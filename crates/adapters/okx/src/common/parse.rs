@@ -813,7 +813,7 @@ pub fn parse_spot_margin_position_from_balance(
 /// Returns an error if any numeric fields cannot be parsed into their target types.
 #[allow(clippy::too_many_lines)]
 pub fn parse_position_status_report(
-    position: OKXPosition,
+    position: &OKXPosition,
     account_id: AccountId,
     instrument_id: InstrumentId,
     size_precision: u8,
@@ -949,7 +949,7 @@ pub fn parse_position_status_report(
 ///
 /// Returns an error if the OKX transaction detail cannot be parsed.
 pub fn parse_fill_report(
-    detail: OKXTransactionDetail,
+    detail: &OKXTransactionDetail,
     account_id: AccountId,
     instrument_id: InstrumentId,
     price_precision: u8,
@@ -1361,17 +1361,35 @@ fn parse_common_instrument_data(
         anyhow::bail!("`lot_sz` is empty for {}", definition.inst_id);
     }
 
-    let size_increment = Quantity::from(&definition.lot_sz);
-    let lot_size = Some(Quantity::from(&definition.lot_sz));
+    let size_increment = Quantity::from_str(&definition.lot_sz).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse `lot_sz` '{}' for {}: {e}",
+            definition.lot_sz,
+            definition.inst_id,
+        )
+    })?;
+    let lot_size = Some(size_increment);
     let max_quantity = if definition.max_mkt_sz.is_empty() {
         None
     } else {
-        Some(Quantity::from(&definition.max_mkt_sz))
+        Some(Quantity::from_str(&definition.max_mkt_sz).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse `max_mkt_sz` '{}' for {}: {e}",
+                definition.max_mkt_sz,
+                definition.inst_id,
+            )
+        })?)
     };
     let min_quantity = if definition.min_sz.is_empty() {
         None
     } else {
-        Some(Quantity::from(&definition.min_sz))
+        Some(Quantity::from_str(&definition.min_sz).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse `min_sz` '{}' for {}: {e}",
+                definition.min_sz,
+                definition.inst_id,
+            )
+        })?)
     };
     let max_notional: Option<Money> = None;
     let min_notional: Option<Money> = None;
@@ -1396,7 +1414,7 @@ fn parse_common_instrument_data(
 /// Generic instrument parsing function that delegates to type-specific parsers.
 fn parse_instrument_with_parser<P: InstrumentParser>(
     definition: &OKXInstrument,
-    parser: P,
+    parser: &P,
     margin_init: Option<Decimal>,
     margin_maint: Option<Decimal>,
     maker_fee: Option<Decimal>,
@@ -1482,7 +1500,7 @@ pub fn parse_spot_instrument(
 ) -> anyhow::Result<InstrumentAny> {
     parse_instrument_with_parser(
         definition,
-        SpotInstrumentParser,
+        &SpotInstrumentParser,
         margin_init,
         margin_maint,
         maker_fee,
@@ -1560,11 +1578,41 @@ pub fn parse_swap_instrument(
             definition.inst_id
         )
     })?;
-    let size_increment = Quantity::from(&definition.lot_sz);
+
+    if definition.lot_sz.is_empty() {
+        anyhow::bail!("`lot_sz` is empty for {}", definition.inst_id);
+    }
+    let size_increment = Quantity::from_str(&definition.lot_sz).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse `lot_sz` '{}' for {}: {e}",
+            definition.lot_sz,
+            definition.inst_id
+        )
+    })?;
     let multiplier = parse_multiplier_product(definition)?;
-    let lot_size = Some(Quantity::from(&definition.lot_sz));
-    let max_quantity = Some(Quantity::from(&definition.max_mkt_sz));
-    let min_quantity = Some(Quantity::from(&definition.min_sz));
+    let lot_size = Some(size_increment);
+    let max_quantity = if definition.max_mkt_sz.is_empty() {
+        None
+    } else {
+        Some(Quantity::from_str(&definition.max_mkt_sz).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse `max_mkt_sz` '{}' for {}: {e}",
+                definition.max_mkt_sz,
+                definition.inst_id
+            )
+        })?)
+    };
+    let min_quantity = if definition.min_sz.is_empty() {
+        None
+    } else {
+        Some(Quantity::from_str(&definition.min_sz).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse `min_sz` '{}' for {}: {e}",
+                definition.min_sz,
+                definition.inst_id
+            )
+        })?)
+    };
     let max_notional: Option<Money> = None;
     let min_notional: Option<Money> = None;
     let max_price = None; // TBD
@@ -1656,12 +1704,48 @@ pub fn parse_futures_instrument(
         anyhow::bail!("`tick_sz` is empty for {}", definition.inst_id);
     }
 
-    let price_increment = Price::from(definition.tick_sz.clone());
-    let size_increment = Quantity::from(&definition.lot_sz);
+    let price_increment = Price::from_str(&definition.tick_sz).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse `tick_sz` '{}' for {}: {e}",
+            definition.tick_sz,
+            definition.inst_id
+        )
+    })?;
+
+    if definition.lot_sz.is_empty() {
+        anyhow::bail!("`lot_sz` is empty for {}", definition.inst_id);
+    }
+    let size_increment = Quantity::from_str(&definition.lot_sz).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse `lot_sz` '{}' for {}: {e}",
+            definition.lot_sz,
+            definition.inst_id
+        )
+    })?;
     let multiplier = parse_multiplier_product(definition)?;
-    let lot_size = Some(Quantity::from(&definition.lot_sz));
-    let max_quantity = Some(Quantity::from(&definition.max_mkt_sz));
-    let min_quantity = Some(Quantity::from(&definition.min_sz));
+    let lot_size = Some(size_increment);
+    let max_quantity = if definition.max_mkt_sz.is_empty() {
+        None
+    } else {
+        Some(Quantity::from_str(&definition.max_mkt_sz).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse `max_mkt_sz` '{}' for {}: {e}",
+                definition.max_mkt_sz,
+                definition.inst_id
+            )
+        })?)
+    };
+    let min_quantity = if definition.min_sz.is_empty() {
+        None
+    } else {
+        Some(Quantity::from_str(&definition.min_sz).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse `min_sz` '{}' for {}: {e}",
+                definition.min_sz,
+                definition.inst_id
+            )
+        })?)
+    };
     let max_notional: Option<Money> = None;
     let min_notional: Option<Money> = None;
     let max_price = None; // TBD
@@ -1728,7 +1812,13 @@ pub fn parse_option_instrument(
     let raw_symbol = Symbol::from_ustr_unchecked(definition.inst_id);
     let underlying = Currency::get_or_create_crypto_with_context(underlying_str, Some(&context));
     let option_kind: OptionKind = definition.opt_type.into();
-    let strike_price = Price::from(&definition.stk);
+    let strike_price = Price::from_str(&definition.stk).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse `stk` '{}' for {}: {e}",
+            definition.stk,
+            definition.inst_id
+        )
+    })?;
     let quote_currency = Currency::get_or_create_crypto_with_context(quote_ccy_str, Some(&context));
     let settlement_currency =
         Currency::get_or_create_crypto_with_context(definition.settle_ccy, Some(&context));
@@ -1752,12 +1842,48 @@ pub fn parse_option_instrument(
         anyhow::bail!("`tick_sz` is empty for {}", definition.inst_id);
     }
 
-    let price_increment = Price::from(definition.tick_sz.clone());
-    let size_increment = Quantity::from(&definition.lot_sz);
+    let price_increment = Price::from_str(&definition.tick_sz).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse `tick_sz` '{}' for {}: {e}",
+            definition.tick_sz,
+            definition.inst_id
+        )
+    })?;
+
+    if definition.lot_sz.is_empty() {
+        anyhow::bail!("`lot_sz` is empty for {}", definition.inst_id);
+    }
+    let size_increment = Quantity::from_str(&definition.lot_sz).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse `lot_sz` '{}' for {}: {e}",
+            definition.lot_sz,
+            definition.inst_id
+        )
+    })?;
     let multiplier = parse_multiplier_product(definition)?;
-    let lot_size = Quantity::from(&definition.lot_sz);
-    let max_quantity = Some(Quantity::from(&definition.max_mkt_sz));
-    let min_quantity = Some(Quantity::from(&definition.min_sz));
+    let lot_size = size_increment;
+    let max_quantity = if definition.max_mkt_sz.is_empty() {
+        None
+    } else {
+        Some(Quantity::from_str(&definition.max_mkt_sz).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse `max_mkt_sz` '{}' for {}: {e}",
+                definition.max_mkt_sz,
+                definition.inst_id
+            )
+        })?)
+    };
+    let min_quantity = if definition.min_sz.is_empty() {
+        None
+    } else {
+        Some(Quantity::from_str(&definition.min_sz).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse `min_sz` '{}' for {}: {e}",
+                definition.min_sz,
+                definition.inst_id
+            )
+        })?)
+    };
     let max_notional = None;
     let min_notional = None;
     let max_price = None;
@@ -1927,6 +2053,11 @@ pub fn parse_account_state(
         ts_init,
         None,
     ))
+}
+
+/// Converts an optional `UnixNanos` to an optional `DateTime<Utc>`.
+pub fn nanos_to_datetime(value: Option<UnixNanos>) -> Option<chrono::DateTime<chrono::Utc>> {
+    value.map(|nanos| nanos.to_datetime_utc())
 }
 
 #[cfg(test)]
@@ -2980,7 +3111,7 @@ mod tests {
         let account_id = AccountId::new("OKX-001");
         let instrument_id = InstrumentId::from("BTC-USDT.OKX");
         let position_report = parse_position_status_report(
-            okx_position,
+            &okx_position,
             account_id,
             instrument_id,
             8,
@@ -3228,7 +3359,7 @@ mod tests {
         let account_id = AccountId::new("OKX-001");
         let instrument_id = InstrumentId::from("BTC-USDT.OKX");
         let fill_report = parse_fill_report(
-            transaction_detail,
+            &transaction_detail,
             account_id,
             instrument_id,
             2,
@@ -3399,7 +3530,7 @@ mod tests {
         let account_id = AccountId::new("OKX-001");
         let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
         let report = parse_position_status_report(
-            position,
+            &position,
             account_id,
             instrument_id,
             8,
@@ -3467,7 +3598,7 @@ mod tests {
         let account_id = AccountId::new("OKX-001");
         let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
         let report = parse_position_status_report(
-            position,
+            &position,
             account_id,
             instrument_id,
             8,
@@ -3535,7 +3666,7 @@ mod tests {
         let account_id = AccountId::new("OKX-001");
         let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
         let report = parse_position_status_report(
-            position,
+            &position,
             account_id,
             instrument_id,
             8,
@@ -3603,7 +3734,7 @@ mod tests {
         let account_id = AccountId::new("OKX-001");
         let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
         let report = parse_position_status_report(
-            position,
+            &position,
             account_id,
             instrument_id,
             8,
@@ -3675,7 +3806,7 @@ mod tests {
         let account_id = AccountId::new("OKX-001");
         let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
         let report = parse_position_status_report(
-            position,
+            &position,
             account_id,
             instrument_id,
             8,
@@ -3747,7 +3878,7 @@ mod tests {
         let account_id = AccountId::new("OKX-001");
         let instrument_id = InstrumentId::from("ETH-USDT.OKX");
         let report = parse_position_status_report(
-            position,
+            &position,
             account_id,
             instrument_id,
             4,
@@ -3815,7 +3946,7 @@ mod tests {
         let account_id = AccountId::new("OKX-001");
         let instrument_id = InstrumentId::from("ETH-USDT.OKX");
         let report = parse_position_status_report(
-            position,
+            &position,
             account_id,
             instrument_id,
             4,
@@ -3883,7 +4014,7 @@ mod tests {
         let account_id = AccountId::new("OKX-001");
         let instrument_id = InstrumentId::from("ETH-USDT.OKX");
         let report = parse_position_status_report(
-            position,
+            &position,
             account_id,
             instrument_id,
             4,

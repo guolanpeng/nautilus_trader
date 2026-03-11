@@ -1,7 +1,6 @@
 # Data
 
-NautilusTrader provides a set of built-in data types specifically designed to represent a trading domain.
-These data types include:
+NautilusTrader provides built-in data types for the trading domain:
 
 - `OrderBookDelta` (L1/L2/L3): Represents the most granular order book updates.
 - `OrderBookDeltas` (L1/L2/L3): Batches multiple order book deltas for more efficient processing.
@@ -15,9 +14,9 @@ These data types include:
 - `InstrumentStatus`: An instrument-level status event.
 - `InstrumentClose`: The closing price of an instrument.
 
-NautilusTrader is designed primarily to operate on granular order book data, providing the highest realism
-for execution simulations in backtesting.
-However, backtests can also be conducted on any of the supported market data types, depending on the desired simulation fidelity.
+NautilusTrader operates primarily on granular order book data for the highest realism
+in execution simulations. Backtests can also run on any supported market data type,
+depending on the desired simulation fidelity.
 
 ## Order books
 
@@ -159,8 +158,8 @@ The platform implements various aggregation methods:
 ### Information-driven bars
 
 Information-driven bars adapt their sampling frequency to market activity rather than using fixed
-intervals. They are based on the concept of *aggressor side* — whether the trade initiator was a
-buyer or seller — and come in two families: **imbalance** and **runs**.
+intervals. They are based on the concept of *aggressor side* (whether the trade initiator was a
+buyer or seller) and come in two families: **imbalance** and **runs**.
 
 **Imbalance bars** close when the *net* buy/sell activity reaches a threshold. Each trade contributes
 a signed value: positive for buyer-initiated trades and negative for seller-initiated. The bar closes
@@ -494,7 +493,7 @@ These timestamps serve distinct purposes and help maintain precise timing inform
 :::note
 The `ts_init` field represents a more general concept than "time of reception" for events.
 It denotes the timestamp when an object, such as a data point or command, was initialized within Nautilus.
-This distinction is important because `ts_init` is not exclusive to "received events" — it applies to any internal
+This distinction is important because `ts_init` is not exclusive to "received events". It applies to any internal
 initialization process.
 
 For example, the `ts_init` field is also used for commands, where the concept of reception does not apply.
@@ -546,7 +545,7 @@ For details on how to implement user-defined data types, see the [Custom Data](#
 
 ## Loading data
 
-NautilusTrader facilitates data loading and conversion for three main use cases:
+NautilusTrader supports data loading and conversion for three main use cases:
 
 - Providing data for a `BacktestEngine` to run backtests.
 - Persisting the Nautilus-specific Parquet format for the data catalog via `ParquetDataCatalog.write_data(...)` to be later used with a `BacktestNode`.
@@ -585,7 +584,7 @@ of the Nautilus core, currently in development.
 
 ### Fixed-point precision and raw values
 
-NautilusTrader uses fixed-point arithmetic for `Price` and `Quantity` types to ensure precise financial calculations without floating-point errors. Understanding how raw values work is essential when creating data or working with catalogs.
+NautilusTrader uses fixed-point arithmetic for `Price` and `Quantity` types for precise financial calculations without floating-point errors. Understanding how raw values work is essential when creating data or working with catalogs.
 
 #### Raw value requirements
 
@@ -672,7 +671,7 @@ deltas = wrangler.process(df)
 
 ## Data catalog
 
-The data catalog is a central store for Nautilus data, persisted in the [Parquet](https://parquet.apache.org) file format. It serves as the primary data management system for both backtesting and live trading scenarios, providing efficient storage, retrieval, and streaming capabilities for market data.
+The data catalog is a central store for Nautilus data, persisted in the [Parquet](https://parquet.apache.org) file format. It is the primary data management system for both backtesting and live trading scenarios, providing efficient storage, retrieval, and streaming capabilities for market data.
 
 ### Overview and architecture
 
@@ -710,7 +709,7 @@ The current plan is to eventually phase out the Python schemas module, so that a
 
 The data catalog can be initialized from a `NAUTILUS_PATH` environment variable, or by explicitly passing in a path like object.
 
-:::note NAUTILUS_PATH environment variable
+:::note[NAUTILUS_PATH environment variable]
 The `NAUTILUS_PATH` environment variable should point to the **root** directory containing your Nautilus data. The catalog will automatically append `/catalog` to this path.
 
 For example:
@@ -739,7 +738,7 @@ catalog = ParquetDataCatalog.from_env()  # Uses NAUTILUS_PATH environment variab
 
 ### Filesystem protocols and storage options
 
-The catalog supports multiple filesystem protocols through fsspec integration, enabling seamless operation across local and cloud storage systems.
+The catalog supports multiple filesystem protocols through fsspec integration, working across local and cloud storage systems.
 
 #### Supported filesystem protocols
 
@@ -823,7 +822,7 @@ catalog = ParquetDataCatalog.from_uri("s3://my-bucket/nautilus-data/")
 # With storage options
 catalog = ParquetDataCatalog.from_uri(
     "s3://my-bucket/nautilus-data/",
-    storage_options={
+    fs_storage_options={
         "access_key_id": "your-key",
         "secret_access_key": "your-secret"
     }
@@ -1172,7 +1171,7 @@ streaming_config = StreamingConfig(
 
 ### Query system and dual backend architecture
 
-The catalog's query system leverages a sophisticated dual-backend architecture that automatically selects the optimal query engine based on data type and query parameters.
+The catalog's query system uses a dual-backend architecture that selects the query engine based on data type and query parameters.
 
 #### Backend selection logic
 
@@ -1233,7 +1232,7 @@ catalog.query(
 
 ### Catalog operations
 
-The catalog provides several operation functions for maintaining and organizing data files. These operations help optimize storage, improve query performance, and ensure data integrity.
+The catalog provides several operation functions for maintaining and organizing data files. These operations help optimize storage, improve query performance, and maintain data integrity.
 
 #### Reset file names
 
@@ -1407,7 +1406,7 @@ greeks_data = catalog.query(
 
 ### Catalog summary
 
-The NautilusTrader data catalog provides comprehensive market data management:
+The NautilusTrader data catalog provides market data management:
 
 **Core features**:
 
@@ -1826,9 +1825,39 @@ GreeksTestData(
 )
 ```
 
+#### Python-only custom data with the PyO3 catalog
+
+To use custom data with the Rust-backed catalog (`ParquetDataCatalogV2` from `nautilus_pyo3`), use the
+`@customdataclass_pyo3()` decorator instead of `@customdataclass`. This adds the methods the Rust catalog
+expects (JSON and Arrow IPC serialization). After defining your class, register it once. You can pass either
+the **type** (recommended) or a **sample instance**:
+
+```python
+from nautilus_trader.core.nautilus_pyo3 import ParquetDataCatalogV2
+from nautilus_trader.core.nautilus_pyo3.model import register_custom_data_class
+from nautilus_trader.model.custom import customdataclass_pyo3
+
+
+@customdataclass_pyo3()
+class MarketTickPython:
+    symbol: str = ""
+    price: float = 0.0
+    volume: int = 0
+
+
+# Register by type (no instance needed; call once, e.g. at startup)
+register_custom_data_class(MarketTickPython)
+
+catalog = ParquetDataCatalogV2("/path/to/catalog")
+catalog.write_custom_data([MarketTickPython(1, 1, "AAPL", 150.5, 1000)])
+result = catalog.query("MarketTickPython", None, None, None, None, None, True)
+```
+
+See `nautilus_trader.model.custom.customdataclass_pyo3` for details.
+
 #### Custom data type stub
 
-To enhance development convenience and improve code suggestions in your IDE, you can create a `.pyi`
+For better IDE code suggestions, you can create a `.pyi`
 stub file with the proper constructor signature for your custom data types as well as type hints for attributes.
 This is particularly useful when the constructor is dynamically generated at runtime, as it allows the IDE to recognize
 and provide suggestions for the class's methods and attributes.
@@ -1857,5 +1886,7 @@ class GreeksData(Data):
 ## Related guides
 
 - [Instruments](instruments.md) - Financial instruments referenced by data.
+- [Options](options.md) - Option instruments, chain subscriptions, and strike filtering.
+- [Greeks](greeks.md) - Venue-provided and locally computed option Greeks.
 - [Cache](cache.md) - Data storage and retrieval.
 - [Adapters](adapters.md) - Data sources and connectivity.

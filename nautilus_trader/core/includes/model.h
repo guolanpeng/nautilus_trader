@@ -1449,10 +1449,10 @@ typedef struct InstrumentClose_t {
 } InstrumentClose_t;
 
 /**
- * A built-in Nautilus data type.
+ * A C-compatible representation of [`Data`] for FFI.
  *
- * Not recommended for storing large amounts of data, as the largest variant is significantly
- * larger (10x) than the smallest.
+ * This enum matches the standard variants of [`Data`] but excludes the `Custom`
+ * variant which is not FFI-safe.
  */
 typedef enum Data_t_Tag {
     DELTA,
@@ -3118,6 +3118,10 @@ void orderbook_apply_depth(struct OrderBook_API *book, const struct OrderBookDep
 CVec orderbook_bids(struct OrderBook_API *book);
 
 CVec orderbook_asks(struct OrderBook_API *book);
+
+CVec orderbook_bids_down_to(struct OrderBook_API *book, PriceRaw price_raw, uint8_t price_prec);
+
+CVec orderbook_asks_up_to(struct OrderBook_API *book, PriceRaw price_raw, uint8_t price_prec);
 
 uint8_t orderbook_has_bid(struct OrderBook_API *book);
 

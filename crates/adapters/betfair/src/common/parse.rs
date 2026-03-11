@@ -28,7 +28,13 @@ use nautilus_model::{
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use ustr::Ustr;
 
-use super::consts::{BETFAIR_PRICE_PRECISION, BETFAIR_QUANTITY_PRECISION, BETFAIR_VENUE};
+use super::{
+    consts::{
+        BETFAIR_CUSTOMER_ORDER_REF_MAX_LEN, BETFAIR_PRICE_PRECISION, BETFAIR_QUANTITY_PRECISION,
+        BETFAIR_VENUE,
+    },
+    types::SelectionId,
+};
 use crate::{
     http::models::{AccountFundsResponse, MarketCatalogue},
     stream::messages::MarketDefinition,
@@ -85,6 +91,34 @@ pub fn parse_millis_timestamp(timestamp_ms: u64) -> UnixNanos {
     UnixNanos::from(timestamp_ms * NANOSECONDS_IN_MILLISECOND)
 }
 
+/// Truncates a client order ID to a Betfair `customer_order_ref`.
+///
+/// Takes the last 32 characters to preserve the high-entropy UUID suffix.
+/// Returns the full string if it is already 32 characters or shorter.
+#[must_use]
+pub fn make_customer_order_ref(client_order_id: &str) -> String {
+    let len = client_order_id.len();
+    if len <= BETFAIR_CUSTOMER_ORDER_REF_MAX_LEN {
+        client_order_id.to_string()
+    } else {
+        client_order_id[len - BETFAIR_CUSTOMER_ORDER_REF_MAX_LEN..].to_string()
+    }
+}
+
+/// Legacy truncation that takes the first 32 characters.
+///
+/// Pre-existing orders may use this format. Register both truncations
+/// on reconnect to match orders regardless of which convention was used.
+#[must_use]
+pub fn make_customer_order_ref_legacy(client_order_id: &str) -> String {
+    let len = client_order_id.len();
+    if len <= BETFAIR_CUSTOMER_ORDER_REF_MAX_LEN {
+        client_order_id.to_string()
+    } else {
+        client_order_id[..BETFAIR_CUSTOMER_ORDER_REF_MAX_LEN].to_string()
+    }
+}
+
 /// Parses a Betfair [`MarketCatalogue`] into a vec of [`InstrumentAny`].
 ///
 /// Each runner in the catalogue becomes a separate [`BettingInstrument`].
@@ -96,6 +130,7 @@ pub fn parse_market_catalogue(
     catalogue: &MarketCatalogue,
     currency: Currency,
     ts_init: UnixNanos,
+    min_notional: Option<Money>,
 ) -> anyhow::Result<Vec<InstrumentAny>> {
     let runners = catalogue
         .runners
@@ -200,7 +235,7 @@ pub fn parse_market_catalogue(
             None,               // max_quantity
             None,               // min_quantity
             None,               // max_notional
-            None,               // min_notional
+            min_notional,       // min_notional
             None,               // max_price
             None,               // min_price
             Some(Decimal::ONE), // margin_init (pre-funded)
@@ -238,6 +273,7 @@ pub fn parse_market_definition(
     def: &MarketDefinition,
     currency: Currency,
     ts_init: UnixNanos,
+    min_notional: Option<Money>,
 ) -> anyhow::Result<Vec<InstrumentAny>> {
     let runners = def
         .runners
@@ -330,7 +366,7 @@ pub fn parse_market_definition(
             None,               // max_quantity
             None,               // min_quantity
             None,               // max_notional
-            None,               // min_notional
+            min_notional,       // min_notional
             None,               // max_price
             None,               // min_price
             Some(Decimal::ONE), // margin_init
@@ -387,6 +423,53 @@ pub fn parse_account_state(
         ts_init,
         Some(currency),
     ))
+}
+
+/// Extracts the Betfair market ID from a Nautilus instrument ID.
+///
+/// Instrument IDs follow the format `{market_id}-{selection_id}.BETFAIR`
+/// or `{market_id}-{selection_id}-{handicap}.BETFAIR`.
+///
+/// # Errors
+///
+/// Returns an error if the symbol does not contain a hyphen separator.
+pub fn extract_market_id(instrument_id: &InstrumentId) -> anyhow::Result<String> {
+    let symbol = instrument_id.symbol.as_str();
+    let parts: Vec<&str> = symbol.splitn(3, '-').collect();
+    if parts.len() >= 2 {
+        Ok(parts[0].to_string())
+    } else {
+        anyhow::bail!("Cannot extract market ID from {instrument_id}")
+    }
+}
+
+/// Extracts the selection ID and handicap from a Nautilus instrument ID.
+///
+/// # Errors
+///
+/// Returns an error if the symbol cannot be parsed into the expected format.
+pub fn extract_selection_id(
+    instrument_id: &InstrumentId,
+) -> anyhow::Result<(SelectionId, Decimal)> {
+    let symbol = instrument_id.symbol.as_str();
+    let parts: Vec<&str> = symbol.splitn(3, '-').collect();
+    if parts.len() < 2 {
+        anyhow::bail!("Cannot extract selection ID from {instrument_id}");
+    }
+
+    let selection_id: SelectionId = parts[1]
+        .parse()
+        .with_context(|| format!("invalid selection ID in {instrument_id}"))?;
+
+    let handicap = if parts.len() == 3 {
+        parts[2]
+            .parse::<Decimal>()
+            .with_context(|| format!("invalid handicap in {instrument_id}"))?
+    } else {
+        Decimal::ZERO
+    };
+
+    Ok((selection_id, handicap))
 }
 
 #[cfg(test)]
@@ -449,7 +532,8 @@ mod tests {
         let data = load_test_json("rest/list_market_catalogue.json");
         let catalogue: MarketCatalogue = serde_json::from_str(&data).unwrap();
         let instruments =
-            parse_market_catalogue(&catalogue, Currency::GBP(), UnixNanos::default()).unwrap();
+            parse_market_catalogue(&catalogue, Currency::GBP(), UnixNanos::default(), None)
+                .unwrap();
 
         assert_eq!(instruments.len(), 3);
 
@@ -479,7 +563,7 @@ mod tests {
         let mut total = 0;
         for cat in &catalogues {
             let instruments =
-                parse_market_catalogue(cat, Currency::GBP(), UnixNanos::default()).unwrap();
+                parse_market_catalogue(cat, Currency::GBP(), UnixNanos::default(), None).unwrap();
             total += instruments.len();
         }
         assert!(total > 0);
@@ -503,6 +587,7 @@ mod tests {
                 def,
                 Currency::GBP(),
                 parse_millis_timestamp(mcm.pt),
+                None,
             )
             .unwrap();
 
@@ -537,5 +622,91 @@ mod tests {
         assert_eq!(state.balances.len(), 1);
         assert!(state.is_reported);
         assert_eq!(state.base_currency, Some(Currency::GBP()));
+    }
+
+    #[rstest]
+    fn test_extract_market_id_no_handicap() {
+        let instrument_id = make_instrument_id("1.180737206", 19248890, Decimal::ZERO);
+        let market_id = extract_market_id(&instrument_id).unwrap();
+        assert_eq!(market_id, "1.180737206");
+    }
+
+    #[rstest]
+    fn test_extract_market_id_with_handicap() {
+        let instrument_id = make_instrument_id("1.180737206", 19248890, Decimal::new(15, 1));
+        let market_id = extract_market_id(&instrument_id).unwrap();
+        assert_eq!(market_id, "1.180737206");
+    }
+
+    #[rstest]
+    fn test_extract_selection_id_no_handicap() {
+        let instrument_id = make_instrument_id("1.180737206", 19248890, Decimal::ZERO);
+        let (selection_id, handicap) = extract_selection_id(&instrument_id).unwrap();
+        assert_eq!(selection_id, 19248890);
+        assert_eq!(handicap, Decimal::ZERO);
+    }
+
+    #[rstest]
+    fn test_extract_selection_id_with_handicap() {
+        let instrument_id = make_instrument_id("1.180737206", 19248890, Decimal::new(15, 1));
+        let (selection_id, handicap) = extract_selection_id(&instrument_id).unwrap();
+        assert_eq!(selection_id, 19248890);
+        assert_eq!(handicap, Decimal::new(15, 1));
+    }
+
+    #[rstest]
+    fn test_make_customer_order_ref_short_id() {
+        let result = make_customer_order_ref("O-20240101-001");
+        assert_eq!(result, "O-20240101-001");
+    }
+
+    #[rstest]
+    fn test_make_customer_order_ref_exactly_32_chars() {
+        let id = "12345678901234567890123456789012";
+        assert_eq!(id.len(), 32);
+        let result = make_customer_order_ref(id);
+        assert_eq!(result, id);
+    }
+
+    #[rstest]
+    fn test_make_customer_order_ref_truncates_to_last_32() {
+        // UUID-style ID longer than 32 chars
+        let id = "O-20240101-550e8400-e29b-41d4-a716-446655440000";
+        assert!(id.len() > 32);
+        let result = make_customer_order_ref(id);
+        assert_eq!(result.len(), 32);
+        // Should keep the last 32 characters (high-entropy UUID tail)
+        assert_eq!(result, &id[id.len() - 32..]);
+    }
+
+    #[rstest]
+    fn test_make_customer_order_ref_legacy_short_id() {
+        let result = make_customer_order_ref_legacy("O-20240101-001");
+        assert_eq!(result, "O-20240101-001");
+    }
+
+    #[rstest]
+    fn test_make_customer_order_ref_legacy_truncates_to_first_32() {
+        let id = "O-20240101-550e8400-e29b-41d4-a716-446655440000";
+        assert!(id.len() > 32);
+        let result = make_customer_order_ref_legacy(id);
+        assert_eq!(result.len(), 32);
+        assert_eq!(result, &id[..32]);
+    }
+
+    #[rstest]
+    fn test_legacy_and_current_differ_for_long_ids() {
+        let id = "O-20240101-550e8400-e29b-41d4-a716-446655440000";
+        let current = make_customer_order_ref(id);
+        let legacy = make_customer_order_ref_legacy(id);
+        assert_ne!(current, legacy);
+    }
+
+    #[rstest]
+    fn test_legacy_and_current_same_for_short_ids() {
+        let id = "O-20240101-001";
+        let current = make_customer_order_ref(id);
+        let legacy = make_customer_order_ref_legacy(id);
+        assert_eq!(current, legacy);
     }
 }

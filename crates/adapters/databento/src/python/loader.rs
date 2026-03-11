@@ -23,7 +23,10 @@ use nautilus_core::{
     python::{IntoPyObjectNautilusExt, to_pyvalue_err},
 };
 use nautilus_model::{
-    data::{Bar, Data, InstrumentStatus, OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick},
+    data::{
+        Bar, Data, DataFFI, InstrumentStatus, OrderBookDelta, OrderBookDepth10, QuoteTick,
+        TradeTick,
+    },
     identifiers::{InstrumentId, Venue},
     python::instruments::instrument_any_to_pyobject,
 };
@@ -38,6 +41,7 @@ use crate::{
     types::{DatabentoImbalance, DatabentoPublisher, DatabentoStatistics, PublisherId},
 };
 
+#[allow(clippy::needless_pass_by_value)]
 #[pymethods]
 impl DatabentoDataLoader {
     #[new]
@@ -85,14 +89,16 @@ impl DatabentoDataLoader {
     }
 
     #[pyo3(name = "load_instruments")]
+    #[pyo3(signature = (filepath, use_exchange_as_venue, skip_on_error=false))]
     fn py_load_instruments(
         &mut self,
         py: Python,
         filepath: PathBuf,
         use_exchange_as_venue: bool,
+        skip_on_error: bool,
     ) -> PyResult<Py<PyAny>> {
         let iter = self
-            .load_instruments(&filepath, use_exchange_as_venue)
+            .load_instruments(&filepath, use_exchange_as_venue, skip_on_error)
             .map_err(to_pyvalue_err)?;
 
         let mut data = Vec::new();
@@ -508,7 +514,13 @@ fn exhaust_data_iter_to_pycapsule(
         }
     }
 
-    let cvec: CVec = data.into();
+    let ffi_data: Vec<DataFFI> = data
+        .into_iter()
+        .map(DataFFI::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_pyvalue_err)?;
+    let cvec: CVec = ffi_data.into();
+    // No destructor: Python must call drop_cvec_pycapsule to take ownership and free.
     let capsule = PyCapsule::new_with_destructor::<CVec, _>(py, cvec, None, |_, _| {})?;
 
     // TODO: Improve error domain. Replace anyhow errors with nautilus

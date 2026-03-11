@@ -141,7 +141,7 @@ All adjustments are preserved in the position event history:
 
 NautilusTrader supports two primary OMS types that fundamentally affect how positions are tracked
 and managed. An `OmsType.UNSPECIFIED` option also exists, which defaults to the component's
-context. For comprehensive details, see the [Execution guide](execution.md#order-management-system-oms).
+context. For full details, see the [Execution guide](execution.md#order-management-system-oms).
 
 ### `NETTING`
 
@@ -239,7 +239,7 @@ incorrect reporting and analysis.
 
 ## PnL calculations
 
-NautilusTrader provides comprehensive PnL calculations that account for instrument
+NautilusTrader provides PnL calculations that account for instrument
 specifications and market conventions.
 
 ### Realized PnL
@@ -374,7 +374,7 @@ notional = position.notional_value(current_price)
 
 :::info
 For complete type information and detailed property documentation, see the Position
-[API Reference](../api_reference/model/position.md#class-position).
+[API Reference](/docs/python-api-latest/model/position.html#nautilus_trader.model.position.Position).
 :::
 
 ## Events and tracking
@@ -448,11 +448,10 @@ they operate without position linkage. The engine handles spread instruments sep
 
 ## Summary
 
-Positions are central to tracking trading activity and performance in NautilusTrader. Understanding
-how positions aggregate fills, calculate PnL, and handle different OMS configurations is essential
-for building robust trading strategies. The position snapshotting mechanism ensures accurate
-historical tracking in `NETTING` mode, while the comprehensive event history supports detailed
-analysis and reconciliation.
+Positions are central to tracking trading activity and performance. Understanding how positions
+aggregate fills, calculate PnL, and handle different OMS configurations matters when building
+trading strategies. Position snapshotting provides accurate historical tracking in `NETTING`
+mode, and the event history supports detailed analysis and reconciliation.
 
 ## Related guides
 

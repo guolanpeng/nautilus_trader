@@ -51,7 +51,7 @@ use nautilus_model::{
 use pyo3::{IntoPyObjectExt, prelude::*};
 
 use crate::{
-    common::enums::DeribitTimeInForce,
+    common::{enums::DeribitTimeInForce, parse::parse_instrument_kind_currency},
     websocket::{
         client::DeribitWebSocketClient,
         enums::DeribitUpdateInterval,
@@ -188,6 +188,7 @@ impl DeribitWebSocketClient {
     }
 
     #[pyo3(name = "connect")]
+    #[allow(clippy::needless_pass_by_value)]
     fn py_connect<'py>(
         &mut self,
         py: Python<'py>,
@@ -244,6 +245,11 @@ impl DeribitWebSocketClient {
                         NautilusWsMessage::Authenticated(auth_result) => {
                             log::info!("WebSocket authenticated (scope: {})", auth_result.scope);
                         }
+                        NautilusWsMessage::InstrumentStatus(status) => {
+                            call_python_with_data(&call_soon, &callback, |py| {
+                                status.into_py_any(py)
+                            });
+                        }
                         NautilusWsMessage::Raw(msg) => {
                             log::debug!("Received raw message, skipping: {msg}");
                         }
@@ -262,6 +268,11 @@ impl DeribitWebSocketClient {
                                 }
                             }
                         }),
+                        NautilusWsMessage::OptionGreeks(greeks) => {
+                            call_python_with_data(&call_soon, &callback, |py| {
+                                Py::new(py, greeks).map(|obj| obj.into_any())
+                            });
+                        }
                         // Execution events - route to Python callback
                         NautilusWsMessage::OrderStatusReports(reports) => Python::attach(|py| {
                             for report in reports {
@@ -558,6 +569,52 @@ impl DeribitWebSocketClient {
         })
     }
 
+    /// Subscribes to option greeks for the given instrument.
+    ///
+    /// Registers the instrument in the `option_greeks_subs` set so the handler
+    /// emits `OptionGreeks` from ticker messages, then subscribes to the ticker channel.
+    #[pyo3(name = "subscribe_option_greeks")]
+    #[pyo3(signature = (instrument_id, interval=None))]
+    fn py_subscribe_option_greeks<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        interval: Option<DeribitUpdateInterval>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.add_option_greeks_sub(instrument_id);
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .subscribe_ticker(instrument_id, interval)
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
+    /// Unsubscribes from option greeks for the given instrument.
+    ///
+    /// Removes the instrument from the `option_greeks_subs` set and unsubscribes
+    /// from the ticker channel.
+    #[pyo3(name = "unsubscribe_option_greeks")]
+    #[pyo3(signature = (instrument_id, interval=None))]
+    fn py_unsubscribe_option_greeks<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        interval: Option<DeribitUpdateInterval>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.remove_option_greeks_sub(&instrument_id);
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_ticker(instrument_id, interval)
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
     #[pyo3(name = "subscribe_quotes")]
     fn py_subscribe_quotes<'py>(
         &self,
@@ -682,40 +739,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    #[pyo3(name = "subscribe_instrument_state")]
-    fn py_subscribe_instrument_state<'py>(
-        &self,
-        py: Python<'py>,
-        kind: String,
-        currency: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client
-                .subscribe_instrument_state(&kind, &currency)
-                .await
-                .map_err(to_pyvalue_err)
-        })
-    }
-
-    #[pyo3(name = "unsubscribe_instrument_state")]
-    fn py_unsubscribe_instrument_state<'py>(
-        &self,
-        py: Python<'py>,
-        kind: String,
-        currency: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client
-                .unsubscribe_instrument_state(&kind, &currency)
-                .await
-                .map_err(to_pyvalue_err)
-        })
-    }
-
     #[pyo3(name = "subscribe_perpetual_interest_rates")]
     #[pyo3(signature = (instrument_id, interval=None))]
     fn py_subscribe_perpetual_interest_rates<'py>(
@@ -747,6 +770,40 @@ impl DeribitWebSocketClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client
                 .unsubscribe_perpetual_interest_rates_updates(instrument_id, interval)
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
+    #[pyo3(name = "subscribe_instrument_status")]
+    fn py_subscribe_instrument_status<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let (kind, currency) = parse_instrument_kind_currency(&instrument_id);
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .subscribe_instrument_status(&kind, &currency)
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_instrument_status")]
+    fn py_unsubscribe_instrument_status<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let (kind, currency) = parse_instrument_kind_currency(&instrument_id);
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_instrument_status(&kind, &currency)
                 .await
                 .map_err(to_pyvalue_err)
         })

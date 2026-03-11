@@ -1,16 +1,85 @@
-# NautilusTrader 1.224.0 Beta
+# NautilusTrader 1.225.0 Beta
 
 Released on TBD (UTC).
 
 ### Enhancements
+- Added option chains and greeks in Rust (#3637), thanks @filipmacek
+- Added option chains and greeks in Python (#3677), thanks @filipmacek
+- Added custom data registration, persistence, and routing in Rust (#3542), thanks @faysou
+- Added Databento Arrow serialization for imbalance and statistics (#3689), thanks for reporting @GianC0
+- Added Hyperliquid agent wallet support (#3668), thanks @oh92
+
+### Breaking Changes
+- Renamed `OrderEvent.kind()` to `type_name()` in Rust
+- Renamed instrument `type_str` PyO3 getter to `type_name`
+
+### Security
+- Hardened Docker Compose to bind all ports to localhost and add `no-new-privileges` to all services
+- Upgraded all `nautilustrader.io` URLs from HTTP to HTTPS (#3686), thanks @04cb
+
+### Fixes
+- Fixed `PRICE_UNDEF` panic in `OrderBookDelta.to_pyo3_list` Cython conversion (#3697), thanks @zshuang15
+- Fixed `RiskEngine` RefCell re-entrancy panic on order denial (#3680), thanks @husariancom
+- Fixed reconciliation when trigger_price is set for non-conditional orders (#3673), thanks @husariancom
+- Fixed spurious "Timer replaced" warnings for expired timers in `LiveClock` and `TestClock` (#3690), thanks @HaakonFlaaronning
+- Fixed time bar historical event deferral (#3698), thanks @faysou
+- Fixed `SimulatedExchange` account balance adjustment mutation (#3704), thanks for reporting @thaning0
+- Fixed Sandbox reconciliation missing `account_id` (#3705), thanks for reporting @eliotOrderson
+- Fixed Betfair order modify `Quantity` serialization for partial cancel size reduction
+- Fixed Binance algo order update (#3665), thanks @qu1zzyboy
+- Fixed Binance SBE price/quantity precision derivation (#3670), thanks @husariancom
+- Fixed Databento price precision truncation for fractional tick sizes (#3696), thanks @pandashark
+- Fixed dYdX WebSocket handler repeatedly emitting `NewInstrumentDiscovered` for uncached instruments on every `v4_markets` update
+- Fixed Interactive Brokers docs `request_ticks` API and add contract example (#3699), thanks @faysou
+- Fixed Kraken post-only order rejection not setting `due_post_only` on `OrderRejected` events (Spot and Futures)
+
+### Internal Improvements
+- Added `SpreadQuoteAggregator` (#3698), thanks @faysou
+- Added Python strategy support to v2 `LiveNode` with `add_strategy_from_config`
+- Added backtest margin models, `FXRolloverInterestModule`, `PerContractFeeModel`, and `SimulationModule` trait in Rust
+- Refactored computation of greeks (#3691), thanks @faysou
+- Refactored Polymarket HTTP client and improved outcome enum (#3702), thanks @filipmacek
+- Improved socket clients reconnect and shutdown reliability
+- Improved Databento live price precision handling with maps populated from instrument definitions
+- Refined `AtomicTime` mode switching and datetime panics
+- Standardized `type_name()` across order events and instruments
+- Optimized network client performance and add benchmarks
+- Upgraded Rust (MSRV) to 1.94.0
+- Upgraded `databento` crate to v0.43.0
+- Upgraded `redis` crate to v1.0.5
+- Upgraded `tokio` crate to v1.50.0
+
+### Documentation
+- Added Options concept guide with chain architecture, subscription API, strike filtering, and snapshot modes
+- Added Greeks concept guide covering venue-provided and local calculator paths
+- Added adapter developer guide sections for WS unit tests, close/stream patterns, and split-client architecture
+- Added Interactive brokers docs `request_ticks` API fix and contract example (#3699), thanks @faysou
+- Rewrote Live Trading concept guide for accuracy (reconciliation, periodic timers, lookback windows)
+- Rewrote Custom Data architecture docs for two-mode (Rust/Python) registration
+- Improved Value Types concept guide with full arithmetic operator and unary operation docs
+- Improved accuracy of Greeks and Options concept guides, thanks @faysou
+- Migrated Python API reference from sphinx-markdown-builder to Sphinx HTML with Furo theme
+- Updated all API reference links to Sphinx HTML paths
+
+---
+
+# NautilusTrader 1.224.0 Beta
+
+Released on 3rd March 2026 (UTC).
+
+### Enhancements
 - Added matching engine L1 quote-based queue position tracking for backtests
-- Added `fill_limit_at_touch` to `FillModel` and `MatchingCore` for at-or-inside-spread limit fill control
+- Added `fill_limit_inside_spread` to `FillModel` and `MatchingCore` for at-or-inside-spread limit fill control
 - Added synthetic book support for binary markets (#3495), thanks @Javdu10
 - Added `get_target_px_for_quantity` method on `OrderBook` (#3627), thanks @Javdu10
 - Added Betfair batch submit and cancel order support
-- Added BitMEX dead man's switch (cancelAllAfter) support
+- Added BitMEX dead man's switch (cancelAllAfter) support (Rust and Python)
 - Added BitMEX grid market maker example (Rust)
+- Added BitMEX instrument status subscription support (Rust and Python)
 - Added Bybit book snapshot and funding rate request support (Rust)
+- Added Databento `skip_on_error` flag for `load_instruments` to skip unparsable definitions (#3657), thanks for reporting @davidsblom
+- Added Deribit instrument status subscription support (Rust and Python)
+- Added dYdX instrument status subscription support (Rust and Python)
 - Added Hyperliquid order modify support (Rust and Python)
 - Added OKX trailing stop market order support (Rust and Python)
 - Added OKX algo order amend support (Rust and Python)
@@ -23,10 +92,14 @@ Released on TBD (UTC).
 - Removed Coinbase International (`COINBASE_INTX`) adapter, see RFC (#3555)
 - Removed Binance `BINANCE_ED25519_*` env vars for Spot/Margin (use `BINANCE_API_KEY`/`BINANCE_API_SECRET`; Futures deprecated with warning)
 - Removed Hyperliquid `builder_fee_refresh_mins` config option (builder fees no longer charged)
+- Removed Polymarket `fetch_orderbook_history`, `load_orderbook_snapshots`, `fetch_price_history` and related methods (endpoints decommissioned, #3635)
 
 ### Security
 - Added `pip-audit` to security audit pipeline
 - Added Docker image cosign signing and SBOM generation
+- Standardized credential zeroization across all adapters (`Ustr` replaced with `Box<str>` for API keys)
+- Standardized secret redaction in `Debug` impls across all adapter credentials
+- Updated `SECURITY.md` with expanded scope, reporting guidelines, and responsible disclosure policy
 - Bumped all eligible GitHub Actions pinned SHAs to latest versions (2-week release policy)
 
 ### Fixes
@@ -36,10 +109,14 @@ Released on TBD (UTC).
 - Fixed `LiveExecEngine` position reconciliation infinite loop when venue reports flat (#3622), thanks for reporting @mrbaron3
 - Fixed `CryptoOption` instrument pyo3 transform for (#3626), thanks @davidsblom
 - Fixed `StreamingFeatherWriter` duplicate events from multiple message bus topics (#3625), thanks for reporting @fomotoshi
+- Fixed `VolumeImbalanceBarAggregator` and `VolumeRunsBarAggregator` integer overflow for step >= 923 in high-precision mode (#3658), thanks for reporting @honvl
+- Fixed `InstrumentProvider` `load_ids_async` loading all instruments instead of filtering to requested IDs (affected dYdX, Kraken, AX, Hyperliquid)
 - Fixed Python WS callbacks running off asyncio event-loop thread in Rust adapters (#3653), thanks for reporting @camilorodegheri
 - Fixed Binance Futures algo order serde field renames for WS and HTTP parsing (#3624), thanks for reporting @qu1zzyboy
 - Fixed Binance silent HMAC fallback when using encrypted Ed25519 PEM keys (now warns)
 - Fixed BinanceSymbol COIN-M perpetual symbol conversion (#3641), thanks @YeeTsai
+- Fixed Binance algo order cancellation parsing (#3646), thanks @qu1zzyboy
+- Fixed Binance Spot testnet WebSocket API URL (#3661), thanks @penguinwokrs
 - Fixed Hyperliquid stop/trigger order price derivation (#3611), thanks for reporting @h-tsun3
 - Fixed Hyperliquid price normalization and inner error detection (#3612), thanks for reporting @h-tsun3
 - Fixed Interactive Brokers BarType/str comparison in get_historical_bars (#3616), thanks @powerseed
@@ -50,7 +127,12 @@ Released on TBD (UTC).
 - Fixed Kraken sequential `ClientOrderId` exceeding `cl_ord_id` 18-char free-text limit (#3651), thanks for reporting @husariancom
 - Fixed Kraken missing account state registration during connect (#3652), thanks for reporting @husariancom
 - Fixed Polymarket Gamma API `load_ids` path skipping sibling tokens (#3654), thanks for reporting @likenji
+- Fixed Polymarket loader to use Data API trades instead of decommissioned orderbook/price history endpoints (#3635), thanks for reporting @JSai23
+- Fixed Binance Spot testnet WebSocket API URL (legacy URL removed by Binance in May 2025) (#3660)
 - Fixed pre-commit hooks portability for Windows (#3617), thanks for reporting @powerseed
+- Fixed `LiveNode` startup `RefCell` panic when execution reports arrive during `connect()`
+- Fixed dYdX new instrument discovery flooding logs with inactive/delisted markets
+- Fixed dYdX fills and orders API requests missing required `marketType` parameter
 
 ### Internal Improvements
 - Added catalog deduplication functionality (#3613), thanks @ms32035
@@ -61,14 +143,17 @@ Released on TBD (UTC).
 - Standardized use of atomic clock across adapters
 - Standardized adapter credentials handling and testing
 - Refined build script for Windows (#3636), thanks @faysou
+- Optimized matching engine `_seed_trade_consumption` to use range-bounded FFI queries for deep books
 - Optimized backtest engine settle loop to avoid Python list allocation on idle ticks
 - Optimized `MatchingCore.iterate` to avoid list concatenation on every call
 - Upgraded `databento` crate to v0.42.0
+- Upgraded `datafusion` crate to v52.2.0
 
 ### Documentation Updates
 - Added AX Exchange gold perps book imbalance tutorial
 - Added AX Exchange spot FX bars mean reversion tutorial
 - Added BitMEX grid market maker tutorial
+- Added adapter data and execution testing specifications
 - Added order book concepts documentation
 - Improved backtesting mermaid diagram and tutorial formatting
 

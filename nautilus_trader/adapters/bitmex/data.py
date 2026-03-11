@@ -35,12 +35,14 @@ from nautilus_trader.data.messages import RequestTradeTicks
 from nautilus_trader.data.messages import SubscribeBars
 from nautilus_trader.data.messages import SubscribeInstrument
 from nautilus_trader.data.messages import SubscribeInstruments
+from nautilus_trader.data.messages import SubscribeInstrumentStatus
 from nautilus_trader.data.messages import SubscribeOrderBook
 from nautilus_trader.data.messages import SubscribeQuoteTicks
 from nautilus_trader.data.messages import SubscribeTradeTicks
 from nautilus_trader.data.messages import UnsubscribeBars
 from nautilus_trader.data.messages import UnsubscribeInstrument
 from nautilus_trader.data.messages import UnsubscribeInstruments
+from nautilus_trader.data.messages import UnsubscribeInstrumentStatus
 from nautilus_trader.data.messages import UnsubscribeOrderBook
 from nautilus_trader.data.messages import UnsubscribeQuoteTicks
 from nautilus_trader.data.messages import UnsubscribeTradeTicks
@@ -49,6 +51,7 @@ from nautilus_trader.live.cancellation import cancel_tasks_with_timeout
 from nautilus_trader.live.data_client import LiveMarketDataClient
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import FundingRateUpdate
+from nautilus_trader.model.data import InstrumentStatus
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.data import capsule_to_data
 from nautilus_trader.model.enums import AggregationSource
@@ -268,6 +271,10 @@ class BitmexDataClient(LiveMarketDataClient):
         pyo3_bar_type = nautilus_pyo3.BarType.from_str(str(command.bar_type))
         await self._ws_client.subscribe_bars(pyo3_bar_type)
 
+    async def _subscribe_instrument_status(self, command: SubscribeInstrumentStatus) -> None:
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.subscribe_instrument(pyo3_instrument_id)
+
     async def _unsubscribe_order_book_deltas(self, command: UnsubscribeOrderBook) -> None:
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
         await self._ws_client.unsubscribe_book(pyo3_instrument_id)
@@ -306,23 +313,34 @@ class BitmexDataClient(LiveMarketDataClient):
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
         await self._ws_client.unsubscribe_funding_rates(pyo3_instrument_id)
 
+    async def _unsubscribe_instrument_status(self, command: UnsubscribeInstrumentStatus) -> None:
+        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        await self._ws_client.unsubscribe_instrument(pyo3_instrument_id)
+
     async def _request_instruments(self, request: RequestInstruments) -> None:
-        instruments = await self._http_client.request_instruments(self._active_only)
-        for instrument in instruments:
-            self._handle_instrument(instrument)
-        self._send_response(
-            msg_type=type(request),
-            correlation_id=request.id,
+        pyo3_instruments = await self._http_client.request_instruments(self._active_only)
+        instruments = [transform_instrument_from_pyo3(i) for i in pyo3_instruments]
+        self._handle_instruments(
+            request.venue,
+            instruments,
+            request.id,
+            request.start,
+            request.end,
+            request.params,
         )
 
     async def _request_instrument(self, request: RequestInstrument) -> None:
-        instruments = await self._http_client.request_instruments(self._active_only)
-        for instrument in instruments:
-            if instrument.id == request.instrument_id:
-                self._handle_instrument(instrument)
-                self._send_response(
-                    msg_type=type(request),
-                    correlation_id=request.id,
+        pyo3_instruments = await self._http_client.request_instruments(self._active_only)
+        pyo3_target_id = nautilus_pyo3.InstrumentId.from_str(request.instrument_id.value)
+        for pyo3_instrument in pyo3_instruments:
+            if pyo3_instrument.id == pyo3_target_id:
+                instrument = transform_instrument_from_pyo3(pyo3_instrument)
+                self._handle_instrument(
+                    instrument,
+                    request.id,
+                    request.start,
+                    request.end,
+                    request.params,
                 )
                 return
 
@@ -453,6 +471,8 @@ class BitmexDataClient(LiveMarketDataClient):
                 # to `Data` is still owned and managed by Rust.
                 data = capsule_to_data(msg)
                 self._handle_data(data)
+            elif isinstance(msg, nautilus_pyo3.InstrumentStatus):
+                self._handle_data(InstrumentStatus.from_pyo3(msg))
             elif isinstance(msg, BITMEX_INSTRUMENT_TYPES):
                 self._handle_instrument_update(msg)
             elif isinstance(msg, nautilus_pyo3.FundingRateUpdate):

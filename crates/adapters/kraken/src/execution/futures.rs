@@ -152,13 +152,13 @@ impl KrakenFuturesExecutionClient {
         tasks.push(handle);
     }
 
-    fn submit_single_order(&self, order: &OrderAny, task_name: &'static str) -> anyhow::Result<()> {
+    fn submit_single_order(&self, order: &OrderAny, task_name: &'static str) {
         if order.is_closed() {
             log::warn!(
                 "Cannot submit closed order: client_order_id={}",
                 order.client_order_id()
             );
-            return Ok(());
+            return;
         }
 
         let account_id = self.core.account_id;
@@ -224,23 +224,24 @@ impl KrakenFuturesExecutionClient {
                 }
                 Err(e) => {
                     let ts_event = clock.get_time_ns();
+                    let error_msg = format!("{task_name} error: {e}");
+                    let due_post_only = error_msg.contains("POST_ONLY_REJECTED");
                     emitter.emit_order_rejected_event(
                         strategy_id,
                         instrument_id,
                         client_order_id,
-                        &format!("{task_name} error: {e}"),
+                        &error_msg,
                         ts_event,
-                        false,
+                        due_post_only,
                     );
-                    Err(e)
+                    ws.uncache_client_order(client_order_id);
+                    Ok(())
                 }
             }
         });
-
-        Ok(())
     }
 
-    fn cancel_single_order(&self, cmd: &CancelOrder) -> anyhow::Result<()> {
+    fn cancel_single_order(&self, cmd: &CancelOrder) {
         let account_id = self.core.account_id;
         let client_order_id = cmd.client_order_id;
         let venue_order_id = cmd.venue_order_id;
@@ -279,8 +280,6 @@ impl KrakenFuturesExecutionClient {
             }
             Ok(())
         });
-
-        Ok(())
     }
 
     fn spawn_message_handler(&mut self) -> anyhow::Result<()> {
@@ -321,6 +320,9 @@ impl KrakenFuturesExecutionClient {
         match msg {
             KrakenFuturesWsMessage::OrderAccepted(event) => {
                 emitter.send_order_event(OrderEventAny::Accepted(event));
+            }
+            KrakenFuturesWsMessage::OrderRejected(event) => {
+                emitter.send_order_event(OrderEventAny::Rejected(event));
             }
             KrakenFuturesWsMessage::OrderCanceled(event) => {
                 emitter.send_order_event(OrderEventAny::Canceled(event));
@@ -378,7 +380,7 @@ impl KrakenFuturesExecutionClient {
         }
     }
 
-    fn modify_single_order(&self, cmd: &ModifyOrder) -> anyhow::Result<()> {
+    fn modify_single_order(&self, cmd: &ModifyOrder) {
         let client_order_id = cmd.client_order_id;
         let venue_order_id = cmd.venue_order_id;
         let strategy_id = cmd.strategy_id;
@@ -420,8 +422,6 @@ impl KrakenFuturesExecutionClient {
             }
             Ok(())
         });
-
-        Ok(())
     }
 }
 
@@ -753,7 +753,8 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
             .order(&cmd.client_order_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Order not found in cache: {}", cmd.client_order_id))?;
-        self.submit_single_order(&order, "submit_order")
+        self.submit_single_order(&order, "submit_order");
+        Ok(())
     }
 
     fn submit_order_list(&self, cmd: &SubmitOrderList) -> anyhow::Result<()> {
@@ -766,18 +767,20 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
         );
 
         for order in &orders {
-            self.submit_single_order(order, "submit_order_list")?;
+            self.submit_single_order(order, "submit_order_list");
         }
 
         Ok(())
     }
 
     fn modify_order(&self, cmd: &ModifyOrder) -> anyhow::Result<()> {
-        self.modify_single_order(cmd)
+        self.modify_single_order(cmd);
+        Ok(())
     }
 
     fn cancel_order(&self, cmd: &CancelOrder) -> anyhow::Result<()> {
-        self.cancel_single_order(cmd)
+        self.cancel_single_order(cmd);
+        Ok(())
     }
 
     fn cancel_all_orders(&self, cmd: &CancelAllOrders) -> anyhow::Result<()> {
@@ -867,7 +870,7 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
         );
 
         for cancel in &cmd.cancels {
-            self.cancel_single_order(cancel)?;
+            self.cancel_single_order(cancel);
         }
 
         Ok(())

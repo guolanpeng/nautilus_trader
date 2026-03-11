@@ -242,9 +242,9 @@ mod tests {
         );
         assert_eq!(snap.bids.len(), 3);
         assert_eq!(snap.asks.len(), 3);
-        assert_eq!(snap.bids[0].price, "0.50");
-        assert_eq!(snap.bids[0].size, "200.0");
-        assert_eq!(snap.asks[0].price, "0.51");
+        assert_eq!(snap.bids[0].price, "0.48");
+        assert_eq!(snap.bids[0].size, "500.0");
+        assert_eq!(snap.asks[0].price, "0.53");
         assert_eq!(snap.timestamp, "1703875200000");
     }
 
@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(order.status, PolymarketOrderStatus::Live);
         assert_eq!(order.side, PolymarketOrderSide::Buy);
         assert_eq!(order.order_type, PolymarketOrderType::GTC);
-        assert_eq!(order.outcome, PolymarketOutcome::Yes);
+        assert_eq!(order.outcome, PolymarketOutcome::yes());
         assert_eq!(order.original_size, "100.0");
         assert_eq!(order.size_matched, "0.0");
         assert!(order.associate_trades.is_none());

@@ -132,7 +132,7 @@ impl KrakenFuturesDataClient {
             .and_then(|guard| guard.get(instrument_id).cloned())
     }
 
-    async fn load_instruments(&mut self) -> anyhow::Result<Vec<InstrumentAny>> {
+    async fn load_instruments(&self) -> anyhow::Result<Vec<InstrumentAny>> {
         let instruments = self
             .http
             .request_instruments()
@@ -242,6 +242,7 @@ impl KrakenFuturesDataClient {
             }
             // Execution messages are handled by the execution client
             KrakenFuturesWsMessage::OrderAccepted(_)
+            | KrakenFuturesWsMessage::OrderRejected(_)
             | KrakenFuturesWsMessage::OrderCanceled(_)
             | KrakenFuturesWsMessage::OrderExpired(_)
             | KrakenFuturesWsMessage::OrderUpdated(_)

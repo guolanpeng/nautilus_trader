@@ -23,19 +23,31 @@ crate-type = ["rlib"]
 
 [features]
 high-precision = ["nautilus-model/high-precision"]
+python = [
+  "nautilus-core/python",
+  "nautilus-model/python",
+  "nautilus-system/python",
+  "pyo3",
+]
 
 [package.metadata.docs.rs]
-all-features = true
+features = ["high-precision"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 nautilus-common = { workspace = true, features = ["live"] }
 nautilus-core = { workspace = true }
+nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
 nautilus-network = { workspace = true }
+nautilus-persistence-macros = { workspace = true }
+nautilus-serialization = { workspace = true, features = ["arrow"] }
+nautilus-system = { workspace = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
+arrow = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 log = { workspace = true }
@@ -51,6 +63,12 @@ urlencoding = { workspace = true }
 ustr = { workspace = true }
 zeroize = { workspace = true }
 
+pyo3 = { workspace = true, optional = true }
+
 [dev-dependencies]
+nautilus-execution = { workspace = true }
 nautilus-testkit = { workspace = true }
+
+axum = { workspace = true }
 rstest = { workspace = true }
+tokio = { workspace = true, features = ["full"] }

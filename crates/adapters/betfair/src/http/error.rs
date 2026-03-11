@@ -82,6 +82,48 @@ impl BetfairHttpError {
             _ => false,
         }
     }
+
+    /// Returns whether this error is a session expiry that should trigger reconnection.
+    ///
+    /// Session errors (`NO_SESSION`, `INVALID_SESSION_INFORMATION`) occur every
+    /// 12-24 hours and are resolved by re-authenticating. Undocumented JSON-RPC
+    /// server errors (-32099) are also treated as session errors.
+    #[must_use]
+    pub fn is_session_error(&self) -> bool {
+        match self {
+            Self::BetfairError { code, message } => {
+                message.contains("NO_SESSION")
+                    || message.contains("INVALID_SESSION_INFORMATION")
+                    || *code == -32099
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns whether this error is a rate limit (`TOO_MANY_REQUESTS`) error.
+    #[must_use]
+    pub fn is_rate_limit_error(&self) -> bool {
+        match self {
+            Self::BetfairError { message, .. } => message.contains("TOO_MANY_REQUESTS"),
+            Self::UnexpectedStatus { status, .. } => *status == 429,
+            _ => false,
+        }
+    }
+
+    /// Returns whether this error leaves order placement in an ambiguous state.
+    ///
+    /// When true, the request may have been processed by Betfair despite the
+    /// error. Callers must NOT emit `OrderRejected` for ambiguous errors
+    /// because the order may be live on the exchange. The OCM stream will
+    /// reconcile the order via its `customerOrderRef`.
+    #[must_use]
+    pub fn is_order_placement_ambiguous(&self) -> bool {
+        match self {
+            Self::NetworkError(_) | Self::Timeout(_) => true,
+            Self::UnexpectedStatus { status, .. } => *status >= 500,
+            _ => false,
+        }
+    }
 }
 
 /// Returns whether a Betfair JSON-RPC error code is retryable.
@@ -159,5 +201,41 @@ mod tests {
         let anyhow_err = anyhow::anyhow!("network failure");
         let err: BetfairHttpError = anyhow_err.into();
         assert!(matches!(err, BetfairHttpError::NetworkError(_)));
+    }
+
+    #[rstest]
+    #[case(BetfairHttpError::NetworkError("connection reset".to_string()), true)]
+    #[case(BetfairHttpError::Timeout("read".to_string()), true)]
+    #[case(BetfairHttpError::UnexpectedStatus { status: 502, body: "error code: 502".to_string() }, true)]
+    #[case(BetfairHttpError::UnexpectedStatus { status: 500, body: String::new() }, true)]
+    #[case(BetfairHttpError::UnexpectedStatus { status: 429, body: String::new() }, false)]
+    #[case(BetfairHttpError::UnexpectedStatus { status: 403, body: String::new() }, false)]
+    #[case(BetfairHttpError::BetfairError { code: -32600, message: "Invalid".to_string() }, false)]
+    #[case(BetfairHttpError::JsonError("bad".to_string()), false)]
+    #[case(BetfairHttpError::MissingCredentials, false)]
+    #[case(BetfairHttpError::Canceled("shutdown".to_string()), false)]
+    fn test_is_order_placement_ambiguous(#[case] error: BetfairHttpError, #[case] expected: bool) {
+        assert_eq!(error.is_order_placement_ambiguous(), expected);
+    }
+
+    #[rstest]
+    #[case(BetfairHttpError::BetfairError { code: -32099, message: "server error".to_string() }, true)]
+    #[case(BetfairHttpError::BetfairError { code: -1, message: "NO_SESSION".to_string() }, true)]
+    #[case(BetfairHttpError::BetfairError { code: -1, message: "INVALID_SESSION_INFORMATION".to_string() }, true)]
+    #[case(BetfairHttpError::BetfairError { code: -32600, message: "Invalid request".to_string() }, false)]
+    #[case(BetfairHttpError::NetworkError("timeout".to_string()), false)]
+    #[case(BetfairHttpError::UnexpectedStatus { status: 429, body: String::new() }, false)]
+    fn test_is_session_error(#[case] error: BetfairHttpError, #[case] expected: bool) {
+        assert_eq!(error.is_session_error(), expected);
+    }
+
+    #[rstest]
+    #[case(BetfairHttpError::BetfairError { code: -1, message: "TOO_MANY_REQUESTS".to_string() }, true)]
+    #[case(BetfairHttpError::UnexpectedStatus { status: 429, body: String::new() }, true)]
+    #[case(BetfairHttpError::BetfairError { code: -1, message: "NO_SESSION".to_string() }, false)]
+    #[case(BetfairHttpError::UnexpectedStatus { status: 500, body: String::new() }, false)]
+    #[case(BetfairHttpError::NetworkError("timeout".to_string()), false)]
+    fn test_is_rate_limit_error(#[case] error: BetfairHttpError, #[case] expected: bool) {
+        assert_eq!(error.is_rate_limit_error(), expected);
     }
 }

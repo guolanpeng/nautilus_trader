@@ -35,7 +35,7 @@ use nautilus_model::{
     },
     instruments::{Instrument, InstrumentAny},
     reports::{FillReport, OrderStatusReport},
-    types::{Money, Price, Quantity},
+    types::{Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 use ustr::Ustr;
@@ -946,18 +946,18 @@ pub fn parse_candle_msg(
 ///
 /// Returns an error if any contained order messages cannot be parsed.
 pub fn parse_order_msg_vec(
-    data: Vec<OKXOrderMsg>,
+    data: &[OKXOrderMsg],
     account_id: AccountId,
     instruments: &AHashMap<Ustr, InstrumentAny>,
-    fee_cache: &AHashMap<Ustr, Money>,
-    filled_qty_cache: &AHashMap<Ustr, Quantity>,
+    fee_cache: &mut AHashMap<Ustr, Money>,
+    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Vec<ExecutionReport>> {
     let mut order_reports = Vec::with_capacity(data.len());
 
     for msg in data {
         match parse_order_msg(
-            &msg,
+            msg,
             account_id,
             instruments,
             fee_cache,
@@ -967,9 +967,46 @@ pub fn parse_order_msg_vec(
             Ok(report) => order_reports.push(report),
             Err(e) => log::error!("Failed to parse execution report from message: {e}"),
         }
+
+        if let Some(instrument) = instruments.get(&msg.inst_id) {
+            update_fee_fill_caches(msg, instrument, fee_cache, filled_qty_cache);
+        }
     }
 
     Ok(order_reports)
+}
+
+/// Updates fee and fill caches from a raw OKX order message.
+///
+/// Call after parsing each message so subsequent messages in the same batch
+/// see the correct cumulative fee and filled quantity.
+pub fn update_fee_fill_caches(
+    msg: &OKXOrderMsg,
+    instrument: &InstrumentAny,
+    fee_cache: &mut AHashMap<Ustr, Money>,
+    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
+) {
+    if let Some(ref fee_str) = msg.fee
+        && !fee_str.is_empty()
+    {
+        let fee_ccy = if msg.fee_ccy.is_empty() {
+            Currency::USDT()
+        } else {
+            Currency::from(msg.fee_ccy.as_str())
+        };
+
+        if let Ok(total_fee) = crate::common::parse::parse_fee(Some(fee_str.as_str()), fee_ccy) {
+            fee_cache.insert(msg.ord_id, total_fee);
+        }
+    }
+
+    if let Some(ref acc_fill_sz) = msg.acc_fill_sz
+        && !acc_fill_sz.is_empty()
+        && acc_fill_sz != "0"
+        && let Ok(qty) = parse_quantity(acc_fill_sz, instrument.size_precision())
+    {
+        filled_qty_cache.insert(msg.ord_id, qty);
+    }
 }
 
 /// Checks if acc_fill_sz has increased compared to the previous filled quantity.
@@ -1046,7 +1083,7 @@ pub fn parse_order_msg(
 /// Returns an error if the instrument cannot be found or if message fields
 /// fail to parse.
 pub fn parse_algo_order_msg(
-    msg: OKXAlgoOrderMsg,
+    msg: &OKXAlgoOrderMsg,
     account_id: AccountId,
     instruments: &AHashMap<Ustr, InstrumentAny>,
     ts_init: UnixNanos,
@@ -1064,7 +1101,7 @@ pub fn parse_algo_order_msg(
         .get(&msg.inst_id)
         .ok_or_else(|| anyhow::anyhow!("No instrument found for inst_id: {}", msg.inst_id))?;
 
-    parse_algo_order_status_report(&msg, inst, account_id, ts_init)
+    parse_algo_order_status_report(msg, inst, account_id, ts_init)
         .map(ExecutionReport::Order)
         .map(Some)
 }
@@ -1194,7 +1231,14 @@ pub fn parse_order_status_report(
     account_id: AccountId,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderStatusReport> {
-    let client_order_id = parse_client_order_id(&msg.cl_ord_id);
+    // For triggered algo child orders, OKX assigns a new cl_ord_id and keeps
+    // the parent's ID in algo_cl_ord_id. Prefer the parent ID so the report
+    // matches the tracked order in Nautilus.
+    let client_order_id = msg
+        .algo_cl_ord_id
+        .as_deref()
+        .and_then(parse_client_order_id)
+        .or_else(|| parse_client_order_id(&msg.cl_ord_id));
     let venue_order_id = VenueOrderId::new(msg.ord_id);
     let order_side: OrderSide = msg.side.into();
 
@@ -1424,7 +1468,12 @@ pub fn parse_fill_report(
     previous_filled_qty: Option<Quantity>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<FillReport> {
-    let client_order_id = parse_client_order_id(&msg.cl_ord_id);
+    // For triggered algo child orders, prefer the parent algo_cl_ord_id
+    let client_order_id = msg
+        .algo_cl_ord_id
+        .as_deref()
+        .and_then(parse_client_order_id)
+        .or_else(|| parse_client_order_id(&msg.cl_ord_id));
     let venue_order_id = VenueOrderId::new(msg.ord_id);
 
     // TODO: Extract to dedicated function:
@@ -1471,6 +1520,12 @@ pub fn parse_fill_report(
 
             // Calculate incremental fill as: current_total - previous_total
             if let Some(prev_qty) = previous_filled_qty {
+                if current_filled < prev_qty {
+                    anyhow::bail!(
+                        "Cumulative fill went backwards: acc_fill_sz='{acc_fill_sz}' < previous_filled_qty={prev_qty} \
+                         (possible stale data after reconnect)"
+                    );
+                }
                 let incremental = current_filled - prev_qty;
                 if incremental.is_zero() {
                     anyhow::bail!(
@@ -1508,34 +1563,44 @@ pub fn parse_fill_report(
 
     // OKX sends cumulative fees, so we subtract the previous total to get this fill's fee
     let commission = if let Some(previous_fee) = previous_fee {
-        let incremental = total_fee - previous_fee;
+        if total_fee.currency == previous_fee.currency {
+            let incremental = total_fee - previous_fee;
 
-        if incremental < Money::zero(fee_currency) {
-            log::debug!(
-                "Negative incremental fee detected - likely a maker rebate or fee refund: order_id={}, total_fee={}, previous_fee={}, incremental={}",
-                msg.ord_id.as_str(),
-                total_fee,
-                previous_fee,
-                incremental,
-            );
-        }
+            if incremental < Money::zero(fee_currency) {
+                log::debug!(
+                    "Negative incremental fee detected - likely a maker rebate or fee refund: order_id={}, total_fee={}, previous_fee={}, incremental={}",
+                    msg.ord_id.as_str(),
+                    total_fee,
+                    previous_fee,
+                    incremental,
+                );
+            }
 
-        // Skip corruption check when previous is negative (rebate), as transitions from
-        // rebate to charge legitimately have incremental > total (e.g., -1 → +2 gives +3)
-        if previous_fee >= Money::zero(fee_currency)
-            && total_fee > Money::zero(fee_currency)
-            && incremental > total_fee
-        {
-            log::error!(
-                "Incremental fee exceeds total fee - likely fee cache corruption, using total fee as fallback: order_id={}, total_fee={}, previous_fee={}, incremental={}",
+            // Skip corruption check when previous is negative (rebate), as transitions from
+            // rebate to charge legitimately have incremental > total (e.g., -1 → +2 gives +3)
+            if previous_fee >= Money::zero(fee_currency)
+                && total_fee > Money::zero(fee_currency)
+                && incremental > total_fee
+            {
+                log::error!(
+                    "Incremental fee exceeds total fee - likely fee cache corruption, using total fee as fallback: order_id={}, total_fee={}, previous_fee={}, incremental={}",
+                    msg.ord_id.as_str(),
+                    total_fee,
+                    previous_fee,
+                    incremental,
+                );
+                total_fee
+            } else {
+                incremental
+            }
+        } else {
+            log::warn!(
+                "Fee currency changed from {} to {} for order_id={}, using total fee as commission",
+                previous_fee.currency.code,
+                total_fee.currency.code,
                 msg.ord_id.as_str(),
-                total_fee,
-                previous_fee,
-                incremental,
             );
             total_fee
-        } else {
-            incremental
         }
     } else {
         total_fee
@@ -1766,7 +1831,7 @@ mod tests {
             testing::load_test_json,
         },
         http::models::OKXAccount,
-        websocket::messages::{OKXAlgoOrderMsg, OKXWebSocketArg, OKXWsMessage},
+        websocket::messages::{OKXAlgoOrderMsg, OKXWebSocketArg, OKXWsFrame},
     };
 
     fn create_stub_instrument() -> CryptoPerpetual {
@@ -1844,9 +1909,9 @@ mod tests {
     #[rstest]
     fn test_parse_books_snapshot() {
         let json_data = load_test_json("ws_books_snapshot.json");
-        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
         let (okx_books, action): (Vec<OKXBookMsg>, OKXBookAction) = match msg {
-            OKXWsMessage::BookData { data, action, .. } => (data, action),
+            OKXWsFrame::BookData { data, action, .. } => (data, action),
             _ => panic!("Expected a `BookData` variant"),
         };
 
@@ -1887,10 +1952,10 @@ mod tests {
     #[rstest]
     fn test_parse_books_update() {
         let json_data = load_test_json("ws_books_update.json");
-        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
         let instrument_id = InstrumentId::from("BTC-USDT.OKX");
         let (okx_books, action): (Vec<OKXBookMsg>, OKXBookAction) = match msg {
-            OKXWsMessage::BookData { data, action, .. } => (data, action),
+            OKXWsFrame::BookData { data, action, .. } => (data, action),
             _ => panic!("Expected a `BookData` variant"),
         };
 
@@ -1930,9 +1995,9 @@ mod tests {
     #[rstest]
     fn test_parse_tickers() {
         let json_data = load_test_json("ws_tickers.json");
-        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
         let okx_tickers: Vec<OKXTickerMsg> = match msg {
-            OKXWsMessage::Data { data, .. } => serde_json::from_value(data).unwrap(),
+            OKXWsFrame::Data { data, .. } => serde_json::from_value(data).unwrap(),
             _ => panic!("Expected a `Data` variant"),
         };
 
@@ -1952,9 +2017,9 @@ mod tests {
     #[rstest]
     fn test_parse_quotes() {
         let json_data = load_test_json("ws_bbo_tbt.json");
-        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
         let okx_quotes: Vec<OKXBookMsg> = match msg {
-            OKXWsMessage::Data { data, .. } => serde_json::from_value(data).unwrap(),
+            OKXWsFrame::Data { data, .. } => serde_json::from_value(data).unwrap(),
             _ => panic!("Expected a `Data` variant"),
         };
         let instrument_id = InstrumentId::from("BTC-USDT.OKX");
@@ -1974,9 +2039,9 @@ mod tests {
     #[rstest]
     fn test_parse_trades() {
         let json_data = load_test_json("ws_trades.json");
-        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
         let okx_trades: Vec<OKXTradeMsg> = match msg {
-            OKXWsMessage::Data { data, .. } => serde_json::from_value(data).unwrap(),
+            OKXWsFrame::Data { data, .. } => serde_json::from_value(data).unwrap(),
             _ => panic!("Expected a `Data` variant"),
         };
 
@@ -1996,9 +2061,9 @@ mod tests {
     #[rstest]
     fn test_parse_candle() {
         let json_data = load_test_json("ws_candle.json");
-        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
         let okx_candles: Vec<OKXCandleMsg> = match msg {
-            OKXWsMessage::Data { data, .. } => serde_json::from_value(data).unwrap(),
+            OKXWsFrame::Data { data, .. } => serde_json::from_value(data).unwrap(),
             _ => panic!("Expected a `Data` variant"),
         };
 
@@ -2023,10 +2088,10 @@ mod tests {
     #[rstest]
     fn test_parse_funding_rate() {
         let json_data = load_test_json("ws_funding_rate.json");
-        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
 
         let okx_funding_rates: Vec<crate::websocket::messages::OKXFundingRateMsg> = match msg {
-            OKXWsMessage::Data { data, .. } => serde_json::from_value(data).unwrap(),
+            OKXWsFrame::Data { data, .. } => serde_json::from_value(data).unwrap(),
             _ => panic!("Expected a `Data` variant"),
         };
 
@@ -2048,9 +2113,9 @@ mod tests {
     #[rstest]
     fn test_parse_book_vec() {
         let json_data = load_test_json("ws_books_snapshot.json");
-        let event: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
+        let event: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
         let (msgs, action): (Vec<OKXBookMsg>, OKXBookAction) = match event {
-            OKXWsMessage::BookData { data, action, .. } => (data, action),
+            OKXWsFrame::BookData { data, action, .. } => (data, action),
             _ => panic!("Expected BookData"),
         };
 
@@ -2070,9 +2135,9 @@ mod tests {
     #[rstest]
     fn test_parse_ticker_vec() {
         let json_data = load_test_json("ws_tickers.json");
-        let event: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
+        let event: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
         let data_val: serde_json::Value = match event {
-            OKXWsMessage::Data { data, .. } => data,
+            OKXWsFrame::Data { data, .. } => data,
             _ => panic!("Expected Data"),
         };
 
@@ -2093,9 +2158,9 @@ mod tests {
     #[rstest]
     fn test_parse_trade_vec() {
         let json_data = load_test_json("ws_trades.json");
-        let event: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
+        let event: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
         let data_val: serde_json::Value = match event {
-            OKXWsMessage::Data { data, .. } => data,
+            OKXWsFrame::Data { data, .. } => data,
             _ => panic!("Expected Data"),
         };
 
@@ -2115,9 +2180,9 @@ mod tests {
     #[rstest]
     fn test_parse_candle_vec() {
         let json_data = load_test_json("ws_candle.json");
-        let event: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
+        let event: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
         let data_val: serde_json::Value = match event {
-            OKXWsMessage::Data { data, .. } => data,
+            OKXWsFrame::Data { data, .. } => data,
             _ => panic!("Expected Data"),
         };
 
@@ -2144,9 +2209,9 @@ mod tests {
     #[rstest]
     fn test_parse_book_message() {
         let json_data = load_test_json("ws_bbo_tbt.json");
-        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
         let (okx_books, arg): (Vec<OKXBookMsg>, OKXWebSocketArg) = match msg {
-            OKXWsMessage::Data { data, arg, .. } => (serde_json::from_value(data).unwrap(), arg),
+            OKXWsFrame::Data { data, arg, .. } => (serde_json::from_value(data).unwrap(), arg),
             _ => panic!("Expected a `Data` variant"),
         };
 
@@ -2181,10 +2246,10 @@ mod tests {
     #[rstest]
     fn test_parse_ws_account_message() {
         let json_data = load_test_json("ws_account.json");
-        let msg: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
+        let msg: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
 
-        let OKXWsMessage::Data { data, .. } = msg else {
-            panic!("Expected OKXWsMessage::Data");
+        let OKXWsFrame::Data { data, .. } = msg else {
+            panic!("Expected OKXWsFrame::Data");
         };
 
         let accounts: Vec<OKXAccount> = serde_json::from_value(data).unwrap();
@@ -2264,15 +2329,15 @@ mod tests {
         );
 
         let ts_init = UnixNanos::default();
-        let fee_cache = AHashMap::new();
-        let filled_qty_cache = AHashMap::new();
+        let mut fee_cache = AHashMap::new();
+        let mut filled_qty_cache = AHashMap::new();
 
         let result = parse_order_msg_vec(
-            data,
+            &data,
             account_id,
             &instruments,
-            &fee_cache,
-            &filled_qty_cache,
+            &mut fee_cache,
+            &mut filled_qty_cache,
             ts_init,
         );
 
@@ -2440,9 +2505,9 @@ mod tests {
     #[rstest]
     fn test_parse_book10_msg() {
         let json_data = load_test_json("ws_books_snapshot.json");
-        let event: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
+        let event: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
         let msgs: Vec<OKXBookMsg> = match event {
-            OKXWsMessage::BookData { data, .. } => data,
+            OKXWsFrame::BookData { data, .. } => data,
             _ => panic!("Expected BookData"),
         };
 
@@ -2489,9 +2554,9 @@ mod tests {
     #[rstest]
     fn test_parse_book10_msg_vec() {
         let json_data = load_test_json("ws_books_snapshot.json");
-        let event: OKXWsMessage = serde_json::from_str(&json_data).unwrap();
+        let event: OKXWsFrame = serde_json::from_str(&json_data).unwrap();
         let msgs: Vec<OKXBookMsg> = match event {
-            OKXWsMessage::BookData { data, .. } => data,
+            OKXWsFrame::BookData { data, .. } => data,
             _ => panic!("Expected BookData"),
         };
 
@@ -3041,6 +3106,34 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_fill_report_fee_currency_change_no_panic() {
+        let instrument = create_stub_instrument();
+        let account_id = AccountId::new("OKX-001");
+        let ts_init = UnixNanos::default();
+
+        // First fill charged in USDT
+        let previous_fee = Money::new(1.0, Currency::USDT());
+
+        // Second fill charged in BTC (fee currency changed)
+        let mut order_msg =
+            create_stub_order_msg("0.01", Some("0.02".to_string()), "1234567890", "trade_2");
+        order_msg.fee = Some("-0.00005".to_string());
+        order_msg.fee_ccy = Ustr::from("BTC");
+
+        let result = parse_fill_report(
+            &order_msg,
+            &InstrumentAny::CryptoPerpetual(instrument),
+            account_id,
+            Some(previous_fee),
+            Some(Quantity::from("0.01")),
+            ts_init,
+        );
+
+        let fill_report = result.unwrap();
+        assert_eq!(fill_report.commission.currency, Currency::BTC());
+    }
+
+    #[rstest]
     fn test_parse_fill_report_empty_fill_sz_first_fill() {
         let instrument = create_stub_instrument();
         let account_id = AccountId::new("OKX-001");
@@ -3143,6 +3236,30 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Cannot determine fill quantity"));
         assert!(err_msg.contains("acc_fill_sz is None"));
+    }
+
+    #[rstest]
+    fn test_parse_fill_report_error_acc_fill_sz_less_than_previous() {
+        let instrument = create_stub_instrument();
+        let account_id = AccountId::new("OKX-001");
+        let ts_init = UnixNanos::default();
+
+        // acc_fill_sz (0.01) < previous_filled_qty (0.03) — stale data after reconnect
+        let order_msg =
+            create_stub_order_msg("", Some("0.01".to_string()), "1234567890", "trade_2");
+
+        let result = parse_fill_report(
+            &order_msg,
+            &InstrumentAny::CryptoPerpetual(instrument),
+            account_id,
+            None,
+            Some(Quantity::from("0.03")),
+            ts_init,
+        );
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Cumulative fill went backwards"));
     }
 
     #[rstest]
@@ -3303,8 +3420,7 @@ mod tests {
             InstrumentAny::CryptoPerpetual(instrument),
         );
 
-        let result =
-            parse_algo_order_msg(msg.clone(), account_id, &instruments, UnixNanos::default());
+        let result = parse_algo_order_msg(msg, account_id, &instruments, UnixNanos::default());
 
         let report = result.unwrap().unwrap();
 
@@ -3369,8 +3485,7 @@ mod tests {
             InstrumentAny::CryptoPerpetual(instrument),
         );
 
-        let result =
-            parse_algo_order_msg(msg.clone(), account_id, &instruments, UnixNanos::default());
+        let result = parse_algo_order_msg(msg, account_id, &instruments, UnixNanos::default());
 
         let report = result.unwrap().unwrap();
 
@@ -3434,15 +3549,15 @@ mod tests {
             InstrumentAny::CryptoPerpetual(instrument),
         );
 
-        let fee_cache = AHashMap::new();
-        let filled_qty_cache = AHashMap::new();
+        let mut fee_cache = AHashMap::new();
+        let mut filled_qty_cache = AHashMap::new();
 
         let result = parse_order_msg_vec(
-            vec![msg.clone()],
+            std::slice::from_ref(msg),
             account_id,
             &instruments,
-            &fee_cache,
-            &filled_qty_cache,
+            &mut fee_cache,
+            &mut filled_qty_cache,
             UnixNanos::default(),
         );
 
@@ -3507,15 +3622,15 @@ mod tests {
             Ustr::from("BTC-USDT-SWAP"),
             InstrumentAny::CryptoPerpetual(instrument),
         );
-        let fee_cache = AHashMap::new();
-        let filled_qty_cache = AHashMap::new();
+        let mut fee_cache = AHashMap::new();
+        let mut filled_qty_cache = AHashMap::new();
 
         let result = parse_order_msg_vec(
-            vec![msg.clone()],
+            std::slice::from_ref(msg),
             account_id,
             &instruments,
-            &fee_cache,
-            &filled_qty_cache,
+            &mut fee_cache,
+            &mut filled_qty_cache,
             UnixNanos::default(),
         );
 
@@ -3583,15 +3698,15 @@ mod tests {
             InstrumentAny::CryptoPerpetual(instrument),
         );
 
-        let fee_cache = AHashMap::new();
-        let filled_qty_cache = AHashMap::new();
+        let mut fee_cache = AHashMap::new();
+        let mut filled_qty_cache = AHashMap::new();
 
         let result = parse_order_msg_vec(
-            vec![msg.clone()],
+            std::slice::from_ref(msg),
             account_id,
             &instruments,
-            &fee_cache,
-            &filled_qty_cache,
+            &mut fee_cache,
+            &mut filled_qty_cache,
             UnixNanos::default(),
         );
 
@@ -4829,7 +4944,7 @@ mod tests {
 
         let msg = stub_algo_order_msg(OKXAlgoOrderType::Iceberg);
 
-        let result = parse_algo_order_msg(msg, account_id, &instruments, UnixNanos::default());
+        let result = parse_algo_order_msg(&msg, account_id, &instruments, UnixNanos::default());
 
         assert!(result.unwrap().is_none());
     }

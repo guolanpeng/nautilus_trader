@@ -1814,8 +1814,7 @@ impl OKXHttpClient {
             let mut before_trade_id: Option<String> = None;
             let mut pages = 0usize;
             let mut page_results: Vec<Vec<TradeTick>> = Vec::new();
-            let mut seen_trades: std::collections::HashSet<(String, i64)> =
-                std::collections::HashSet::new();
+            let mut seen_trades: AHashSet<(String, i64)> = AHashSet::new();
             let mut unique_count = 0usize;
             let mut consecutive_empty_pages = 0usize;
 
@@ -2007,7 +2006,7 @@ impl OKXHttpClient {
             }
 
             // Deduplicate by (trade_id, ts_event) composite key
-            let mut dedup_keys = std::collections::HashSet::new();
+            let mut dedup_keys = AHashSet::new();
             let pre_dedup_len = out.len();
             out.retain(|trade| {
                 dedup_keys.insert((trade.trade_id.to_string(), trade.ts_event.as_i64()))
@@ -2948,7 +2947,7 @@ impl OKXHttpClient {
             };
 
             let report = match parse_fill_report(
-                detail,
+                &detail,
                 account_id,
                 inst.id(),
                 inst.price_precision(),
@@ -3051,7 +3050,7 @@ impl OKXHttpClient {
             };
 
             match parse_position_status_report(
-                position,
+                &position,
                 account_id,
                 inst.id(),
                 inst.size_precision(),
@@ -3369,7 +3368,7 @@ impl OKXHttpClient {
                 "Invalid order side".to_string(),
             ));
         }
-        let okx_side: OKXSide = order_side.into();
+        let okx_side = OKXSide::from(order_side.as_specified());
         let algo_type = conditional_order_to_algo_type(order_type)
             .map_err(|e| OKXHttpError::ValidationError(e.to_string()))?;
 

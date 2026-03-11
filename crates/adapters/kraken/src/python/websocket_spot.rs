@@ -72,7 +72,7 @@ impl KrakenSpotWebSocketClient {
         heartbeat_secs: Option<u64>,
         api_key: Option<String>,
         api_secret: Option<String>,
-    ) -> PyResult<Self> {
+    ) -> Self {
         let env = environment.unwrap_or(KrakenEnvironment::Mainnet);
 
         let (resolved_api_key, resolved_api_secret) =
@@ -102,7 +102,7 @@ impl KrakenSpotWebSocketClient {
 
         let token = CancellationToken::new();
 
-        Ok(Self::new(config, token))
+        Self::new(config, token)
     }
 
     #[getter]
@@ -162,6 +162,7 @@ impl KrakenSpotWebSocketClient {
     }
 
     #[pyo3(name = "connect")]
+    #[allow(clippy::needless_pass_by_value)]
     fn py_connect<'py>(
         &mut self,
         py: Python<'py>,

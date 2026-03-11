@@ -231,7 +231,7 @@ impl DydxExecutionClient {
 
         // Use private WebSocket client for authenticated subaccount subscriptions
         let credential = DydxCredential::resolve(
-            config.private_key.clone(),
+            config.private_key.as_deref(),
             config.is_testnet,
             config.authenticator_ids.clone(),
         )?
@@ -662,7 +662,7 @@ impl DydxExecutionClient {
     ///
     /// The instruments are stored in the shared `InstrumentCache` which is automatically
     /// populated by the HTTP client during `fetch_and_cache_instruments()`.
-    fn mark_instruments_initialized(&mut self) {
+    fn mark_instruments_initialized(&self) {
         let count = self.instrument_cache.len();
         self.core.set_instruments_initialized();
         log::debug!("Instruments initialized: {count} instruments in shared cache");
@@ -1533,7 +1533,7 @@ impl ExecutionClient for DydxExecutionClient {
                 let mut handles = Vec::with_capacity(order_count);
 
                 for (params, (client_order_id, instrument_id, strategy_id)) in
-                    order_params.into_iter().zip(order_info.into_iter())
+                    order_params.into_iter().zip(order_info)
                 {
                     let tx_manager = tx_manager.clone();
                     let broadcaster = broadcaster.clone();

@@ -1,9 +1,9 @@
 # Cache
 
-The `Cache` is a central in-memory database that automatically stores and manages all trading-related data.
-Think of it as your trading system’s memory – storing everything from market data to order history to custom calculations.
+The `Cache` is a central in-memory database that stores and manages all trading-related data,
+from market data to order history to custom calculations.
 
-The Cache serves multiple key purposes:
+The Cache serves multiple purposes:
 
 1. **Stores market data**:
    - Stores recent market history (e.g., order books, quotes, trades, bars).
@@ -150,7 +150,7 @@ config = CacheConfig(
 
 ### Accessing market data
 
-The `Cache` provides a comprehensive interface for accessing order books, quotes, trades, and bars.
+The `Cache` provides a full interface for accessing order books, quotes, trades, and bars.
 All market data in the cache uses reverse indexing, so the most recent entry sits at index 0.
 
 #### Bar access
@@ -264,7 +264,7 @@ class MarketDataStrategy(Strategy):
 
 ### Trading objects
 
-The `Cache` provides comprehensive access to all trading objects within the system, including:
+The `Cache` provides access to all trading objects within the system, including:
 
 - Orders
 - Positions

@@ -27,8 +27,9 @@ use nautilus_common::{
     clients::ExecutionClient,
     clock::TestClock,
     messages::execution::{
-        BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateOrderStatusReports, ModifyOrder,
-        QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateOrderStatusReports,
+        GeneratePositionStatusReports, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+        SubmitOrderList,
     },
 };
 use nautilus_core::{UUID4, UnixNanos};
@@ -127,7 +128,7 @@ impl TestContext {
             .unwrap();
     }
 
-    fn add_position(&self, position: Position) {
+    fn add_position(&self, position: &Position) {
         self.cache
             .borrow_mut()
             .add_position(position, OmsType::Hedging)
@@ -3191,7 +3192,7 @@ async fn test_reconcile_hedge_position_matching_quantities() {
 
     // Add existing position to cache with 5.0 qty
     let position = create_test_position(&instrument, position_id, OrderSide::Buy, "5.0", "3000.00");
-    ctx.add_position(position);
+    ctx.add_position(&position);
 
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
@@ -3243,7 +3244,7 @@ async fn test_reconcile_hedge_position_discrepancy_generates_order() {
 
     // Add existing position to cache with 5.0 qty
     let position = create_test_position(&instrument, position_id, OrderSide::Buy, "5.0", "3000.00");
-    ctx.add_position(position);
+    ctx.add_position(&position);
 
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
@@ -3339,7 +3340,7 @@ async fn test_reconcile_hedge_position_discrepancy_disabled() {
 
     // Add existing position with different qty than venue reports
     let position = create_test_position(&instrument, position_id, OrderSide::Buy, "5.0", "3000.00");
-    ctx.add_position(position);
+    ctx.add_position(&position);
 
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
@@ -3984,7 +3985,7 @@ async fn test_netting_position_cross_zero_long_to_short() {
         "5.0",
         "3000.00",
     );
-    ctx.add_position(position);
+    ctx.add_position(&position);
 
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
@@ -4059,7 +4060,7 @@ async fn test_netting_position_cross_zero_short_to_long() {
         "4.0",
         "3000.00",
     );
-    ctx.add_position(position);
+    ctx.add_position(&position);
 
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
@@ -4134,7 +4135,7 @@ async fn test_netting_position_flat_report_closes_cached_position() {
         "5.0",
         "3000.00",
     );
-    ctx.add_position(position);
+    ctx.add_position(&position);
 
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
@@ -4847,7 +4848,7 @@ async fn test_cross_zero_with_missing_cached_avg_px_returns_none() {
         "5.0",
         "0.00", // Zero price - will be treated as no avg_px in some paths
     );
-    ctx.add_position(position);
+    ctx.add_position(&position);
 
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
@@ -4898,7 +4899,7 @@ async fn test_cross_zero_with_missing_venue_avg_px_closes_only() {
         "5.0",
         "3000.00",
     );
-    ctx.add_position(position);
+    ctx.add_position(&position);
 
     let mut mass_status = ExecutionMassStatus::new(
         test_client_id(),
@@ -6001,8 +6002,8 @@ async fn test_check_open_orders_defers_with_recent_local_activity() {
     .with_avg_px(100.0)
     .unwrap();
 
-    let mock_client = Rc::new(MockExecutionClient::new(vec![report]));
-    let clients: Vec<Rc<dyn ExecutionClient>> = vec![mock_client];
+    let mock_client = MockExecutionClient::new(vec![report]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     let events = ctx.manager.check_open_orders(&clients).await;
 
@@ -6057,8 +6058,8 @@ async fn test_check_open_orders_proceeds_after_threshold_exceeded() {
     .with_avg_px(100.0)
     .unwrap();
 
-    let mock_client = Rc::new(MockExecutionClient::new(vec![report]));
-    let clients: Vec<Rc<dyn ExecutionClient>> = vec![mock_client];
+    let mock_client = MockExecutionClient::new(vec![report]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     let events = ctx.manager.check_open_orders(&clients).await;
 
@@ -6114,8 +6115,8 @@ async fn test_check_open_orders_proceeds_without_local_activity() {
     .with_avg_px(100.0)
     .unwrap();
 
-    let mock_client = Rc::new(MockExecutionClient::new(vec![report]));
-    let clients: Vec<Rc<dyn ExecutionClient>> = vec![mock_client];
+    let mock_client = MockExecutionClient::new(vec![report]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     let events = ctx.manager.check_open_orders(&clients).await;
 
@@ -6156,9 +6157,9 @@ async fn test_check_open_orders_submitted_missing_at_venue_generates_rejected() 
     ctx.add_order(order.clone());
     ctx.cache.borrow_mut().update_order(&order).unwrap();
 
-    // Venue returns no reports - order was never placed
-    let mock_client = Rc::new(MockExecutionClient::new(vec![]));
-    let clients: Vec<Rc<dyn ExecutionClient>> = vec![mock_client];
+    // Venue returns no reports, order was never placed
+    let mock_client = MockExecutionClient::new(vec![]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     let events = ctx.manager.check_open_orders(&clients).await;
 
@@ -6188,10 +6189,10 @@ async fn test_position_check_retries_stops_after_max() {
 
     // Add position to cache but NOT the instrument — forces reconciliation to
     // return None on the cache.instrument() lookup
-    ctx.add_position(position);
+    ctx.add_position(&position);
 
-    let mock_client = Rc::new(MockExecutionClient::new(vec![]));
-    let clients: Vec<Rc<dyn ExecutionClient>> = vec![mock_client.clone()];
+    let mock_client = MockExecutionClient::new(vec![]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     // First attempt: detects discrepancy, can't reconcile, retry count -> 1
     let events = ctx.manager.check_positions_consistency(&clients).await;
@@ -6221,9 +6222,9 @@ async fn test_position_check_retries_clears_when_discrepancy_resolves() {
     let position = create_test_position(&instrument, position_id, OrderSide::Buy, "5.0", "3000.00");
 
     // First: add position without instrument to force a failed retry
-    ctx.add_position(position);
-    let mock_client = Rc::new(MockExecutionClient::new(vec![]));
-    let clients: Vec<Rc<dyn ExecutionClient>> = vec![mock_client.clone()];
+    ctx.add_position(&position);
+    let mock_client = MockExecutionClient::new(vec![]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     let events = ctx.manager.check_positions_consistency(&clients).await;
     assert!(events.is_empty()); // Failed, retry count = 1
@@ -6254,10 +6255,10 @@ async fn test_position_check_stale_retries_pruned_when_position_closed() {
 
     ctx.add_instrument(instrument.clone());
     let position = create_test_position(&instrument, position_id, OrderSide::Buy, "5.0", "3000.00");
-    ctx.add_position(position.clone());
+    ctx.add_position(&position);
 
-    let mock_client = Rc::new(MockExecutionClient::new(vec![]));
-    let clients: Vec<Rc<dyn ExecutionClient>> = vec![mock_client.clone()];
+    let mock_client = MockExecutionClient::new(vec![]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
     // First call: reconciliation succeeds (generates events to match venue=flat)
     let events = ctx.manager.check_positions_consistency(&clients).await;
@@ -6302,12 +6303,343 @@ async fn test_position_check_stale_retries_pruned_when_position_closed() {
         "3.0",
         "3100.00",
     );
-    ctx.add_position(position2);
+    ctx.add_position(&position2);
 
     // Should produce events (counter was pruned, not suppressed)
     let events = ctx.manager.check_positions_consistency(&clients).await;
     assert!(
         !events.is_empty(),
         "Expected events: stale retry counter should have been pruned"
+    );
+}
+
+struct MockPositionExecutionClient {
+    client_id: ClientId,
+    account_id: AccountId,
+    venue: Venue,
+    order_reports: RefCell<Vec<OrderStatusReport>>,
+    position_reports: RefCell<Vec<PositionStatusReport>>,
+}
+
+impl MockPositionExecutionClient {
+    fn new(
+        order_reports: Vec<OrderStatusReport>,
+        position_reports: Vec<PositionStatusReport>,
+    ) -> Self {
+        Self {
+            client_id: test_client_id(),
+            account_id: test_account_id(),
+            venue: test_venue(),
+            order_reports: RefCell::new(order_reports),
+            position_reports: RefCell::new(position_reports),
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl ExecutionClient for MockPositionExecutionClient {
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+
+    fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    fn venue(&self) -> Venue {
+        self.venue
+    }
+
+    fn oms_type(&self) -> OmsType {
+        OmsType::Hedging
+    }
+
+    fn get_account(&self) -> Option<AccountAny> {
+        None
+    }
+
+    fn generate_account_state(
+        &self,
+        _balances: Vec<AccountBalance>,
+        _margins: Vec<MarginBalance>,
+        _reported: bool,
+        _ts_event: UnixNanos,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn start(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn submit_order(&self, _cmd: &SubmitOrder) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn submit_order_list(&self, _cmd: &SubmitOrderList) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn modify_order(&self, _cmd: &ModifyOrder) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn cancel_order(&self, _cmd: &CancelOrder) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn cancel_all_orders(&self, _cmd: &CancelAllOrders) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn batch_cancel_orders(&self, _cmd: &BatchCancelOrders) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn query_account(&self, _cmd: &QueryAccount) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn query_order(&self, _cmd: &QueryOrder) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn generate_order_status_reports(
+        &self,
+        _cmd: &GenerateOrderStatusReports,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        Ok(self.order_reports.borrow().clone())
+    }
+
+    async fn generate_position_status_reports(
+        &self,
+        _cmd: &GeneratePositionStatusReports,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        Ok(self.position_reports.borrow().clone())
+    }
+}
+
+#[tokio::test]
+async fn test_position_check_dedup_skips_second_hedge_position_same_instrument() {
+    // Two hedge positions should only consume one retry per cycle, not two
+    let config = ExecutionManagerConfig {
+        position_check_retries: 3,
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    let instrument = test_instrument();
+
+    let pos_long = create_test_position(
+        &instrument,
+        PositionId::from("P-LONG"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    let pos_short = create_test_position(
+        &instrument,
+        PositionId::from("P-SHORT"),
+        OrderSide::Sell,
+        "3.0",
+        "3100.00",
+    );
+
+    // Omit instrument from cache to force the retry path
+    ctx.add_position(&pos_long);
+    ctx.add_position(&pos_short);
+
+    let mock_client = MockExecutionClient::new(vec![]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+
+    // Three cycles: each increments retry by 1 (not 2) thanks to dedup
+    ctx.manager.check_positions_consistency(&clients).await;
+    ctx.manager.check_positions_consistency(&clients).await;
+    let events = ctx.manager.check_positions_consistency(&clients).await;
+    assert!(events.is_empty());
+
+    // With correct dedup retry count is 3 (= max), so adding the instrument
+    // now should still be suppressed. If dedup were broken (2 per cycle),
+    // retries would have hit 6 instead.
+    ctx.add_instrument(instrument.clone());
+    let events = ctx.manager.check_positions_consistency(&clients).await;
+    assert!(
+        events.is_empty(),
+        "Expected retries to be exhausted after 3 cycles with dedup"
+    );
+}
+
+#[tokio::test]
+async fn test_position_check_flat_venue_report_does_not_protect_stale_counter() {
+    // Flat (zero-qty) venue reports should not prevent pruning of stale
+    // retry counters
+    let config = ExecutionManagerConfig {
+        position_check_retries: 1,
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+
+    ctx.add_instrument(instrument.clone());
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-001"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_position(&position);
+
+    let flat_report = PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSideSpecified::Flat,
+        Quantity::from("0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        None,
+        None,
+    );
+    let mock_client = MockPositionExecutionClient::new(vec![], vec![flat_report]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+
+    let events = ctx.manager.check_positions_consistency(&clients).await;
+    assert!(!events.is_empty());
+
+    // Don't apply events — simulate recon not fixing it, exhaust retries
+    ctx.manager.check_positions_consistency(&clients).await;
+    let close_order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_id)
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("5.0"))
+        .build();
+    let close_fill = TestOrderEventStubs::filled(
+        &close_order,
+        &instrument,
+        Some(TradeId::new("T-CLOSE-001")),
+        Some(PositionId::from("P-001")),
+        Some(Price::from("3000.00")),
+        Some(Quantity::from("5.0")),
+        None,
+        None,
+        None,
+        Some(test_account_id()),
+    );
+    let close_filled: OrderFilled = close_fill.into();
+    let mut pos = position;
+    pos.apply(&close_filled);
+    ctx.cache.borrow_mut().update_position(&pos).unwrap();
+
+    // Flat venue report should not protect the stale retry counter
+    ctx.manager.check_positions_consistency(&clients).await;
+
+    // Counter was pruned, so new position should trigger recon
+    let position2 = create_test_position(
+        &instrument,
+        PositionId::from("P-002"),
+        OrderSide::Buy,
+        "3.0",
+        "3100.00",
+    );
+    ctx.add_position(&position2);
+
+    let events = ctx.manager.check_positions_consistency(&clients).await;
+    assert!(
+        !events.is_empty(),
+        "Expected events: flat venue report should not protect stale retry counter"
+    );
+}
+
+#[tokio::test]
+async fn test_position_check_nonflat_venue_report_protects_counter() {
+    // Non-flat venue report should protect the retry counter from pruning
+    let config = ExecutionManagerConfig {
+        position_check_retries: 1,
+        position_check_threshold_ns: 0,
+        ..Default::default()
+    };
+    let mut ctx = TestContext::with_config(config);
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+
+    ctx.add_instrument(instrument.clone());
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-001"),
+        OrderSide::Buy,
+        "5.0",
+        "3000.00",
+    );
+    ctx.add_position(&position);
+
+    let venue_report = PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSideSpecified::Long,
+        Quantity::from("3.0"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        None,
+        Some(dec!(3000.00)),
+    );
+    let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report.clone()]);
+    let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
+
+    let events = ctx.manager.check_positions_consistency(&clients).await;
+    assert!(!events.is_empty());
+
+    // Don't apply events — exhaust retries
+    ctx.manager.check_positions_consistency(&clients).await;
+    let close_order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_id)
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("5.0"))
+        .build();
+    let close_fill = TestOrderEventStubs::filled(
+        &close_order,
+        &instrument,
+        Some(TradeId::new("T-CLOSE-002")),
+        Some(PositionId::from("P-001")),
+        Some(Price::from("3000.00")),
+        Some(Quantity::from("5.0")),
+        None,
+        None,
+        None,
+        Some(test_account_id()),
+    );
+    let close_filled: OrderFilled = close_fill.into();
+    let mut pos = position;
+    pos.apply(&close_filled);
+    ctx.cache.borrow_mut().update_position(&pos).unwrap();
+
+    // Non-flat venue report should keep the counter alive
+    ctx.manager.check_positions_consistency(&clients).await;
+
+    let position2 = create_test_position(
+        &instrument,
+        PositionId::from("P-002"),
+        OrderSide::Buy,
+        "3.0",
+        "3100.00",
+    );
+    ctx.add_position(&position2);
+
+    // Counter retained — retries still exhausted
+    let events = ctx.manager.check_positions_consistency(&clients).await;
+    assert!(
+        events.is_empty(),
+        "Expected no events: non-flat venue report should protect retry counter"
     );
 }

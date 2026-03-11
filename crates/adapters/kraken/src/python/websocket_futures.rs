@@ -43,7 +43,7 @@ impl KrakenFuturesWebSocketClient {
         heartbeat_secs: Option<u64>,
         api_key: Option<String>,
         api_secret: Option<String>,
-    ) -> PyResult<Self> {
+    ) -> Self {
         let env = environment.unwrap_or(KrakenEnvironment::Mainnet);
         let demo = env == KrakenEnvironment::Demo;
         let url = base_url.unwrap_or_else(|| {
@@ -51,7 +51,7 @@ impl KrakenFuturesWebSocketClient {
         });
         let credential = KrakenCredential::resolve_futures(api_key, api_secret, demo);
 
-        Ok(Self::with_credentials(url, heartbeat_secs, credential))
+        Self::with_credentials(url, heartbeat_secs, credential)
     }
 
     #[getter]
@@ -123,6 +123,7 @@ impl KrakenFuturesWebSocketClient {
     }
 
     #[pyo3(name = "connect")]
+    #[allow(clippy::needless_pass_by_value)]
     fn py_connect<'py>(
         &mut self,
         py: Python<'py>,
@@ -194,6 +195,18 @@ impl KrakenFuturesWebSocketClient {
                                     Err(e) => {
                                         log::error!(
                                             "Failed to convert OrderAccepted to Python: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            KrakenFuturesWsMessage::OrderRejected(event) => {
+                                match event.into_py_any(py) {
+                                    Ok(py_obj) => {
+                                        call_python_threadsafe(py, &call_soon, &callback, py_obj);
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "Failed to convert OrderRejected to Python: {e}"
                                         );
                                     }
                                 }

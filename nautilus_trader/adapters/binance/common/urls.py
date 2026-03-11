@@ -38,8 +38,9 @@ def get_http_base_url(  # noqa: C901 (URL dispatch)
     if environment == BinanceEnvironment.DEMO:
         if account_type.is_spot_or_margin:
             return "https://demo-api.binance.com"
-        elif account_type.is_futures:
-            # Futures demo uses same URLs as futures testnet
+        elif account_type == BinanceAccountType.USDT_FUTURES:
+            return "https://demo-fapi.binance.com"
+        elif account_type == BinanceAccountType.COIN_FUTURES:
             return "https://testnet.binancefuture.com"
         else:
             raise RuntimeError(  # pragma: no cover (design-time error)
@@ -74,7 +75,7 @@ def get_ws_api_base_url(  # noqa: C901 (URL dispatch)
     """
     if environment == BinanceEnvironment.TESTNET:
         if account_type.is_spot_or_margin:
-            return "wss://testnet.binance.vision/ws-api/v3"
+            return "wss://ws-api.testnet.binance.vision/ws-api/v3"
         elif account_type == BinanceAccountType.USDT_FUTURES:
             return "wss://testnet.binancefuture.com/ws-fapi/v1"
         elif account_type == BinanceAccountType.COIN_FUTURES:
