@@ -17,6 +17,7 @@ import datetime as dt
 from collections import OrderedDict
 from enum import Enum
 from io import TextIOWrapper
+from typing import cast
 from typing import Any
 from typing import BinaryIO
 
@@ -71,11 +72,17 @@ class StreamingFeatherWriter:
         The `fsspec` file system protocol.
     flush_interval_ms : int, optional
         The flush interval (milliseconds) for writing chunks.
+    batch_size : int, optional
+        The number of records to buffer per writer before serializing and writing.
+        If ``None`` or <= 1, data is written immediately.
     replace : bool, default False
         If existing files at the given `path` should be replaced.
     include_types : list[type], optional
         A list of Arrow serializable types to write.
         If this is specified then **only** the included types will be written.
+    compression : str, optional
+        The Arrow IPC compression codec. Supported values are ``"lz4"`` and ``"zstd"``.
+        If ``None``, compression is disabled.
     rotation_mode : RotationMode, default `RotationMode.NO_ROTATION`
         The mode for file rotation.
     max_file_size : int, default 1GB
@@ -96,8 +103,10 @@ class StreamingFeatherWriter:
         clock: Clock,
         fs_protocol: str | None = "file",
         flush_interval_ms: int | None = None,
+        batch_size: int | None = None,
         replace: bool = False,
         include_types: list[type] | None = None,
+        compression: str | None = None,
         rotation_mode: RotationMode = RotationMode.NO_ROTATION,
         max_file_size: int = 1024 * 1024 * 1024,  # 1GB
         rotation_interval: pd.Timedelta | None = None,
@@ -117,6 +126,13 @@ class StreamingFeatherWriter:
             self.fs.makedirs(self.path, exist_ok=True)  # Create directory if it doesn't exist
 
         self.include_types = include_types
+        self.batch_size = batch_size if batch_size and batch_size > 1 else None
+        self.compression = self._validate_compression(compression)
+        self._ipc_write_options = (
+            pa.ipc.IpcWriteOptions(compression=self.compression)
+            if self.compression is not None
+            else None
+        )
 
         if self.fs.exists(self.path) and replace:
             for fn in self.fs.ls(self.path):
@@ -132,6 +148,8 @@ class StreamingFeatherWriter:
         ] = {}
         self._writers: dict[str | tuple[str, str], RecordBatchStreamWriter] = {}
         self._instrument_writers: dict[tuple[str, str], RecordBatchStreamWriter] = {}
+        self._buffers: dict[str | tuple[str, str], list[object]] = {}
+        self._buffer_types: dict[str | tuple[str, str], type] = {}
         self._per_instrument_writers = {
             "bar",
             "order_book_deltas",
@@ -156,6 +174,22 @@ class StreamingFeatherWriter:
         self.missing_writers: set[type] = set()
         self._seen_event_ids: OrderedDict = OrderedDict()
         self._seen_event_ids_maxlen = 10_000
+
+    @staticmethod
+    def _validate_compression(compression: str | None) -> str | None:
+        if compression is None:
+            return None
+
+        compression = compression.lower()
+        if compression not in {"lz4", "zstd"}:
+            raise ValueError(
+                "Invalid compression codec. Supported values are 'lz4' and 'zstd'.",
+            )
+
+        if not pa.Codec.is_available(compression):
+            raise ValueError(f"Compression codec '{compression}' is not available.")
+
+        return compression
 
     def _create_writers(self) -> None:
         for cls in self._schemas:
@@ -251,36 +285,20 @@ class StreamingFeatherWriter:
         else:
             writer = self._writers[table]
 
-        serialized = ArrowSerializer.serialize_batch([obj], data_cls=cls)
+        if isinstance(obj, Bar):
+            size_key: str | tuple[str, str] = (table, str(obj.bar_type))
+        elif use_per_instrument_writer:
+            size_key = (table, actual_data.instrument_id.value)
+        else:
+            size_key = table
 
-        if not serialized:
-            return
+        self._buffers.setdefault(size_key, []).append(obj)
+        self._buffer_types[size_key] = cls
 
-        try:
-            writer.write_table(serialized)
+        if self.batch_size is None or len(self._buffers[size_key]) >= self.batch_size:
+            self._flush_buffer(size_key)
 
-            # Use the appropriate key for file size tracking
-            if isinstance(obj, Bar):
-                size_key = (table, str(obj.bar_type))
-            elif isinstance(obj, Instrument):
-                size_key = (table, obj.id.value)
-            elif use_per_instrument_writer:
-                size_key = (table, actual_data.instrument_id.value)
-            else:
-                size_key = table  # type: ignore
-
-            self._file_sizes[size_key] = self._file_sizes.get(size_key, 0) + serialized.nbytes
-            self.check_flush()
-
-            if self._check_file_rotation(size_key):
-                if isinstance(obj, Bar) or use_per_instrument_writer:
-                    self._rotate_identifier_file(cls=cls, obj=actual_data)
-                else:
-                    self._rotate_regular_file(table, cls)
-        except Exception as e:
-            self.log.error(f"Failed to serialize {cls=}")
-            self.log.error(f"ERROR = `{e}`")
-            self.log.debug(f"data = {obj}")
+        self.check_flush()
 
     def _check_file_rotation(self, table_name: str | tuple[str, str]) -> bool:
         """
@@ -362,6 +380,8 @@ class StreamingFeatherWriter:
 
         key = (table_name, identifier_str)
 
+        self._flush_buffer(key)
+
         if key in self._instrument_writers:
             self._files[key].flush()
             self._instrument_writers[key].close()
@@ -389,6 +409,8 @@ class StreamingFeatherWriter:
             The class type for the writer.
 
         """
+        self._flush_buffer(table_name)
+
         if table_name in self._writers:
             self._files[table_name].flush()
             self._writers[table_name].close()
@@ -423,7 +445,14 @@ class StreamingFeatherWriter:
 
         f = self.fs.open(full_path, "wb")
         self._files[key] = f
-        self._instrument_writers[key] = pa.ipc.new_stream(f, schema)
+        if self._ipc_write_options is None:
+            self._instrument_writers[key] = pa.ipc.new_stream(f, schema)
+        else:
+            self._instrument_writers[key] = pa.ipc.new_stream(
+                f,
+                schema,
+                options=self._ipc_write_options,
+            )
         self._file_sizes[key] = 0
         self._file_creation_times[key] = self.clock.utc_now()
         self.log.info(f"Created {table_name} writer for '{identifier_str}'")
@@ -463,11 +492,54 @@ class StreamingFeatherWriter:
         self.fs.makedirs(self.fs._parent(full_path), exist_ok=True)
         f = self.fs.open(full_path, "wb")
         self._files[table_name] = f
-        self._writers[table_name] = pa.ipc.new_stream(f, schema)
+        if self._ipc_write_options is None:
+            self._writers[table_name] = pa.ipc.new_stream(f, schema)
+        else:
+            self._writers[table_name] = pa.ipc.new_stream(
+                f,
+                schema,
+                options=self._ipc_write_options,
+            )
         self._file_sizes[table_name] = 0
         self._file_creation_times[table_name] = self.clock.utc_now()
 
         self.log.info(f"Created writer for table '{table_name}'")
+
+    def _flush_buffer(self, key: str | tuple[str, str]) -> None:
+        buffer = self._buffers.get(key)
+        if not buffer:
+            return
+
+        cls = self._buffer_types[key]
+        writer = self._instrument_writers.get(key) or self._writers.get(key)
+        if writer is None:
+            return
+
+        try:
+            serialized = ArrowSerializer.serialize_batch(buffer, data_cls=cls)
+            if not serialized:
+                self._buffers[key] = []
+                return
+
+            writer.write_table(serialized)
+            self._file_sizes[key] = self._file_sizes.get(key, 0) + serialized.nbytes
+            self._buffers[key] = []
+
+            if self._check_file_rotation(key):
+                sample = buffer[-1]
+                if isinstance(key, tuple):
+                    actual_data = sample.data if isinstance(sample, CustomData) else sample
+                    if isinstance(sample, Bar):
+                        self._rotate_identifier_file(cls=cls, obj=sample)
+                    elif hasattr(actual_data, "instrument_id"):
+                        self._rotate_identifier_file(cls=cls, obj=actual_data)
+                else:
+                    self._rotate_regular_file(cast(str, key), cls)
+        except Exception as e:
+            self.log.error(f"Failed to serialize {cls=}")
+            self.log.error(f"ERROR = `{e}`")
+            self.log.debug(f"data = {buffer[-1]}")
+            raise
 
     def _extract_obj_metadata(  # noqa: C901
         self,
@@ -576,6 +648,9 @@ class StreamingFeatherWriter:
         """
         Flush all stream writers.
         """
+        for key in tuple(self._buffers):
+            self._flush_buffer(key)
+
         for stream in self._files.values():
             if not stream.closed:
                 stream.flush()

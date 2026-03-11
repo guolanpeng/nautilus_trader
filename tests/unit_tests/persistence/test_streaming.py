@@ -889,3 +889,130 @@ class TestPersistenceStreaming:
             table = pa.ipc.open_stream(f).read_all()
 
         assert len(table) == 2
+
+    def test_feather_writer_batch_size_defers_write_until_threshold(self, tmp_path) -> None:
+        # Arrange
+        clock = TestClock()
+        cache = Cache()
+        instrument = TestInstrumentProvider.default_fx_ccy("AUD/USD")
+        cache.add_instrument(instrument)
+
+        writer = StreamingFeatherWriter(
+            path=str(tmp_path / "stream"),
+            cache=cache,
+            clock=clock,
+            fs_protocol="file",
+            include_types=[TradeTick],
+            batch_size=2,
+        )
+
+        trade1 = TestDataStubs.trade_tick(instrument=instrument, ts_event=1, ts_init=1)
+        trade2 = TestDataStubs.trade_tick(instrument=instrument, ts_event=2, ts_init=2)
+
+        # Act / Assert
+        writer.write(trade1)
+        file_info = writer.get_current_file_info()
+        key = ("trade_tick", instrument.id.value)
+        assert file_info[key]["size"] == 0
+
+        writer.write(trade2)
+        file_info = writer.get_current_file_info()
+        assert file_info[key]["size"] > 0
+
+        writer.close()
+
+        feather_files = list(tmp_path.glob("stream/trade_tick/**/*.feather"))
+        assert len(feather_files) == 1
+        with open(feather_files[0], "rb") as f:
+            table = pa.ipc.open_stream(f).read_all()
+
+        assert len(table) == 2
+
+    def test_feather_writer_batch_size_flushes_on_interval(self, tmp_path) -> None:
+        # Arrange
+        clock = TestClock()
+        cache = Cache()
+        instrument = TestInstrumentProvider.default_fx_ccy("AUD/USD")
+        cache.add_instrument(instrument)
+        clock.set_time(1)
+
+        writer = StreamingFeatherWriter(
+            path=str(tmp_path / "stream"),
+            cache=cache,
+            clock=clock,
+            fs_protocol="file",
+            include_types=[TradeTick],
+            batch_size=10,
+            flush_interval_ms=1,
+        )
+
+        trade = TestDataStubs.trade_tick(instrument=instrument, ts_event=1, ts_init=1)
+
+        # Act
+        writer.write(trade)
+        file_info = writer.get_current_file_info()
+        key = ("trade_tick", instrument.id.value)
+        assert file_info[key]["size"] == 0
+
+        clock.set_time(2_000_000)
+        writer.check_flush()
+
+        # Assert
+        file_info = writer.get_current_file_info()
+        assert file_info[key]["size"] > 0
+
+        writer.close()
+
+    def test_feather_writer_compression_reduces_file_size(self, tmp_path) -> None:
+        # Arrange
+        clock = TestClock()
+        cache = Cache()
+        instrument = TestInstrumentProvider.default_fx_ccy("AUD/USD")
+        cache.add_instrument(instrument)
+
+        uncompressed_writer = StreamingFeatherWriter(
+            path=str(tmp_path / "uncompressed"),
+            cache=cache,
+            clock=clock,
+            fs_protocol="file",
+            include_types=[TradeTick],
+            batch_size=100,
+        )
+        compressed_writer = StreamingFeatherWriter(
+            path=str(tmp_path / "compressed"),
+            cache=cache,
+            clock=clock,
+            fs_protocol="file",
+            include_types=[TradeTick],
+            batch_size=100,
+            compression="zstd",
+        )
+
+        trades = [
+            TestDataStubs.trade_tick(
+                instrument=instrument,
+                ts_event=i,
+                ts_init=i,
+            )
+            for i in range(1, 1_001)
+        ]
+
+        # Act
+        for trade in trades:
+            uncompressed_writer.write(trade)
+            compressed_writer.write(trade)
+
+        uncompressed_writer.close()
+        compressed_writer.close()
+
+        # Assert
+        uncompressed_files = list(tmp_path.glob("uncompressed/trade_tick/**/*.feather"))
+        compressed_files = list(tmp_path.glob("compressed/trade_tick/**/*.feather"))
+        assert len(uncompressed_files) == 1
+        assert len(compressed_files) == 1
+
+        with open(compressed_files[0], "rb") as f:
+            compressed_table = pa.ipc.open_stream(f).read_all()
+
+        assert len(compressed_table) == len(trades)
+        assert compressed_files[0].stat().st_size < uncompressed_files[0].stat().st_size

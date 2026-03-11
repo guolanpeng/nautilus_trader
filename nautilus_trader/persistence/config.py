@@ -40,11 +40,17 @@ class StreamingConfig(NautilusConfig, frozen=True):
         The `fsspec` storage options for the Rust backend.
     flush_interval_ms : int, optional
         The flush interval (milliseconds) for writing chunks.
+    batch_size : int, optional
+        The number of records to buffer per stream before writing a batch.
+        If ``None`` or <= 1, data is written immediately (current behavior).
     replace_existing: bool, default False
         If any existing feather files should be replaced.
     include_types : list[type], optional
         A list of Arrow serializable types to write.
         If this is specified then **only** the included types will be written.
+    compression : str, optional
+        The Arrow IPC compression codec. Supported values are ``"lz4"`` and ``"zstd"``.
+        If ``None``, compression is disabled.
     rotation_mode : RotationMode, default RotationMode.NO_ROTATION
         The mode for file rotation.
     max_file_size : int, default 1GB
@@ -63,8 +69,10 @@ class StreamingConfig(NautilusConfig, frozen=True):
     fs_storage_options: dict | None = None
     fs_rust_storage_options: dict | None = None
     flush_interval_ms: int | None = None
+    batch_size: int | None = None
     replace_existing: bool = False
     include_types: list[type] | None = None
+    compression: str | None = None
     rotation_mode: RotationMode = RotationMode.NO_ROTATION
     max_file_size: int = 1024 * 1024 * 1024  # 1GB
     rotation_interval: pd.Timedelta | None = None
