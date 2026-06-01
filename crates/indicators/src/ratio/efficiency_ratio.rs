@@ -32,6 +32,10 @@ use crate::indicator::Indicator;
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators")
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.indicators")
+)]
 pub struct EfficiencyRatio {
     /// The rolling window period for the indicator (>= 2).
     pub period: usize,
@@ -44,7 +48,7 @@ pub struct EfficiencyRatio {
 
 impl Display for EfficiencyRatio {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}({})", self.name(), self.period,)
+        write!(f, "{}({})", self.name(), self.period)
     }
 }
 

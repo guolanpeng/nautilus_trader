@@ -135,6 +135,12 @@ impl OptionChainAggregator {
         self.series_id
     }
 
+    /// Returns `true` if the given timestamp is at or past the series expiration.
+    #[must_use]
+    pub fn is_expired(&self, now_ns: UnixNanos) -> bool {
+        now_ns >= self.series_id.expiration_ns
+    }
+
     /// Returns a reference to the full instrument set.
     #[must_use]
     pub fn instruments(&self) -> &HashMap<InstrumentId, (Price, OptionKind)> {
@@ -270,6 +276,16 @@ impl OptionChainAggregator {
 
     /// Handles an incoming quote tick by updating the accumulator buffers.
     pub fn update_quote(&mut self, quote: &QuoteTick) {
+        if self.is_expired(quote.ts_event) {
+            log::warn!(
+                "Dropping quote for {}, series {} expired at {}",
+                quote.instrument_id,
+                self.series_id,
+                self.series_id.expiration_ns,
+            );
+            return;
+        }
+
         if !self.active_ids.contains(&quote.instrument_id) {
             return;
         }
@@ -284,6 +300,7 @@ impl OptionChainAggregator {
                 OptionKind::Call => &mut self.call_buffer,
                 OptionKind::Put => &mut self.put_buffer,
             };
+
             match buffer.get_mut(&strike) {
                 Some(data) => data.quote = *quote,
                 None => {
@@ -307,6 +324,16 @@ impl OptionChainAggregator {
     /// the greeks are stored in `pending_greeks` and will be attached when
     /// the first quote arrives.
     pub fn update_greeks(&mut self, greeks: &OptionGreeks) {
+        if self.is_expired(greeks.ts_event) {
+            log::warn!(
+                "Dropping greeks for {}, series {} expired at {}",
+                greeks.instrument_id,
+                self.series_id,
+                self.series_id.expiration_ns,
+            );
+            return;
+        }
+
         if !self.active_ids.contains(&greeks.instrument_id) {
             return;
         }
@@ -316,6 +343,7 @@ impl OptionChainAggregator {
                 OptionKind::Call => &mut self.call_buffer,
                 OptionKind::Put => &mut self.put_buffer,
             };
+
             match buffer.get_mut(&strike) {
                 Some(data) => data.greeks = Some(*greeks),
                 None => {
@@ -352,12 +380,14 @@ impl OptionChainAggregator {
 
         // Build filtered snapshot (clone from buffers)
         let mut calls = BTreeMap::new();
+
         for (strike, data) in &self.call_buffer {
             if active_strikes.contains(strike) {
                 calls.insert(*strike, data.clone());
             }
         }
         let mut puts = BTreeMap::new();
+
         for (strike, data) in &self.put_buffer {
             if active_strikes.contains(strike) {
                 puts.insert(*strike, data.clone());
@@ -471,6 +501,7 @@ impl OptionChainAggregator {
         for id in &action.add {
             self.active_ids.insert(*id);
         }
+
         for id in &action.remove {
             self.active_ids.remove(id);
         }
@@ -571,7 +602,7 @@ mod tests {
         UnixNanos::from(1_000_000_000_000_000_000u64)
     }
 
-    /// Sets ATM price on an aggregator via a synthetic OptionGreeks with the given forward price.
+    /// Sets ATM price on an aggregator via a synthetic `OptionGreeks` with the given forward price.
     fn set_atm_via_greeks(agg: &mut OptionChainAggregator, price: f64) {
         let greeks = OptionGreeks {
             instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
@@ -681,11 +712,12 @@ mod tests {
 
     // -- Rebalance tests --
 
-    /// Builds instruments with 5 strike prices (45000..55000 step 2500) and AtmRelative +-1.
+    /// Builds instruments with 5 strike prices (45000..55000 step 2500) and `AtmRelative` +-1.
     /// Hysteresis and cooldown are disabled so existing rebalance tests pass unchanged.
     fn make_multi_strike_aggregator() -> OptionChainAggregator {
         let strikes = [45000, 47500, 50000, 52500, 55000];
         let mut instruments = HashMap::new();
+
         for s in &strikes {
             let strike = Price::from(&s.to_string());
             let call_id = InstrumentId::from(&format!("BTC-20240101-{s}-C.DERIBIT"));
@@ -896,6 +928,7 @@ mod tests {
     fn test_hysteresis_blocks_small_movement() {
         let strikes = [47500, 50000, 52500];
         let mut instruments = HashMap::new();
+
         for s in &strikes {
             let strike = Price::from(&s.to_string());
             let call_id = InstrumentId::from(&format!("BTC-20240101-{s}-C.DERIBIT"));
@@ -930,6 +963,7 @@ mod tests {
     fn test_hysteresis_allows_large_movement() {
         let strikes = [47500, 50000, 52500];
         let mut instruments = HashMap::new();
+
         for s in &strikes {
             let strike = Price::from(&s.to_string());
             let call_id = InstrumentId::from(&format!("BTC-20240101-{s}-C.DERIBIT"));
@@ -1101,6 +1135,7 @@ mod tests {
         // Setup: 3 strikes at 47500/50000/52500, AtmRelative +-1, hysteresis enabled
         let strikes = [47500, 50000, 52500];
         let mut instruments = HashMap::new();
+
         for s in &strikes {
             let strike = Price::from(&s.to_string());
             let call_id = InstrumentId::from(&format!("BTC-20240101-{s}-C.DERIBIT"));
@@ -1233,5 +1268,48 @@ mod tests {
 
         let _ = agg.remove_instrument(&put_id);
         assert!(agg.is_catalog_empty());
+    }
+
+    // -- Expiry guard tests --
+
+    #[rstest]
+    fn test_expired_quote_is_dropped() {
+        let (mut agg, call_id, _) = make_aggregator();
+        // Series expires at 1_700_000_000_000_000_000; send quote AT that timestamp
+        let expired_quote = QuoteTick::new(
+            call_id,
+            Price::from("100.00"),
+            Price::from("101.00"),
+            Quantity::from("1.0"),
+            Quantity::from("1.0"),
+            UnixNanos::from(1_700_000_000_000_000_000u64),
+            UnixNanos::from(1_700_000_000_000_000_000u64),
+        );
+        agg.update_quote(&expired_quote);
+        assert!(agg.is_buffer_empty());
+    }
+
+    #[rstest]
+    fn test_expired_greeks_are_dropped() {
+        let (mut agg, call_id, _) = make_aggregator();
+        // First add a valid quote so greeks would normally land in the buffer
+        let quote = make_quote(call_id, "100.00", "101.00");
+        agg.update_quote(&quote);
+        assert_eq!(agg.call_buffer_len(), 1);
+
+        // Send greeks at expiry timestamp — should be dropped
+        let greeks = OptionGreeks {
+            instrument_id: call_id,
+            ts_event: UnixNanos::from(1_700_000_000_000_000_000u64),
+            greeks: OptionGreekValues {
+                delta: 0.55,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        agg.update_greeks(&greeks);
+
+        let strike = Price::from("50000");
+        assert!(agg.get_call_greeks_from_buffer(&strike).is_none());
     }
 }

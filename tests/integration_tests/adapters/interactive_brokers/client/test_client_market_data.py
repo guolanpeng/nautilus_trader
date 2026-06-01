@@ -25,6 +25,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 from ibapi.common import BarData
+from ibapi.common import HistoricalTickBidAsk
 from ibapi.common import HistoricalTickLast
 from ibapi.common import TickAttribBidAsk
 from ibapi.common import TickAttribLast
@@ -330,6 +331,63 @@ async def test_get_historical_bars(ib_client):
         keepUpToDate=False,
         chartOptions=[],
     )
+
+
+@pytest.mark.asyncio
+async def test_get_historical_bars_shared_request_awaits_future(ib_client):
+    """
+    Test that a duplicate historical bars request awaits the first request's future
+    before returning empty, ensuring bars have been processed by the DataEngine before
+    the second caller returns.
+    """
+    # Arrange
+    ib_client._request_id_seq = 999
+    bar_type = BarType.from_str("AAPL.SMART-5-SECOND-BID-EXTERNAL")
+    contract = IBTestContractStubs.aapl_equity_ib_contract()
+    use_rth = True
+    end_date_time = pd.Timestamp("20240101-010000+0000")
+    duration = "5 S"
+    ib_client._eclient.reqHistoricalData = Mock()
+
+    events = []
+
+    # First caller: register a real request
+    name = (str(bar_type), end_date_time.strftime("%Y%m%d %H:%M:%S %Z"))
+    req_id = ib_client._next_req_id()
+    request = ib_client._requests.add(
+        req_id=req_id,
+        name=name,
+        handle=MagicMock(),
+        cancel=MagicMock(),
+    )
+
+    async def second_caller():
+        result = await ib_client.get_historical_bars(
+            bar_type,
+            contract,
+            use_rth,
+            end_date_time,
+            duration,
+        )
+        events.append("second_returned")
+        return result
+
+    # Act
+    task = asyncio.create_task(second_caller())
+    await asyncio.sleep(0)  # Let second_caller start and hit await
+
+    # Second caller should be waiting (not yet returned)
+    assert "second_returned" not in events
+
+    # Simulate first request completing
+    events.append("first_completed")
+    request.future.set_result([])
+
+    result = await task
+
+    # Assert
+    assert result == []
+    assert events.index("first_completed") < events.index("second_returned")
 
 
 @pytest.mark.asyncio
@@ -693,6 +751,7 @@ async def test_process_bar_data_completion_timeout_fix(ib_client):
                         ts_init=ts_init,
                         is_revision=False,
                     )
+
                     if nautilus_bar and not (
                         nautilus_bar.is_single_price() and nautilus_bar.open.as_double() == 0
                     ):
@@ -967,6 +1026,80 @@ async def test_process_trade_ticks(ib_client):
 
 
 @pytest.mark.asyncio
+async def test_process_trade_ticks_skips_fractional_size_below_increment(ib_client):
+    # Arrange
+    instrument = IBTestContractStubs.aapl_instrument()
+    ib_client._cache.add_instrument(instrument)
+    mock_request = Mock(spec=Request)
+    mock_request.name = [str(instrument.id)]
+    mock_request.result = []
+    ib_client._requests = Mock()
+    ib_client._requests.get.return_value = mock_request
+
+    request_id = 1
+    fractional_tick = HistoricalTickLast()
+    fractional_tick.time = 1704067200
+    fractional_tick.price = 100.01
+    fractional_tick.size = Decimal("0.5")
+    valid_tick = HistoricalTickLast()
+    valid_tick.time = 1704067205
+    valid_tick.price = 105.01
+    valid_tick.size = Decimal(200)
+
+    # Act
+    await ib_client._process_trade_ticks(request_id, [fractional_tick, valid_tick])
+
+    # Assert
+    assert len(mock_request.result) == 1
+    result = mock_request.result[0]
+    assert result.instrument_id == InstrumentId.from_str("AAPL.NASDAQ")
+    assert result.price == Price(105.01, precision=2)
+    assert result.size == Quantity(200, precision=0)
+    assert result.trade_id == TradeId("1704067205-105.01-200")
+
+
+@pytest.mark.asyncio
+async def test_process_historical_ticks_bid_ask_skips_fractional_size_below_increment(ib_client):
+    # Arrange
+    instrument = IBTestContractStubs.aapl_instrument()
+    ib_client._cache.add_instrument(instrument)
+    mock_request = Mock(spec=Request)
+    mock_request.name = [str(instrument.id)]
+    mock_request.result = []
+    ib_client._requests = Mock()
+    ib_client._requests.get.return_value = mock_request
+
+    fractional_tick = HistoricalTickBidAsk()
+    fractional_tick.time = 1704067200
+    fractional_tick.priceBid = 100.01
+    fractional_tick.priceAsk = 100.02
+    fractional_tick.sizeBid = Decimal("0.5")
+    fractional_tick.sizeAsk = Decimal(200)
+    valid_tick = HistoricalTickBidAsk()
+    valid_tick.time = 1704067205
+    valid_tick.priceBid = 105.01
+    valid_tick.priceAsk = 105.02
+    valid_tick.sizeBid = Decimal(100)
+    valid_tick.sizeAsk = Decimal(200)
+
+    # Act
+    await ib_client.process_historical_ticks_bid_ask(
+        req_id=1,
+        ticks=[fractional_tick, valid_tick],
+        done=True,
+    )
+
+    # Assert
+    assert len(mock_request.result) == 1
+    result = mock_request.result[0]
+    assert result.instrument_id == InstrumentId.from_str("AAPL.NASDAQ")
+    assert result.bid_price == Price(105.01, precision=2)
+    assert result.ask_price == Price(105.02, precision=2)
+    assert result.bid_size == Quantity(100, precision=0)
+    assert result.ask_size == Quantity(200, precision=0)
+
+
+@pytest.mark.asyncio
 async def test_tickByTickBidAsk(ib_client):
     # Arrange
     ib_client._clock.set_time(1704067205000000000)
@@ -998,6 +1131,33 @@ async def test_tickByTickBidAsk(ib_client):
         ts_init=1704067205000000000,
     )
     ib_client._handle_data.assert_called_once_with(quote_tick)
+
+
+@pytest.mark.asyncio
+async def test_tick_by_tick_bid_ask_skips_fractional_size_below_increment(ib_client):
+    # Arrange
+    ib_client._clock.set_time(1704067205000000000)
+    instrument = IBTestContractStubs.aapl_instrument()
+    ib_client._cache.add_instrument(instrument)
+    mock_subscription = Mock(spec=Subscription)
+    mock_subscription.name = [str(instrument.id)]
+    ib_client._subscriptions = Mock()
+    ib_client._subscriptions.get.return_value = mock_subscription
+    ib_client._handle_data = AsyncMock()
+
+    # Act
+    await ib_client.process_tick_by_tick_bid_ask(
+        req_id=1,
+        time=1704067200,
+        bid_price=100.01,
+        ask_price=100.02,
+        bid_size=Decimal("0.5"),
+        ask_size=Decimal(200),
+        tick_attrib_bid_ask=TickAttribBidAsk(),
+    )
+
+    # Assert
+    ib_client._handle_data.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1033,6 +1193,34 @@ async def test_tickByTickAllLast(ib_client):
         ts_init=1704067205000000000,
     )
     ib_client._handle_data.assert_called_once_with(trade_tick)
+
+
+@pytest.mark.asyncio
+async def test_tick_by_tick_all_last_skips_fractional_size_below_increment(ib_client):
+    # Arrange
+    ib_client._clock.set_time(1704067205000000000)
+    instrument = IBTestContractStubs.aapl_instrument()
+    ib_client._cache.add_instrument(instrument)
+    mock_subscription = Mock(spec=Subscription)
+    mock_subscription.name = [str(instrument.id)]
+    ib_client._subscriptions = Mock()
+    ib_client._subscriptions.get.return_value = mock_subscription
+    ib_client._handle_data = AsyncMock()
+
+    # Act
+    await ib_client.process_tick_by_tick_all_last(
+        req_id=1,
+        tick_type="AllLast",
+        time=1704067200,
+        price=100.01,
+        size=Decimal("0.5"),
+        tick_attrib_last=TickAttribLast(),
+        exchange="",
+        special_conditions="",
+    )
+
+    # Assert
+    ib_client._handle_data.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1421,3 +1609,27 @@ async def test_process_tick_price_creates_index_price_update(ib_client):
     call_args = ib_client._handle_data.call_args[0][0]
     assert isinstance(call_args, IndexPriceUpdate)
     assert call_args.value == Price(7000.53, precision=2)
+
+
+@pytest.mark.asyncio
+async def test_subscribe_historical_bars_replaces_stale_subscription(ib_client):
+    # Arrange
+    ib_client._request_id_seq = 999
+    bar_type = BarType.from_str("AAPL.SMART-5-SECOND-BID-EXTERNAL")
+    contract = IBTestContractStubs.aapl_equity_ib_contract()
+    ib_client._eclient.reqHistoricalData = Mock()
+    ib_client._eclient.cancelHistoricalData = Mock()
+
+    await ib_client.subscribe_historical_bars(bar_type, contract, True, True, {})
+    first_sub = ib_client._subscriptions.get(name=str(bar_type))
+    first_req_id = first_sub.req_id
+
+    # Act - call again (as _resubscribe_all does after gateway restart)
+    await ib_client.subscribe_historical_bars(bar_type, contract, True, True, {})
+    second_sub = ib_client._subscriptions.get(name=str(bar_type))
+
+    # Assert - fresh req_id allocated, old one cleaned up
+    assert second_sub.req_id != first_req_id
+    assert first_req_id not in ib_client._subscription_start_times
+    assert second_sub.req_id in ib_client._subscription_start_times
+    assert ib_client._eclient.reqHistoricalData.call_count == 2

@@ -27,6 +27,7 @@ from nautilus_trader.common.component import MessageBus
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.nautilus_pyo3 import OKXContractType
+from nautilus_trader.core.nautilus_pyo3 import OKXEnvironment
 from nautilus_trader.core.nautilus_pyo3 import OKXInstrumentType
 from nautilus_trader.live.factories import LiveDataClientFactory
 from nautilus_trader.live.factories import LiveExecClientFactory
@@ -42,7 +43,7 @@ def get_cached_okx_http_client(
     max_retries: int | None = None,
     retry_delay_ms: int | None = None,
     retry_delay_max_ms: int | None = None,
-    is_demo: bool = False,
+    environment: OKXEnvironment = OKXEnvironment.LIVE,
     proxy_url: str | None = None,
 ) -> nautilus_pyo3.OKXHttpClient:
     """
@@ -68,8 +69,8 @@ def get_cached_okx_http_client(
         The initial delay (milliseconds) between retries.
     retry_delay_max_ms : int, optional
         The maximum delay (milliseconds) between retries.
-    is_demo : bool, default False
-        If the client is for the OKX demo API.
+    environment : OKXEnvironment, default OKXEnvironment.LIVE
+        The OKX environment (LIVE or DEMO).
     proxy_url : str, optional
         The proxy URL for HTTP requests.
 
@@ -78,18 +79,25 @@ def get_cached_okx_http_client(
     OKXHttpClient
 
     """
-    return nautilus_pyo3.OKXHttpClient(
-        api_key=api_key,
-        api_secret=api_secret,
-        api_passphrase=api_passphrase,
-        base_url=base_url,
-        timeout_secs=timeout_secs,
-        max_retries=max_retries,
-        retry_delay_ms=retry_delay_ms,
-        retry_delay_max_ms=retry_delay_max_ms,
-        is_demo=is_demo,
-        proxy_url=proxy_url,
-    )
+    kwargs: dict = {
+        "api_key": api_key,
+        "api_secret": api_secret,
+        "api_passphrase": api_passphrase,
+        "base_url": base_url,
+        "environment": environment,
+        "proxy_url": proxy_url,
+    }
+
+    if timeout_secs is not None:
+        kwargs["timeout_secs"] = timeout_secs
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
+    if retry_delay_ms is not None:
+        kwargs["retry_delay_ms"] = retry_delay_ms
+    if retry_delay_max_ms is not None:
+        kwargs["retry_delay_max_ms"] = retry_delay_max_ms
+
+    return nautilus_pyo3.OKXHttpClient(**kwargs)
 
 
 @lru_cache(1)
@@ -98,6 +106,7 @@ def get_cached_okx_instrument_provider(
     instrument_types: tuple[OKXInstrumentType, ...],
     contract_types: tuple[OKXContractType, ...] | None = None,
     instrument_families: tuple[str, ...] | None = None,
+    load_spreads: bool = False,
     config: InstrumentProviderConfig | None = None,
 ) -> OKXInstrumentProvider:
     """
@@ -116,6 +125,8 @@ def get_cached_okx_instrument_provider(
     instrument_families : tuple[str, ...], optional
         The instrument families to load (e.g., "BTC-USD", "ETH-USD").
         Required for OPTIONS. Optional for FUTURES/SWAP.
+    load_spreads : bool, default False
+        If True, load OKX Nitro spread instruments.
     config : InstrumentProviderConfig, optional
         The instrument provider configuration, by default None.
 
@@ -129,6 +140,7 @@ def get_cached_okx_instrument_provider(
         instrument_types=instrument_types,
         contract_types=contract_types,
         instrument_families=instrument_families,
+        load_spreads=load_spreads,
         config=config,
     )
 
@@ -170,23 +182,25 @@ class OKXLiveDataClientFactory(LiveDataClientFactory):
         OKXDataClient
 
         """
+        environment = config.environment or OKXEnvironment.LIVE
         client: nautilus_pyo3.OKXHttpClient = get_cached_okx_http_client(
             api_key=config.api_key,
             api_secret=config.api_secret,
             api_passphrase=config.api_passphrase,
             base_url=config.base_url_http,
-            is_demo=config.is_demo,
+            environment=environment,
             timeout_secs=config.http_timeout_secs,
             max_retries=config.max_retries,
             retry_delay_ms=config.retry_delay_initial_ms,
             retry_delay_max_ms=config.retry_delay_max_ms,
-            proxy_url=config.http_proxy_url,
+            proxy_url=config.proxy_url,
         )
         provider = get_cached_okx_instrument_provider(
             client=client,
             instrument_types=config.instrument_types,
             contract_types=config.contract_types,
             instrument_families=config.instrument_families,
+            load_spreads=config.load_spreads,
             config=config.instrument_provider,
         )
         return OKXDataClient(
@@ -238,23 +252,25 @@ class OKXLiveExecClientFactory(LiveExecClientFactory):
         OKXExecutionClient
 
         """
+        environment = config.environment or OKXEnvironment.LIVE
         client: nautilus_pyo3.OKXHttpClient = get_cached_okx_http_client(
             api_key=config.api_key,
             api_secret=config.api_secret,
             api_passphrase=config.api_passphrase,
             base_url=config.base_url_http,
-            is_demo=config.is_demo,
+            environment=environment,
             timeout_secs=config.http_timeout_secs,
             max_retries=config.max_retries,
             retry_delay_ms=config.retry_delay_initial_ms,
             retry_delay_max_ms=config.retry_delay_max_ms,
-            proxy_url=config.http_proxy_url,
+            proxy_url=config.proxy_url,
         )
         provider = get_cached_okx_instrument_provider(
             client=client,
             instrument_types=config.instrument_types,
             contract_types=config.contract_types,
             instrument_families=config.instrument_families,
+            load_spreads=config.load_spreads,
             config=config.instrument_provider,
         )
         return OKXExecutionClient(

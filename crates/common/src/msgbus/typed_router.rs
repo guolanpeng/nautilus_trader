@@ -46,13 +46,13 @@ pub struct TypedSubscription<T: 'static> {
     /// The pattern for matching topics.
     pub pattern: MStr<Pattern>,
     /// Higher priority handlers receive messages first.
-    pub priority: u8,
+    pub priority: u32,
 }
 
 impl<T: 'static> TypedSubscription<T> {
     /// Creates a new typed subscription.
     #[must_use]
-    pub fn new(pattern: MStr<Pattern>, handler: TypedHandler<T>, priority: Option<u8>) -> Self {
+    pub fn new(pattern: MStr<Pattern>, handler: TypedHandler<T>, priority: Option<u32>) -> Self {
         Self {
             handler_id: handler.id(),
             pattern,
@@ -169,24 +169,24 @@ impl<T: 'static> TopicRouter<T> {
     ///
     /// Assigning priority is an advanced feature. Higher priority handlers
     /// receive messages before lower priority handlers.
-    pub fn subscribe(&mut self, pattern: MStr<Pattern>, handler: TypedHandler<T>, priority: u8) {
+    pub fn subscribe(&mut self, pattern: MStr<Pattern>, handler: TypedHandler<T>, priority: u32) {
         let sub = TypedSubscription::new(pattern, handler, Some(priority));
 
-        // Check for duplicate
+        // Re-subscribing the same handler is expected (e.g. book deltas + snapshots
+        // share one BookUpdater), so dedup at debug rather than warn.
         if self.subscriptions.iter().any(|s| s == &sub) {
-            log::warn!("{sub:?} already exists");
+            log::debug!("{sub:?} already exists; skipping duplicate subscription");
             return;
         }
 
         log::debug!("Subscribing {sub:?}");
 
-        // Invalidate cache entries that match this pattern
-        self.invalidate_cache_for_pattern(pattern);
-
         self.subscriptions.push(sub);
 
-        // Re-sort by priority (descending)
+        // Re-sort by priority (descending), then clear index cache
+        // since sort can rearrange all indices
         self.subscriptions.sort();
+        self.topic_cache.clear();
     }
 
     /// Unsubscribes a handler from a topic pattern.
@@ -204,7 +204,10 @@ impl<T: 'static> TopicRouter<T> {
             .position(|s| s.pattern == pattern && s.handler_id == handler_id)
         {
             self.subscriptions.remove(idx);
-            self.invalidate_cache_for_pattern(pattern);
+
+            // Must clear entire cache since remove() shifts indices
+            self.topic_cache.clear();
+
             log::debug!("Handler for pattern '{pattern}' was removed");
         } else {
             log::debug!("No matching handler for pattern '{pattern}' was found");
@@ -248,7 +251,7 @@ impl<T: 'static> TopicRouter<T> {
     #[must_use]
     pub fn subscriber_count(&self, topic: MStr<Topic>) -> usize {
         self.get_matching_indices(topic)
-            .map_or_else(|| self.find_matches(topic).len(), |indices| indices.len())
+            .map_or_else(|| self.find_matches(topic).len(), <[usize]>::len)
     }
 
     /// Returns the count of subscribers with an exact topic match,
@@ -308,7 +311,7 @@ impl<T: 'static> TopicRouter<T> {
 
     /// Gets cached matching indices for a topic, if available.
     fn get_matching_indices(&self, topic: MStr<Topic>) -> Option<&[usize]> {
-        self.topic_cache.get(&topic).map(|v| v.as_slice())
+        self.topic_cache.get(&topic).map(SmallVec::as_slice)
     }
 
     /// Gets or computes matching subscription indices for a topic.
@@ -363,13 +366,6 @@ impl<T: 'static> TopicRouter<T> {
                 }
             })
             .collect()
-    }
-
-    /// Invalidates cache entries that could be affected by a pattern change.
-    fn invalidate_cache_for_pattern(&mut self, pattern: MStr<Pattern>) {
-        // Remove cached entries where the pattern might match the topic
-        self.topic_cache
-            .retain(|topic, _| !is_matching_backtracking(*topic, pattern));
     }
 
     /// Clears all subscriptions and cache.
@@ -537,6 +533,33 @@ mod tests {
         // Publish again - both handlers should receive
         router.publish(topic, &2);
         assert_eq!(*received.borrow(), 12); // 1 + 1 + 10
+    }
+
+    #[rstest]
+    fn test_topic_router_late_distinct_wildcard_receives_cached_topic() {
+        let mut router = TopicRouter::<String>::new();
+        let topic: MStr<Topic> = "data.instrument.POLYMARKET.TEST-SYMBOL".into();
+
+        let early = Rc::new(RefCell::new(Vec::new()));
+        let early_clone = early.clone();
+        let early_handler = TypedHandler::from_with_id("early", move |msg: &String| {
+            early_clone.borrow_mut().push(msg.clone());
+        });
+        router.subscribe("data.*.POLYMARKET.*".into(), early_handler, 0);
+
+        router.publish(topic, &"ONE".to_string());
+
+        let late = Rc::new(RefCell::new(Vec::new()));
+        let late_clone = late.clone();
+        let late_handler = TypedHandler::from_with_id("late", move |msg: &String| {
+            late_clone.borrow_mut().push(msg.clone());
+        });
+        router.subscribe("data.instrument.POLYMARKET.*".into(), late_handler, 0);
+
+        router.publish(topic, &"TWO".to_string());
+
+        assert_eq!(*early.borrow(), vec!["ONE", "TWO"]);
+        assert_eq!(*late.borrow(), vec!["TWO"]);
     }
 
     #[rstest]
@@ -746,5 +769,30 @@ mod tests {
         router.publish(topic, &2);
         assert_eq!(*count_own.borrow(), 1);
         assert_eq!(*count_other.borrow(), 2);
+    }
+
+    #[rstest]
+    fn test_unsubscribe_one_pattern_does_not_break_other_patterns() {
+        let mut router = TopicRouter::<i32>::new();
+        let received = Rc::new(RefCell::new(0));
+
+        let alpha = TypedHandler::from_with_id("alpha", |_: &i32| {});
+
+        let received_beta = received.clone();
+        let beta = TypedHandler::from_with_id("beta", move |_: &i32| {
+            *received_beta.borrow_mut() += 1;
+        });
+
+        router.subscribe("alpha.*".into(), alpha.clone(), 0);
+        router.subscribe("beta.*".into(), beta, 0);
+
+        let beta_topic: MStr<Topic> = "beta.topic".into();
+        router.publish(beta_topic, &1);
+        assert_eq!(*received.borrow(), 1);
+
+        router.unsubscribe("alpha.*".into(), &alpha);
+
+        router.publish(beta_topic, &2);
+        assert_eq!(*received.borrow(), 2);
     }
 }

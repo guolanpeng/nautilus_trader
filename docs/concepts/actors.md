@@ -43,6 +43,22 @@ class MyActor(Actor):
         self.count_of_processed_bars += 1
 ```
 
+## Actor configuration and IDs
+
+Actors can receive an `ActorConfig` subclass. The base config may include an `actor_id`;
+if supplied, the actor registers with that ID. If omitted, the system derives a runtime
+actor ID.
+
+Treat configuration as construction data for the actor. Read user-supplied settings through
+`self.config`, and keep runtime state on the actor itself.
+
+:::info Rust implementation
+For Rust actors, generated or assigned runtime IDs live on the actor core rather than being
+written back into `DataActorConfig`. This differs from Python bridge paths which may copy
+inherited config fields into runtime state when a Python object is created from an importable
+config.
+:::
+
 ## Lifecycle
 
 Actors follow a defined state machine through their lifecycle:
@@ -82,24 +98,33 @@ Actors have access to a clock for scheduling:
 
 ```python
 def on_start(self) -> None:
-    # Set a recurring timer (fires every 5 seconds)
-    self.clock.set_timer("my_timer", timedelta(seconds=5))
+    # Set a recurring timer with a callback (fires every 5 seconds)
+    self.clock.set_timer(
+        "my_timer",
+        timedelta(seconds=5),
+        callback=self._on_timer,
+    )
 
-    # Set a one-time alert
-    self.clock.set_alert("my_alert", self.clock.utc_now() + timedelta(minutes=1))
+    # Set a one-time alert with a callback
+    self.clock.set_time_alert(
+        "my_alert",
+        self.clock.utc_now() + timedelta(minutes=1),
+        callback=self._on_alert,
+    )
 
 def on_stop(self) -> None:
     # Cancel timers to prevent resource leaks across stop/resume cycles
     self.clock.cancel_timer("my_timer")
 
-def on_timer(self, event: TimeEvent) -> None:
-    if event.name == "my_timer":
-        self.log.info("Timer fired!")
+def _on_timer(self, event: TimeEvent) -> None:
+    self.log.info("Timer fired!")
 
-def on_alert(self, event: TimeEvent) -> None:
-    if event.name == "my_alert":
-        self.log.info("Alert triggered!")
+def _on_alert(self, event: TimeEvent) -> None:
+    self.log.info("Alert triggered!")
 ```
+
+Pass a `callback` to direct `TimeEvent` objects to your own method. If you
+omit the callback, the event is delivered to `on_event` instead.
 
 ## System access
 
@@ -140,24 +165,24 @@ Different data operations map to these handlers:
 
 | Operation                            | Category   | Handler                  | Purpose                                           |
 |--------------------------------------|------------|--------------------------|---------------------------------------------------|
-| `subscribe_data()`                   | Real-time  | `on_data()`              | Live data updates.                                |
-| `subscribe_instrument()`             | Real-time  | `on_instrument()`        | Live instrument definition updates.               |
-| `subscribe_instruments()`            | Real-time  | `on_instrument()`        | Live instrument definition updates (for venue).   |
-| `subscribe_order_book_deltas()`      | Real-time  | `on_order_book_deltas()` | Live order book deltas.                           |
-| `subscribe_order_book_depth()`       | Real-time  | `on_order_book_depth()`  | Live order book depth snapshots.                  |
-| `subscribe_order_book_at_interval()` | Real-time  | `on_order_book()`        | Live order book snapshots at intervals.           |
-| `subscribe_quote_ticks()`            | Real-time  | `on_quote_tick()`        | Live quote updates.                               |
-| `subscribe_trade_ticks()`            | Real-time  | `on_trade_tick()`        | Live trade updates.                               |
-| `subscribe_mark_prices()`            | Real-time  | `on_mark_price()`        | Live mark price updates.                          |
-| `subscribe_index_prices()`           | Real-time  | `on_index_price()`       | Live index price updates.                         |
-| `subscribe_bars()`                   | Real-time  | `on_bar()`               | Live bar updates.                                 |
-| `subscribe_funding_rates()`          | Real-time  | `on_funding_rate()`      | Live funding rate updates.                        |
-| `subscribe_instrument_status()`      | Real-time  | `on_instrument_status()` | Live instrument status updates.                   |
-| `subscribe_instrument_close()`       | Real-time  | `on_instrument_close()`  | Live instrument close updates.                    |
-| `subscribe_option_greeks()`          | Real-time  | `on_option_greeks()`     | Live option greeks updates.                       |
-| `subscribe_option_chain()`           | Real-time  | `on_option_chain()`      | Live option chain slice snapshots.                |
-| `subscribe_order_fills()`            | Real-time  | `on_order_filled()`      | Live order fill events for an instrument.         |
-| `subscribe_order_cancels()`          | Real-time  | `on_order_canceled()`    | Live order cancel events for an instrument.       |
+| `subscribe_data()`                   | Real‑time  | `on_data()`              | Live data updates.                                |
+| `subscribe_instrument()`             | Real‑time  | `on_instrument()`        | Live instrument definition updates.               |
+| `subscribe_instruments()`            | Real‑time  | `on_instrument()`        | Live instrument definition updates (for venue).   |
+| `subscribe_order_book_deltas()`      | Real‑time  | `on_order_book_deltas()` | Live order book deltas.                           |
+| `subscribe_order_book_depth()`       | Real‑time  | `on_order_book_depth()`  | Live order book depth snapshots.                  |
+| `subscribe_order_book_at_interval()` | Real‑time  | `on_order_book()`        | Live order book snapshots at intervals.           |
+| `subscribe_quote_ticks()`            | Real‑time  | `on_quote_tick()`        | Live quote updates.                               |
+| `subscribe_trade_ticks()`            | Real‑time  | `on_trade_tick()`        | Live trade updates.                               |
+| `subscribe_mark_prices()`            | Real‑time  | `on_mark_price()`        | Live mark price updates.                          |
+| `subscribe_index_prices()`           | Real‑time  | `on_index_price()`       | Live index price updates.                         |
+| `subscribe_bars()`                   | Real‑time  | `on_bar()`               | Live bar updates.                                 |
+| `subscribe_funding_rates()`          | Real‑time  | `on_funding_rate()`      | Live funding rate updates.                        |
+| `subscribe_instrument_status()`      | Real‑time  | `on_instrument_status()` | Live instrument status updates.                   |
+| `subscribe_instrument_close()`       | Real‑time  | `on_instrument_close()`  | Live instrument close updates.                    |
+| `subscribe_option_greeks()`          | Real‑time  | `on_option_greeks()`     | Live option greeks updates.                       |
+| `subscribe_option_chain()`           | Real‑time  | `on_option_chain()`      | Live option chain slice snapshots.                |
+| `subscribe_order_fills()`            | Real‑time  | `on_order_filled()`      | Live order fill events for an instrument.         |
+| `subscribe_order_cancels()`          | Real‑time  | `on_order_canceled()`    | Live order cancel events for an instrument.       |
 | `request_data()`                     | Historical | `on_historical_data()`   | Historical data processing.                       |
 | `request_order_book_deltas()`        | Historical | `on_historical_data()`   | Historical order book deltas.                     |
 | `request_order_book_depth()`         | Historical | `on_historical_data()`   | Historical order book depth.                      |
@@ -167,7 +192,7 @@ Different data operations map to these handlers:
 | `request_quote_ticks()`              | Historical | `on_historical_data()`   | Historical quotes processing.                     |
 | `request_trade_ticks()`              | Historical | `on_historical_data()`   | Historical trades processing.                     |
 | `request_bars()`                     | Historical | `on_historical_data()`   | Historical bars processing.                       |
-| `request_aggregated_bars()`          | Historical | `on_historical_data()`   | Historical aggregated bars (on-the-fly).          |
+| `request_aggregated_bars()`          | Historical | `on_historical_data()`   | Historical aggregated bars (on‑the‑fly).          |
 | `request_funding_rates()`            | Historical | `on_historical_data()`   | Historical funding rates processing.              |
 
 ### Example

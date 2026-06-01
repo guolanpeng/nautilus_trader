@@ -65,7 +65,9 @@ from nautilus_trader.model.instruments.binary_option cimport BinaryOption
 from nautilus_trader.model.instruments.cfd cimport Cfd
 from nautilus_trader.model.instruments.commodity cimport Commodity
 from nautilus_trader.model.instruments.crypto_future cimport CryptoFuture
+from nautilus_trader.model.instruments.crypto_futures_spread cimport CryptoFuturesSpread
 from nautilus_trader.model.instruments.crypto_option cimport CryptoOption
+from nautilus_trader.model.instruments.crypto_option_spread cimport CryptoOptionSpread
 from nautilus_trader.model.instruments.crypto_perpetual cimport CryptoPerpetual
 from nautilus_trader.model.instruments.currency_pair cimport CurrencyPair
 from nautilus_trader.model.instruments.equity cimport Equity
@@ -76,6 +78,7 @@ from nautilus_trader.model.instruments.option_contract cimport OptionContract
 from nautilus_trader.model.instruments.option_spread cimport OptionSpread
 from nautilus_trader.model.instruments.perpetual_contract cimport PerpetualContract
 from nautilus_trader.model.instruments.synthetic cimport SyntheticInstrument
+from nautilus_trader.model.instruments.tokenized_asset cimport TokenizedAsset
 
 from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.execution.reports import FillReport
@@ -127,7 +130,9 @@ _OBJECT_TO_DICT_MAP: dict[str, Callable[[None], dict]] = {
     Cfd.__name__: Cfd.to_dict_c,
     Commodity.__name__: Commodity.to_dict_c,
     CryptoFuture.__name__: CryptoFuture.to_dict_c,
+    CryptoFuturesSpread.__name__: CryptoFuturesSpread.to_dict_c,
     CryptoOption.__name__: CryptoOption.to_dict_c,
+    CryptoOptionSpread.__name__: CryptoOptionSpread.to_dict_c,
     CryptoPerpetual.__name__: CryptoPerpetual.to_dict_c,
     CurrencyPair.__name__: CurrencyPair.to_dict_c,
     Equity.__name__: Equity.to_dict_c,
@@ -137,6 +142,7 @@ _OBJECT_TO_DICT_MAP: dict[str, Callable[[None], dict]] = {
     OptionContract.__name__: OptionContract.to_dict_c,
     OptionSpread.__name__: OptionSpread.to_dict_c,
     PerpetualContract.__name__: PerpetualContract.to_dict_c,
+    TokenizedAsset.__name__: TokenizedAsset.to_dict_c,
     OrderBookDelta.__name__: OrderBookDelta.to_dict_c,
     OrderBookDeltas.__name__: OrderBookDeltas.to_dict_c,
     TradeTick.__name__: TradeTick.to_dict_c,
@@ -195,7 +201,9 @@ _OBJECT_FROM_DICT_MAP: dict[str, Callable[[dict], Any]] = {
     Cfd.__name__: Cfd.from_dict_c,
     Commodity.__name__: Commodity.from_dict_c,
     CryptoFuture.__name__: CryptoFuture.from_dict_c,
+    CryptoFuturesSpread.__name__: CryptoFuturesSpread.from_dict_c,
     CryptoOption.__name__: CryptoOption.from_dict_c,
+    CryptoOptionSpread.__name__: CryptoOptionSpread.from_dict_c,
     CryptoPerpetual.__name__: CryptoPerpetual.from_dict_c,
     CurrencyPair.__name__: CurrencyPair.from_dict_c,
     Equity.__name__: Equity.from_dict_c,
@@ -205,6 +213,7 @@ _OBJECT_FROM_DICT_MAP: dict[str, Callable[[dict], Any]] = {
     OptionContract.__name__: OptionContract.from_dict_c,
     OptionSpread.__name__: OptionSpread.from_dict_c,
     PerpetualContract.__name__: PerpetualContract.from_dict_c,
+    TokenizedAsset.__name__: TokenizedAsset.from_dict_c,
     OrderBookDelta.__name__: OrderBookDelta.from_dict_c,
     OrderBookDeltas.__name__: OrderBookDeltas.from_dict_c,
     TradeTick.__name__: TradeTick.from_dict_c,
@@ -266,7 +275,9 @@ _EXTERNAL_PUBLISHABLE_TYPES = {
     Cfd,
     Commodity,
     CryptoFuture,
+    CryptoFuturesSpread,
     CryptoOption,
+    CryptoOptionSpread,
     CryptoPerpetual,
     CurrencyPair,
     Equity,

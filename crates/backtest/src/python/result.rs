@@ -21,6 +21,7 @@ use nautilus_core::UUID4;
 
 use crate::result::BacktestResult;
 
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pyo3::pymethods]
 impl BacktestResult {
     #[getter]
@@ -75,6 +76,15 @@ impl BacktestResult {
     #[pyo3(name = "total_positions")]
     const fn py_total_positions(&self) -> usize {
         self.total_positions
+    }
+
+    #[getter]
+    #[pyo3(name = "summary")]
+    fn py_summary(&self) -> HashMap<String, String> {
+        self.summary
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
     }
 
     #[getter]

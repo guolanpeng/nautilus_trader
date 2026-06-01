@@ -92,6 +92,90 @@ provides a neutral valuation.
 If `use_mark_xrates` is enabled in the portfolio configuration, `MARK` prices replace
 `MID` prices for mixed positions and general conversions.
 
+## Equity and mark-to-market
+
+The Portfolio exposes three pull-style queries for continuous portfolio valuation.
+Each returns per-currency results keyed by the relevant account base currency or
+native settlement currency.
+
+| Method                                   | Returns                                                          |
+|------------------------------------------|------------------------------------------------------------------|
+| `mark_values(venue, account_id)`         | Signed MTM totals for open positions.                            |
+| `equity(venue, account_id)`              | Total equity combining balance and position valuation.           |
+| `missing_price_instruments(venue)`       | Instruments currently flagged as unpriceable.                    |
+
+Longs contribute positive notional, shorts contribute negative notional. Flat
+positions are skipped.
+
+### Equity formula
+
+Equity combines the account balance with open-position valuation, using a different
+second term depending on account type:
+
+- **Cash and betting accounts**: `balances_total + Σ mark_value(open positions)`.
+- **Margin accounts**: `balances_total + Σ unrealized_pnl(open positions)`.
+
+The cash and betting path uses `mark_values()` internally. The margin path uses
+the same cached unrealized PnL pipeline that powers `unrealized_pnls()`.
+
+### Price fallback
+
+Valuation asks `Cache` for a price in this order, stopping at the first match:
+
+1. Mark price, if `use_mark_prices=true` in `PortfolioConfig` and a mark price is cached.
+2. Side-appropriate quote: `BID` for longs, `ASK` for shorts.
+3. Last trade price.
+4. Most recent cached bar close (populated when `bar_updates=true`).
+
+If none of the four yield a price, the position goes into the missing-price tracker
+and is skipped in the sum.
+
+### Base currency conversion
+
+When `convert_to_account_base_currency=true` (the default) and the account has a
+`base_currency` set, settlement-currency values are converted to the base currency
+using `MID` xrates from `Cache.get_xrate()`. With `use_mark_xrates=true`, the cached
+mark xrate from `Cache.get_mark_xrate()` is used first and falls back to `MID` if
+unavailable. The output dictionary then has a single key matching the base currency.
+
+When `convert_to_account_base_currency=false`, or the account has no `base_currency`,
+results are keyed by each position's native settlement currency and no xrate
+conversion is applied.
+
+If xrate data is unavailable for a required conversion, that position is treated
+as unpriceable and flagged via the missing-price tracker rather than silently
+valued at a 1.0 rate.
+
+### Missing-price tracking
+
+The tracker is a per-venue set of instrument IDs that could not be priced on the
+last `mark_values()` or `equity()` call. It has two observable behaviors:
+
+- A warning log fires once per instrument on the transition from priced to unpriced,
+  not on every subsequent call. The next transition back to priced clears the entry
+  so a future drop re-warns.
+- When a venue goes flat (no open positions), its tracker entry is cleared so stale
+  instruments do not remain flagged.
+
+Call `missing_price_instruments(venue)` to inspect the current set.
+
+:::tip
+If `equity()` understates what you expect, check `missing_price_instruments(venue)`
+before investigating the math. An empty quote, trade, and bar feed for one instrument
+is the most common cause of silent gaps.
+:::
+
+### Venue and account scope
+
+`mark_values` and `equity` accept an optional `account_id` to scope the
+aggregation to a single account. With `account_id=None`, results aggregate
+across every account on the venue.
+
+The missing-price tracker is venue-scoped. `missing_price_instruments` takes a
+venue only, and an account-filtered `mark_values(venue, account_id)` call does
+not clear the venue entry so flags raised by other accounts on the same venue
+survive.
+
 ## Portfolio statistics
 
 There are a variety of [built-in portfolio statistics](https://github.com/nautechsystems/nautilus_trader/tree/develop/crates/analysis/src/statistics)
@@ -152,6 +236,42 @@ See the [`PortfolioAnalyzer` API Reference](/docs/python-api-latest/analysis.htm
 Your statistic should handle degenerate inputs such as `None`, empty series, or insufficient data.
 Return `None` for unknown/incalculable values, or a reasonable default like `0.0` when semantically appropriate (e.g., win rate with no trades).
 :::
+
+## Returns: position vs portfolio
+
+The analyzer tracks two distinct return series:
+
+- **Position returns** (`analyzer.position_returns()`) measure realized return per position
+  as a side-aware price return relative to the average open price. This reflects the
+  instrument's price movement between entry and exit, independent of account size or
+  leverage.
+- **Portfolio returns** (`analyzer.portfolio_returns()`) measure daily percentage change in
+  total account balance. A $900 gain on a $100,000 account reports roughly 0.9% for that day.
+
+When the analyzer has account state history spanning at least two distinct calendar days,
+it computes portfolio returns automatically and uses them as the primary series for
+statistics, tearsheets, and the monthly returns heatmap. Multiple snapshots on the same
+day count as one day, so intra-day trading alone does not produce portfolio returns. When
+portfolio returns are unavailable, it falls back to position returns.
+
+The convenience accessor `analyzer.returns()` resolves this preference: portfolio returns
+when present, position returns otherwise.
+
+### Multi-currency accounts
+
+Portfolio returns require a single-currency balance history. When the account carries
+balances in multiple currencies, the analyzer cannot produce a single return series and
+falls back to position returns silently. Statistics and tearsheet charts use whichever
+series `returns()` resolves to.
+
+If you need portfolio-level returns for a multi-currency account, compute them externally
+by converting balances to a common currency before calculating percentage changes.
+
+### Per-venue calculation
+
+In the backtest engine, the analyzer runs per venue (`engine.pyx`). Each venue's account
+produces its own portfolio return series. The tearsheet aggregates across all cached
+accounts to produce a combined return series for multi-venue backtests.
 
 ## Backtest analysis
 

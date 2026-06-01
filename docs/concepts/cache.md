@@ -24,17 +24,20 @@ The Cache serves multiple purposes:
 
 - The system automatically adds data to the `Cache` as it flows through.
 - In live contexts, the engine applies updates asynchronously, so you might see a brief delay between an event and its appearance in the `Cache`.
-- All data flows through the `Cache` before reaching your strategy’s callbacks – see the diagram below:
+- For quotes, trades, and bars the `DataEngine` writes to the `Cache` before publishing to subscribers, so the latest value is available in the cache by the time your handler runs. Order book deltas and depth snapshots are published directly without a cache write; book state is maintained separately through `BookUpdater` subscriptions:
 
 ```mermaid
 flowchart LR
     data[Data]
     engine[DataEngine]
     cache[Cache]
-    callback["Strategy callback:<br/>on_data(...)"]
+    callback["Strategy callback:<br/>on_quote_tick(...)"]
 
     data --> engine --> cache --> callback
 ```
+
+For the full step-by-step trace, see
+[Data flow: life of a quote tick](architecture.md#data-flow-life-of-a-quote-tick).
 
 ### Basic example
 
@@ -138,10 +141,11 @@ from nautilus_trader.config import DatabaseConfig
 
 config = CacheConfig(
     database=DatabaseConfig(
-        type="redis",      # Database type
-        host="localhost",  # Database host
-        port=6379,         # Database port
-        timeout=2,         # Connection timeout (seconds)
+        type="redis",            # Database type
+        host="localhost",        # Database host
+        port=6379,               # Database port
+        connection_timeout=2,    # Connection timeout (seconds)
+        response_timeout=2,      # Response timeout (seconds)
     ),
 )
 ```
@@ -294,10 +298,11 @@ orders_for_instrument = self.cache.orders(instrument_id=instrument_id)  # All or
 
 ```python
 # Get orders by their current state
-open_orders = self.cache.orders_open()          # Orders currently active at the venue
-closed_orders = self.cache.orders_closed()      # Orders that have completed their lifecycle
-emulated_orders = self.cache.orders_emulated()  # Orders being simulated locally by the system
-inflight_orders = self.cache.orders_inflight()  # Orders submitted (or modified) to venue, but not yet confirmed
+open_orders = self.cache.orders_open()                       # Orders currently active at the venue
+closed_orders = self.cache.orders_closed()                   # Orders that have completed their lifecycle
+emulated_orders = self.cache.orders_emulated()               # Orders being simulated locally by the system
+inflight_orders = self.cache.orders_inflight()               # Orders submitted (or modified) to venue, but not yet confirmed
+local_active_orders = self.cache.orders_active_local()       # Orders still managed locally (initialized, emulated, or released)
 
 # Check specific order states
 exists = self.cache.order_exists(client_order_id)            # Checks if an order with the given ID exists in the cache
@@ -305,17 +310,19 @@ is_open = self.cache.is_order_open(client_order_id)          # Checks if an orde
 is_closed = self.cache.is_order_closed(client_order_id)      # Checks if an order is closed
 is_emulated = self.cache.is_order_emulated(client_order_id)  # Checks if an order is being simulated locally
 is_inflight = self.cache.is_order_inflight(client_order_id)  # Checks if an order is submitted or modified, but not yet confirmed
+is_active_local = self.cache.is_order_active_local(client_order_id)  # Checks if an order is still managed locally
 ```
 
 ##### Order statistics
 
 ```python
 # Get counts of orders in different states
-open_count = self.cache.orders_open_count()          # Number of open orders
-closed_count = self.cache.orders_closed_count()      # Number of closed orders
-emulated_count = self.cache.orders_emulated_count()  # Number of emulated orders
-inflight_count = self.cache.orders_inflight_count()  # Number of inflight orders
-total_count = self.cache.orders_total_count()        # Total number of orders in the system
+open_count = self.cache.orders_open_count()                  # Number of open orders
+closed_count = self.cache.orders_closed_count()              # Number of closed orders
+emulated_count = self.cache.orders_emulated_count()          # Number of emulated orders
+inflight_count = self.cache.orders_inflight_count()          # Number of inflight orders
+local_active_count = self.cache.orders_active_local_count()  # Number of locally active orders (initialized, emulated, or released)
+total_count = self.cache.orders_total_count()                # Total number of orders in the system
 
 # Get filtered order counts
 buy_orders_count = self.cache.orders_open_count(side=OrderSide.BUY)  # Number of currently open BUY orders
@@ -377,25 +384,7 @@ instrument_positions_count = self.cache.positions_total_count(instrument_id=inst
 account = self.cache.account(account_id)       # Retrieve account by ID
 account = self.cache.account_for_venue(venue)  # Retrieve account for a specific venue
 account_id = self.cache.account_id(venue)      # Retrieve account ID for a venue
-accounts = self.cache.accounts()               # Retrieve all accounts in the cache
 ```
-
-#### Purging cached state
-
-The cache exposes explicit maintenance hooks that remove closed or stale objects while preserving safety checks:
-
-- `purge_closed_orders(ts_now, buffer_secs=0, purge_from_database=False)` drops closed orders that have been inactive for at least `buffer_secs`. Linked contingency orders remain until every dependent child is closed.
-- `purge_closed_positions(ts_now, buffer_secs=0, purge_from_database=False)` removes positions that have stayed closed beyond the buffer window and deletes associated indices.
-- `purge_account_events(ts_now, lookback_secs=0, purge_from_database=False)` trims account event history outside the lookback window and can cascade deletes to the backing database.
-
-Key safeguards:
-
-- Open orders and positions are never purged; the cache logs a warning and leaves the item intact.
-- Linked orders keep parents in the cache until all children have closed, preventing premature removal of contingency chains.
-- Indices and reverse lookups are cleaned alongside the primary object to avoid dangling references.
-- Database deletions occur only when `purge_from_database=True` and a cache database is configured, ensuring in-memory purges do not silently erase persisted data.
-
-Use the trading clock (for example, `self.clock.timestamp_ns()`) when supplying `ts_now`. Set `purge_from_database=True` only when you intend to delete persisted records from Redis or PostgreSQL as well. In live trading these methods run automatically when the execution engine is configured with purge intervals; see [Memory management](live.md#memory-management) for the scheduler settings.
 
 #### Instruments and currencies
 
@@ -415,12 +404,86 @@ instrument_ids = self.cache.instrument_ids()                   # Get all instrum
 venue_instrument_ids = self.cache.instrument_ids(venue=venue)  # Get instrument IDs for a specific venue
 ```
 
-##### Currencies
+### Purging cached data
+
+Long-running sessions accumulate closed orders, closed positions, account events, and
+unused instruments. The cache exposes targeted and bulk purge methods so strategies and
+the live trading engine can keep memory bounded without restarting the system.
+
+#### Targeted purges
+
+Use these to drop a single entity. Each refuses to purge while the entity is still active.
+
+- `cache.purge_order(client_order_id)`: removes the order and every order-keyed index entry.
+  Skips open orders.
+- `cache.purge_position(position_id)`: removes the position, its snapshots, and position-keyed
+  index entries. Skips open positions.
+- `cache.purge_instrument(instrument_id)`: removes the instrument and every per-instrument
+  map (order book, quotes, trades, mark/index/funding prices, instrument status, greeks,
+  and bars referencing the instrument). Skips while any associated order is non-terminal
+  (anything that has not reached a closed state, including initialized, submitted,
+  accepted, emulated, released, and inflight orders) or any associated position is
+  non-closed.
 
 ```python
-# Get currency information
-currency = self.cache.load_currency("USD")  # Loads currency data for USD
+class HousekeepingStrategy(Strategy):
+    def on_start(self) -> None:
+        # Drop instruments that are no longer in the watchlist.
+        for instrument_id in self.cache.instrument_ids(venue=self.venue):
+            if instrument_id not in self.watchlist:
+                self.cache.purge_instrument(instrument_id)
 ```
+
+:::warning
+`purge_instrument` is intended for actors and strategies with their own lifecycle logic
+for deciding when an instrument is no longer needed. Purging an instrument that another
+component still relies on causes missing instrument lookups and loses market-data
+history. Active subscriptions belong to the data engine, so unsubscribe before purging
+if you no longer want updates.
+:::
+
+#### Bulk purges
+
+Use these to sweep older entries by age. They take the current timestamp and a buffer or
+lookback window in seconds.
+
+- `cache.purge_closed_orders(ts_now, buffer_secs)`: closed orders whose close timestamp is
+  older than `buffer_secs`.
+- `cache.purge_closed_positions(ts_now, buffer_secs)`: closed positions whose close timestamp
+  is older than `buffer_secs`.
+- `cache.purge_account_events(ts_now, lookback_secs)`: account state events older than
+  `lookback_secs`. A value of `0` purges all events.
+
+#### Automatic purging in live trading
+
+`LiveExecEngineConfig` schedules the bulk purges on a timer. Set the interval to enable
+the loop and the buffer or lookback to control how recent entries are protected. The
+following defaults work well for most live sessions:
+
+```python
+from nautilus_trader.config import LiveExecEngineConfig
+
+exec_engine = LiveExecEngineConfig(
+    purge_closed_orders_interval_mins=15,
+    purge_closed_orders_buffer_mins=60,
+    purge_closed_positions_interval_mins=15,
+    purge_closed_positions_buffer_mins=60,
+    purge_account_events_interval_mins=15,
+    purge_account_events_lookback_mins=60,
+)
+```
+
+A 60-minute buffer keeps recent activity available for reconciliation while still
+trimming long-tail growth. Tune these down for HFT sessions and up if you need longer
+historical lookbacks for analytics. See
+[Configure live trading: memory management](../how_to/configure_live_trading.md) for the
+full parameter reference.
+
+:::note
+The instrument purge has no automatic loop because the right time to drop an instrument
+depends on strategy state, not age. Call `cache.purge_instrument` from the actor or
+strategy that owns the instrument's lifecycle.
+:::
 
 ---
 

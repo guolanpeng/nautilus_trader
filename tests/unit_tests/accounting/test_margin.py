@@ -18,6 +18,9 @@ from decimal import Decimal
 import pytest
 
 from nautilus_trader.accounting.accounts.margin import MarginAccount
+from nautilus_trader.accounting.manager import AccountsManager
+from nautilus_trader.cache.cache import Cache
+from nautilus_trader.common.component import Logger
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.core.uuid import UUID4
@@ -33,6 +36,7 @@ from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import PositionId
 from nautilus_trader.model.identifiers import StrategyId
 from nautilus_trader.model.objects import AccountBalance
+from nautilus_trader.model.objects import MarginBalance
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
@@ -47,6 +51,31 @@ AUDUSD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/USD")
 USDJPY_SIM = TestInstrumentProvider.default_fx_ccy("USD/JPY")
 ADABTC_BINANCE = TestInstrumentProvider.adabtc_binance()
 BTCUSDT_BINANCE = TestInstrumentProvider.btcusdt_binance()
+
+
+def _fresh_margin_account() -> MarginAccount:
+    """
+    Build a margin account with no pre-populated margin balances.
+    """
+    event = AccountState(
+        account_id=TestIdStubs.account_id(),
+        account_type=AccountType.MARGIN,
+        base_currency=USD,
+        reported=True,
+        balances=[
+            AccountBalance(
+                Money(1_000_000, USD),
+                Money(0, USD),
+                Money(1_000_000, USD),
+            ),
+        ],
+        margins=[],
+        info={},
+        event_id=UUID4(),
+        ts_event=0,
+        ts_init=0,
+    )
+    return MarginAccount(event)
 
 
 class TestMarginAccount:
@@ -72,6 +101,32 @@ class TestMarginAccount:
         assert account == account
         assert account == account
         assert account.default_leverage == Decimal(1)
+
+    def test_instantiate_multi_asset_margin_account_with_empty_balances(self):
+        # Arrange
+        event = AccountState(
+            account_id=AccountId("SIM-000"),
+            account_type=AccountType.MARGIN,
+            base_currency=None,
+            reported=True,
+            balances=[],
+            margins=[],
+            info={},
+            event_id=UUID4(),
+            ts_event=0,
+            ts_init=0,
+        )
+
+        # Act
+        account = MarginAccount(event)
+
+        # Assert
+        assert account.base_currency is None
+        assert account.last_event == event
+        assert account.events == [event]
+        assert account.event_count == 1
+        assert account.currencies() == []
+        assert account.balances_total() == {}
 
     def test_set_default_leverage(self):
         # Arrange
@@ -145,6 +200,336 @@ class TestMarginAccount:
         # Assert
         assert account.margin_maint(AUDUSD_SIM.id) == margin
         assert account.margins_maint() == {AUDUSD_SIM.id: margin}
+
+    def test_apply_replaces_margin_balances_from_account_state(self):
+        # Arrange
+        account = TestExecStubs.margin_account()
+        event = AccountState(
+            account_id=account.id,
+            account_type=AccountType.MARGIN,
+            base_currency=USD,
+            reported=True,
+            balances=[
+                AccountBalance(
+                    Money(1_000_000, USD),
+                    Money(0, USD),
+                    Money(1_000_000, USD),
+                ),
+            ],
+            margins=[
+                MarginBalance(
+                    Money(12_500, USD),
+                    Money(25_000, USD),
+                    USDJPY_SIM.id,
+                ),
+            ],
+            info={},
+            event_id=UUID4(),
+            ts_event=1,
+            ts_init=1,
+        )
+
+        # Act
+        account.apply(event)
+
+        # Assert
+        assert account.margin_init(USDJPY_SIM.id) == Money(12_500, USD)
+        assert account.margin_maint(USDJPY_SIM.id) == Money(25_000, USD)
+        assert account.margin_init(AUDUSD_SIM.id) is None
+        assert account.margin_maint(AUDUSD_SIM.id) is None
+
+    def test_apply_empty_balance_update_to_multi_asset_margin_account_is_noop(self):
+        # Arrange
+        event = AccountState(
+            account_id=AccountId("SIM-000"),
+            account_type=AccountType.MARGIN,
+            base_currency=None,
+            reported=True,
+            balances=[
+                AccountBalance(
+                    Money(1_000_000, USD),
+                    Money(0, USD),
+                    Money(1_000_000, USD),
+                ),
+            ],
+            margins=[
+                MarginBalance(
+                    Money(12_500, USD),
+                    Money(25_000, USD),
+                    USDJPY_SIM.id,
+                ),
+                MarginBalance(
+                    Money(5_000, USD),
+                    Money(10_000, USD),
+                    None,
+                ),
+            ],
+            info={},
+            event_id=UUID4(),
+            ts_event=0,
+            ts_init=0,
+        )
+        account = MarginAccount(event)
+        new_event = AccountState(
+            account_id=AccountId("SIM-000"),
+            account_type=AccountType.MARGIN,
+            base_currency=None,
+            reported=True,
+            balances=[],
+            margins=[],
+            info={},
+            event_id=UUID4(),
+            ts_event=1,
+            ts_init=1,
+        )
+
+        # Act
+        account.apply(new_event)
+
+        # Assert
+        assert account.last_event == new_event
+        assert account.event_count == 2
+        assert account.balance_total(USD) == Money(1_000_000, USD)
+        assert account.margin_init(USDJPY_SIM.id) == Money(12_500, USD)
+        assert account.margin_maint(USDJPY_SIM.id) == Money(25_000, USD)
+        assert account.account_margins_init()[USD] == Money(5_000, USD)
+        assert account.account_margins_maint()[USD] == Money(10_000, USD)
+
+    def test_apply_routes_account_wide_margin_by_currency(self):
+        # Arrange
+        account = TestExecStubs.margin_account()
+        event = AccountState(
+            account_id=account.id,
+            account_type=AccountType.MARGIN,
+            base_currency=USD,
+            reported=True,
+            balances=[
+                AccountBalance(
+                    Money(1_000_000, USD),
+                    Money(0, USD),
+                    Money(1_000_000, USD),
+                ),
+            ],
+            margins=[
+                MarginBalance(
+                    Money(12_500, USD),
+                    Money(25_000, USD),
+                    None,  # account-wide entry keyed by currency
+                ),
+            ],
+            info={},
+            event_id=UUID4(),
+            ts_event=1,
+            ts_init=1,
+        )
+
+        # Act
+        account.apply(event)
+
+        # Assert
+        assert account.margins() == {}
+        assert USD in account.account_margins()
+        assert account.margin_init_for_currency(USD) == Money(12_500, USD)
+        assert account.margin_maint_for_currency(USD) == Money(25_000, USD)
+        assert account.account_margins_init()[USD] == Money(12_500, USD)
+        assert account.account_margins_maint()[USD] == Money(25_000, USD)
+        # Strict per-instrument lookup must not pick up account-wide entries.
+        assert account.margin_init(USDJPY_SIM.id) is None
+        assert account.margin_maint(USDJPY_SIM.id) is None
+
+    def test_apply_routes_mixed_per_instrument_and_account_wide(self):
+        # Arrange
+        account = TestExecStubs.margin_account()
+        event = AccountState(
+            account_id=account.id,
+            account_type=AccountType.MARGIN,
+            base_currency=USD,
+            reported=True,
+            balances=[
+                AccountBalance(
+                    Money(1_000_000, USD),
+                    Money(0, USD),
+                    Money(1_000_000, USD),
+                ),
+            ],
+            margins=[
+                MarginBalance(Money(100, USD), Money(50, USD), USDJPY_SIM.id),
+                MarginBalance(Money(200, USD), Money(150, USD), None),
+            ],
+            info={},
+            event_id=UUID4(),
+            ts_event=1,
+            ts_init=1,
+        )
+
+        # Act
+        account.apply(event)
+
+        # Assert
+        assert account.margin_init(USDJPY_SIM.id) == Money(100, USD)
+        assert account.margin_init_for_currency(USD) == Money(200, USD)
+        assert account.total_margin_init(USD) == Money(300, USD)
+        assert account.total_margin_maint(USD) == Money(200, USD)
+
+    def test_update_margin_routes_account_wide_entry(self):
+        # Arrange
+        account = TestExecStubs.margin_account()
+        per_instrument_before = dict(account.margins())
+        account_wide = MarginBalance(Money(1_500, USD), Money(750, USD), None)
+
+        # Act
+        account.update_margin(account_wide)
+
+        # Assert
+        assert account.margin_for_currency(USD) == account_wide
+        assert account.margin_init_for_currency(USD) == Money(1_500, USD)
+        assert account.margin_maint_for_currency(USD) == Money(750, USD)
+        # Account-wide entry must not leak into per-instrument storage.
+        assert account.margins() == per_instrument_before
+
+    def test_total_margin_sums_per_instrument_and_account_wide(self):
+        # Arrange
+        account = _fresh_margin_account()
+
+        # Act
+        account.update_margin(MarginBalance(Money(80, USD), Money(20, USD), USDJPY_SIM.id))
+        account.update_margin(MarginBalance(Money(200, USD), Money(100, USD), None))
+
+        # Assert
+        assert account.total_margin_init(USD) == Money(280, USD)
+        assert account.total_margin_maint(USD) == Money(120, USD)
+
+    def test_total_margin_ignores_mismatched_currency(self):
+        # Arrange
+        account = _fresh_margin_account()
+
+        # Act
+        account.update_margin(MarginBalance(Money(100, USD), Money(50, USD), None))
+        account.update_margin(MarginBalance(Money("1.5", BTC), Money("0.5", BTC), None))
+
+        # Assert
+        assert account.total_margin_init(USD) == Money(100, USD)
+        assert account.total_margin_init(BTC) == Money("1.5", BTC)
+        assert account.total_margin_maint(USD) == Money(50, USD)
+        assert account.total_margin_maint(BTC) == Money("0.5", BTC)
+
+    def test_clear_account_margin_removes_entry_and_recalculates(self):
+        # Arrange
+        account = _fresh_margin_account()
+        account.update_margin(MarginBalance(Money(500, USD), Money(250, USD), None))
+        assert account.margin_for_currency(USD) is not None
+
+        # Act
+        account.clear_account_margin(USD)
+
+        # Assert
+        assert account.margin_for_currency(USD) is None
+        assert account.margin_init_for_currency(USD) is None
+        assert account.margin_maint_for_currency(USD) is None
+        assert account.total_margin_init(USD) == Money(0, USD)
+
+    def test_margin_for_currency_returns_none_when_absent(self):
+        # Arrange
+        account = TestExecStubs.margin_account()
+
+        # Act / Assert
+        assert account.margin_for_currency(USD) is None
+        assert account.margin_init_for_currency(USD) is None
+        assert account.margin_maint_for_currency(USD) is None
+
+    def test_accounts_manager_generate_account_state_includes_account_margins(self):
+        # Arrange
+        clock = TestClock()
+        logger = Logger("TestAccountsManager")
+        cache = Cache()
+        account = _fresh_margin_account()
+        account.update_margin(MarginBalance(Money(150, USD), Money(75, USD), USDJPY_SIM.id))
+        account.update_margin(MarginBalance(Money(500, USD), Money(250, USD), None))
+        cache.add_account(account)
+
+        manager = AccountsManager(cache=cache, clock=clock, logger=logger)
+
+        # Act
+        state = manager.generate_account_state(account, ts_event=0)
+
+        # Assert: regenerated event must retain both per-instrument and account-wide entries.
+        assert len(state.margins) == 2
+        per_instrument = [m for m in state.margins if m.instrument_id is not None]
+        account_wide = [m for m in state.margins if m.instrument_id is None]
+        assert len(per_instrument) == 1
+        assert per_instrument[0].initial == Money(150, USD)
+        assert len(account_wide) == 1
+        assert account_wide[0].initial == Money(500, USD)
+        assert account_wide[0].currency == USD
+
+    @pytest.mark.parametrize(
+        (
+            "per_instrument_initial",
+            "per_instrument_maint",
+            "account_wide_initial",
+            "account_wide_maint",
+            "expected_locked",
+        ),
+        [
+            # Only per-instrument: locked = initial + maintenance
+            (100, 50, 0, 0, 150),
+            # Only account-wide: locked = initial + maintenance
+            (0, 0, 200, 150, 350),
+            # Both: locked sums across buckets
+            (100, 50, 200, 150, 500),
+        ],
+        ids=["per_instrument_only", "account_wide_only", "mixed"],
+    )
+    def test_recalculate_balance_sums_per_instrument_and_account_wide(
+        self,
+        per_instrument_initial,
+        per_instrument_maint,
+        account_wide_initial,
+        account_wide_maint,
+        expected_locked,
+    ):
+        # Arrange
+        account = _fresh_margin_account()
+        if per_instrument_initial or per_instrument_maint:
+            account.update_margin(
+                MarginBalance(
+                    Money(per_instrument_initial, USD),
+                    Money(per_instrument_maint, USD),
+                    USDJPY_SIM.id,
+                ),
+            )
+        if account_wide_initial or account_wide_maint:
+            account.update_margin(
+                MarginBalance(
+                    Money(account_wide_initial, USD),
+                    Money(account_wide_maint, USD),
+                    None,
+                ),
+            )
+
+        # Assert: balance.locked reflects the combined margin reservation.
+        assert account.balance_locked(USD) == Money(expected_locked, USD)
+        assert account.balance_total(USD) == Money(1_000_000, USD)
+        assert account.balance_free(USD) == Money(1_000_000 - expected_locked, USD)
+
+    def test_accounts_manager_generate_account_state_survives_round_trip(self):
+        # Arrange — regenerating and re-applying must not drop account-wide margins.
+        clock = TestClock()
+        logger = Logger("TestAccountsManager")
+        cache = Cache()
+        account = _fresh_margin_account()
+        account.update_margin(MarginBalance(Money(500, USD), Money(250, USD), None))
+        cache.add_account(account)
+
+        manager = AccountsManager(cache=cache, clock=clock, logger=logger)
+
+        # Act
+        regenerated = manager.generate_account_state(account, ts_event=1)
+        account.apply(regenerated)
+
+        # Assert
+        assert account.margin_init_for_currency(USD) == Money(500, USD)
+        assert account.margin_maint_for_currency(USD) == Money(250, USD)
 
     def test_recalculate_balance_uses_raw_and_clamps(self):
         # Arrange
@@ -973,3 +1358,451 @@ class TestMarginAccount:
         # Assert
         commission = account.commission(USD)
         assert commission == Money(15.00, USD)  # Should accumulate
+
+
+# Regression tests for https://github.com/nautechsystems/nautilus_trader/issues/4110
+#
+# Maintenance margin in HEDGING OMS mode must reflect the account's net per-instrument
+# exposure, not the sum across every open HEDGING sub-position. Each fill in HEDGING mode
+# opens an independent ``Position``, so summing per-position margin causes the requirement
+# to grow with fill count instead of net economic exposure.
+
+
+def _build_hedging_position(
+    instrument,
+    order_factory: OrderFactory,
+    side: OrderSide,
+    qty: str,
+    price: str,
+    position_id: str,
+    ts_event: int = 0,
+) -> Position:
+    order = order_factory.market(
+        instrument.id,
+        side,
+        Quantity.from_str(qty),
+    )
+    fill = TestEventStubs.order_filled(
+        order,
+        instrument=instrument,
+        position_id=PositionId(position_id),
+        strategy_id=StrategyId("S-001"),
+        last_px=Price.from_str(price),
+        commission=Money(0, instrument.quote_currency),
+        ts_event=ts_event,
+    )
+    return Position(instrument, fill)
+
+
+def test_update_positions_nets_hedging_subpositions():
+    # Arrange
+    clock = TestClock()
+    logger = Logger("TestAccountsManager")
+    cache = Cache()
+    account = _fresh_margin_account()
+    instrument = AUDUSD_SIM
+    account.set_leverage(instrument.id, Decimal(1))
+    cache.add_account(account)
+    manager = AccountsManager(cache=cache, clock=clock, logger=logger)
+
+    order_factory = OrderFactory(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=StrategyId("S-001"),
+        clock=clock,
+    )
+
+    positions = []
+    for i in range(5):
+        positions.append(
+            _build_hedging_position(
+                instrument,
+                order_factory,
+                OrderSide.BUY,
+                "50",
+                "1.00000",
+                f"P-L{i}",
+            ),
+        )
+    for i in range(2):
+        positions.append(
+            _build_hedging_position(
+                instrument,
+                order_factory,
+                OrderSide.SELL,
+                "50",
+                "1.00000",
+                f"P-S{i}",
+            ),
+        )
+
+    # Act
+    result = manager.update_positions(
+        account=account,
+        instrument=instrument,
+        positions_open=positions,
+        ts_event=0,
+    )
+
+    # Assert
+    # Net exposure: long 150 @ 1.00000, margin_maint=0.03, leverage=1
+    # Expected: 150 * 1.00 * 0.03 = 4.50 USD
+    # Pre-fix: 7 * (50 * 1.00 * 0.03) = 10.50 USD
+    assert result is True
+    assert account.margin_maint(instrument.id) == Money(4.50, USD)
+
+
+def test_update_positions_net_zero_hedge_clears_margin():
+    # Arrange
+    clock = TestClock()
+    logger = Logger("TestAccountsManager")
+    cache = Cache()
+    account = _fresh_margin_account()
+    instrument = AUDUSD_SIM
+    account.set_leverage(instrument.id, Decimal(1))
+    cache.add_account(account)
+    manager = AccountsManager(cache=cache, clock=clock, logger=logger)
+
+    order_factory = OrderFactory(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=StrategyId("S-001"),
+        clock=clock,
+    )
+
+    long_pos = _build_hedging_position(
+        instrument,
+        order_factory,
+        OrderSide.BUY,
+        "100",
+        "1.00000",
+        "P-L",
+    )
+    short_pos = _build_hedging_position(
+        instrument,
+        order_factory,
+        OrderSide.SELL,
+        "100",
+        "1.00000",
+        "P-S",
+    )
+
+    # Act
+    result = manager.update_positions(
+        account=account,
+        instrument=instrument,
+        positions_open=[long_pos, short_pos],
+        ts_event=0,
+    )
+
+    # Assert: net exposure is zero so the maintenance margin entry must be cleared.
+    assert result is True
+    assert account.margin_maint(instrument.id) is None
+
+
+def test_update_positions_uses_net_side_avg_open_price():
+    # Arrange
+    clock = TestClock()
+    logger = Logger("TestAccountsManager")
+    cache = Cache()
+    account = _fresh_margin_account()
+    instrument = AUDUSD_SIM
+    account.set_leverage(instrument.id, Decimal(1))
+    cache.add_account(account)
+    manager = AccountsManager(cache=cache, clock=clock, logger=logger)
+
+    order_factory = OrderFactory(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=StrategyId("S-001"),
+        clock=clock,
+    )
+
+    # Long 300 @ 0.80000 and short 100 @ 1.00000.
+    # Net is 200 long. The short leg is treated as a closing fill against the long,
+    # so the surviving avg open price is 0.80 (the long leg's price), matching NETTING.
+    # Expected maintenance margin = 200 * 0.80 * 0.03 = 4.80 USD.
+    # Pre-fix: 300*0.80*0.03 + 100*1.00*0.03 = 10.20 USD.
+    long_pos = _build_hedging_position(
+        instrument,
+        order_factory,
+        OrderSide.BUY,
+        "300",
+        "0.80000",
+        "P-L1",
+    )
+    short_pos = _build_hedging_position(
+        instrument,
+        order_factory,
+        OrderSide.SELL,
+        "100",
+        "1.00000",
+        "P-S1",
+    )
+
+    # Act
+    result = manager.update_positions(
+        account=account,
+        instrument=instrument,
+        positions_open=[long_pos, short_pos],
+        ts_event=0,
+    )
+
+    # Assert
+    assert result is True
+    assert account.margin_maint(instrument.id) == Money(4.80, USD)
+
+
+def test_update_positions_floating_dust_clears_margin():
+    # Regression: fractional-size instruments can leave f64 dust on the signed-quantity
+    # sum even when economic exposure is flat (e.g. 0.3 - 0.2 - 0.1). Rounding to the
+    # instrument size precision must clear the margin instead of raising inside `make_qty`
+    # with a sub-tick quantity.
+    clock = TestClock()
+    logger = Logger("TestAccountsManager")
+    cache = Cache()
+    account = _fresh_margin_account()
+    instrument = BTCUSDT_BINANCE
+    account.set_leverage(instrument.id, Decimal(1))
+    cache.add_account(account)
+    manager = AccountsManager(cache=cache, clock=clock, logger=logger)
+
+    order_factory = OrderFactory(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=StrategyId("S-001"),
+        clock=clock,
+    )
+
+    long_pos = _build_hedging_position(
+        instrument,
+        order_factory,
+        OrderSide.BUY,
+        "0.300000",
+        "50000.00",
+        "P-L",
+    )
+    short_pos_a = _build_hedging_position(
+        instrument,
+        order_factory,
+        OrderSide.SELL,
+        "0.200000",
+        "50000.00",
+        "P-S1",
+    )
+    short_pos_b = _build_hedging_position(
+        instrument,
+        order_factory,
+        OrderSide.SELL,
+        "0.100000",
+        "50000.00",
+        "P-S2",
+    )
+
+    # Act
+    result = manager.update_positions(
+        account=account,
+        instrument=instrument,
+        positions_open=[long_pos, short_pos_a, short_pos_b],
+        ts_event=0,
+    )
+
+    # Assert: net rounds to zero at instrument precision -> margin cleared.
+    assert result is True
+    assert account.margin_maint(instrument.id) is None
+
+
+def test_update_positions_net_flat_clears_prior_base_currency_margin():
+    # Regression: a prior non-zero update stored margin in the account base currency.
+    # A subsequent net-flat snapshot must clear that margin so balance_locked drops to zero.
+    clock = TestClock()
+    logger = Logger("TestAccountsManager")
+    cache = Cache()
+    account = _fresh_margin_account()  # base currency = USD
+    instrument = AUDUSD_SIM
+    account.set_leverage(instrument.id, Decimal(1))
+    cache.add_account(account)
+    manager = AccountsManager(cache=cache, clock=clock, logger=logger)
+
+    order_factory = OrderFactory(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=StrategyId("S-001"),
+        clock=clock,
+    )
+
+    # First snapshot: net long 100 @ 1.0 -> non-zero base-currency margin.
+    long_pos = _build_hedging_position(
+        instrument,
+        order_factory,
+        OrderSide.BUY,
+        "100",
+        "1.00000",
+        "P-L",
+    )
+    first = manager.update_positions(
+        account=account,
+        instrument=instrument,
+        positions_open=[long_pos],
+        ts_event=0,
+    )
+    assert first is True
+    prior_margin = account.margin_maint(instrument.id)
+    assert prior_margin is not None
+    assert prior_margin.as_decimal() > 0
+    assert account.balance_locked(USD).as_decimal() > 0
+
+    # Second snapshot: offsetting short closes the net exposure.
+    short_pos = _build_hedging_position(
+        instrument,
+        order_factory,
+        OrderSide.SELL,
+        "100",
+        "1.00000",
+        "P-S",
+    )
+    second = manager.update_positions(
+        account=account,
+        instrument=instrument,
+        positions_open=[long_pos, short_pos],
+        ts_event=0,
+    )
+    assert second is True
+
+    # Net-flat: maintenance margin and the resulting base-currency locked balance must clear.
+    assert account.margin_maint(instrument.id) is None
+    assert account.balance_locked(USD) == Money(0, USD)
+
+
+def test_update_positions_flip_uses_flipping_fill_price():
+    # Regression: in a reversal sequence (long, then offsetting fills that flip the net
+    # to short), NETTING leaves the residual at the flipping fill's price. The replay must
+    # match this: a gross net-side average understates margin in reversal cases.
+    clock = TestClock()
+    logger = Logger("TestAccountsManager")
+    cache = Cache()
+    account = _fresh_margin_account()  # base currency = USD
+    instrument = AUDUSD_SIM
+    account.set_leverage(instrument.id, Decimal(1))
+    cache.add_account(account)
+    manager = AccountsManager(cache=cache, clock=clock, logger=logger)
+
+    order_factory = OrderFactory(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=StrategyId("S-001"),
+        clock=clock,
+    )
+
+    # Long 100 @ 1.00000, short 50 @ 2.00000, short 100 @ 3.00000 (chronological order).
+    # NETTING residual: short 50 @ 3.00000 (the flipping fill's price).
+    # Expected maintenance margin = 50 * 3.00 * 0.03 = 4.50 USD.
+    # Gross net-side average would give 50 * 2.6667 * 0.03 = 4.00 USD (under-margin).
+    long_pos = _build_hedging_position(
+        instrument,
+        order_factory,
+        OrderSide.BUY,
+        "100",
+        "1.00000",
+        "P-L",
+        ts_event=1,
+    )
+    short_partial = _build_hedging_position(
+        instrument,
+        order_factory,
+        OrderSide.SELL,
+        "50",
+        "2.00000",
+        "P-S1",
+        ts_event=2,
+    )
+    short_flip = _build_hedging_position(
+        instrument,
+        order_factory,
+        OrderSide.SELL,
+        "100",
+        "3.00000",
+        "P-S2",
+        ts_event=3,
+    )
+
+    result = manager.update_positions(
+        account=account,
+        instrument=instrument,
+        positions_open=[long_pos, short_partial, short_flip],
+        ts_event=0,
+    )
+
+    assert result is True
+    assert account.margin_maint(instrument.id) == Money(4.50, USD)
+
+
+def test_update_positions_same_ts_legs_ordering_is_deterministic():
+    # Regression: positions_open is read from the cache's AHashSet-backed index, so the
+    # iteration order for legs sharing a ts_opened is non-deterministic across runs. The
+    # manager must impose a tie-breaker (here: position_id) so equal-ts reversal sequences
+    # yield the same maintenance margin regardless of input order.
+    instrument = AUDUSD_SIM
+    clock = TestClock()
+
+    order_factory = OrderFactory(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=StrategyId("S-001"),
+        clock=clock,
+    )
+
+    # Three same-ts legs that form a reversal under canonical (position_id-sorted) order:
+    # long 100 @ 1.0 (id=A), short 50 @ 2.0 (id=B), short 100 @ 3.0 (id=C).
+    # Expected residual: short 50 @ 3.0 -> margin = 50 * 3.0 * 0.03 = 4.50 USD.
+    leg_a = _build_hedging_position(
+        instrument,
+        order_factory,
+        OrderSide.BUY,
+        "100",
+        "1.00000",
+        "P-A",
+        ts_event=42,
+    )
+    leg_b = _build_hedging_position(
+        instrument,
+        order_factory,
+        OrderSide.SELL,
+        "50",
+        "2.00000",
+        "P-B",
+        ts_event=42,
+    )
+    leg_c = _build_hedging_position(
+        instrument,
+        order_factory,
+        OrderSide.SELL,
+        "100",
+        "3.00000",
+        "P-C",
+        ts_event=42,
+    )
+
+    permutations = [
+        [leg_a, leg_b, leg_c],
+        [leg_c, leg_b, leg_a],
+        [leg_b, leg_a, leg_c],
+        [leg_c, leg_a, leg_b],
+    ]
+
+    results = []
+
+    for perm in permutations:
+        logger = Logger("TestAccountsManager")
+        cache = Cache()
+        account = _fresh_margin_account()
+        account.set_leverage(instrument.id, Decimal(1))
+        cache.add_account(account)
+        manager = AccountsManager(cache=cache, clock=clock, logger=logger)
+
+        result = manager.update_positions(
+            account=account,
+            instrument=instrument,
+            positions_open=perm,
+            ts_event=0,
+        )
+        assert result is True
+        results.append(account.margin_maint(instrument.id))
+
+    first = results[0]
+    for r in results[1:]:
+        assert r == first, "maintenance margin must be deterministic across permutations"
+    assert first == Money(4.50, USD)

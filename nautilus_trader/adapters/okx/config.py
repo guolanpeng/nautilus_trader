@@ -17,6 +17,7 @@ from nautilus_trader.common.config import PositiveInt
 from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.config import LiveExecClientConfig
 from nautilus_trader.core.nautilus_pyo3 import OKXContractType
+from nautilus_trader.core.nautilus_pyo3 import OKXEnvironment
 from nautilus_trader.core.nautilus_pyo3 import OKXInstrumentType
 from nautilus_trader.core.nautilus_pyo3 import OKXMarginMode
 from nautilus_trader.core.nautilus_pyo3 import OKXVipLevel
@@ -53,16 +54,15 @@ class OKXDataClientConfig(LiveDataClientConfig, frozen=True):
     base_url_ws : str, optional
         The base url to OKX's websocket API.
         If ``None`` then will source the url from `get_ws_base_url()`.
-    http_proxy_url : str, optional
-        Optional HTTP proxy URL.
-    ws_proxy_url : str, optional
-        Optional WebSocket proxy URL.
-        Note: WebSocket proxy support is not yet implemented. This field is reserved
-        for future functionality. Use `http_proxy_url` for REST API proxy support.
-    is_demo : bool, default False
-        If the client is connecting to the OKX demo API.
+    proxy_url : str, optional
+        Optional proxy URL for HTTP and WebSocket transports.
+    environment : OKXEnvironment, optional
+        The OKX environment for the client (LIVE or DEMO).
+        If ``None`` then defaults to LIVE.
     update_instruments_interval_mins: PositiveInt or None, default 60
         The interval (minutes) between reloading instruments from the venue.
+    load_spreads : bool, default False
+        If True, load OKX Nitro spread instruments from the spread endpoint.
     vip_level : OKXVipLevel, optional
         The account VIP level to determine book subscriptions.
         - Only VIP4 and above in trading fee tier are allowed to subscribe to "books50-l2-tbt" 50 depth channels (10 ms updates).
@@ -76,16 +76,16 @@ class OKXDataClientConfig(LiveDataClientConfig, frozen=True):
     instrument_types: tuple[OKXInstrumentType, ...] = (OKXInstrumentType.SPOT,)
     instrument_families: tuple[str, ...] | None = None
     contract_types: tuple[OKXContractType, ...] | None = None
+    environment: OKXEnvironment | None = None
     base_url_http: str | None = None
     base_url_ws: str | None = None
-    http_proxy_url: str | None = None
-    ws_proxy_url: str | None = None
-    is_demo: bool = False
+    proxy_url: str | None = None
     http_timeout_secs: PositiveInt | None = 60
     max_retries: PositiveInt | None = 3
     retry_delay_initial_ms: PositiveInt | None = 1_000
     retry_delay_max_ms: PositiveInt | None = 10_000
     update_instruments_interval_mins: PositiveInt | None = 60
+    load_spreads: bool = False
     vip_level: OKXVipLevel | None = None
 
 
@@ -120,14 +120,11 @@ class OKXExecClientConfig(LiveExecClientConfig, frozen=True):
     base_url_ws : str, optional
         The base url to OKX's websocket API.
         If ``None`` then will source the url from `get_ws_base_url()`.
-    http_proxy_url : str, optional
-        Optional HTTP proxy URL.
-    ws_proxy_url : str, optional
-        Optional WebSocket proxy URL.
-        Note: WebSocket proxy support is not yet implemented. This field is reserved
-        for future functionality. Use `http_proxy_url` for REST API proxy support.
-    is_demo : bool, default False
-        If the client is connecting to the OKX demo API.
+    proxy_url : str, optional
+        Optional proxy URL for HTTP and WebSocket transports.
+    environment : OKXEnvironment, optional
+        The OKX environment for the client (LIVE or DEMO).
+        If ``None`` then defaults to LIVE.
     margin_mode : OKXMarginMode, optional
         The intended OKX account margin mode.
         - `ISOLATED`: Margin isolated to specific positions (default)
@@ -157,6 +154,10 @@ class OKXExecClientConfig(LiveExecClientConfig, frozen=True):
         (borrowing) as SHORT positions. This may lead to unintended liquidation of wallet assets
         if strategies are not designed to handle SPOT positions properly.
         If False, SPOT instruments return FLAT position reports (default behavior).
+    ws_auth_timeout_secs : PositiveInt, default 30
+        The timeout (seconds) for WebSocket authentication.
+    load_spreads : bool, default False
+        If True, load OKX Nitro spread instruments and subscribe to spread order updates.
 
     """
 
@@ -166,11 +167,10 @@ class OKXExecClientConfig(LiveExecClientConfig, frozen=True):
     instrument_types: tuple[OKXInstrumentType, ...] = (OKXInstrumentType.SPOT,)
     contract_types: tuple[OKXContractType, ...] | None = None
     instrument_families: tuple[str, ...] | None = None
+    environment: OKXEnvironment | None = None
     base_url_http: str | None = None
     base_url_ws: str | None = None
-    http_proxy_url: str | None = None
-    ws_proxy_url: str | None = None
-    is_demo: bool = False
+    proxy_url: str | None = None
     margin_mode: OKXMarginMode | None = None
     use_spot_margin: bool = False
     http_timeout_secs: PositiveInt | None = 60
@@ -180,3 +180,5 @@ class OKXExecClientConfig(LiveExecClientConfig, frozen=True):
     use_fills_channel: bool = False
     use_mm_mass_cancel: bool = False
     use_spot_cash_position_reports: bool = False
+    ws_auth_timeout_secs: PositiveInt | None = 30
+    load_spreads: bool = False

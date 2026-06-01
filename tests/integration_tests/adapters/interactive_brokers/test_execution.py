@@ -16,6 +16,7 @@
 import asyncio
 from decimal import Decimal
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 from ibapi.order_state import OrderState as IBOrderState
@@ -24,11 +25,26 @@ from nautilus_trader.adapters.interactive_brokers.common import IBOrderTags
 from nautilus_trader.adapters.interactive_brokers.factories import (
     InteractiveBrokersLiveExecClientFactory,
 )
+from nautilus_trader.adapters.interactive_brokers.parsing.execution import timestring_to_timestamp
+from nautilus_trader.execution.messages import BatchCancelOrders
+from nautilus_trader.execution.messages import CancelAllOrders
+from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.execution.messages import QueryAccount
+from nautilus_trader.model.enums import AssetClass
+from nautilus_trader.model.enums import OptionKind
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.enums import PositionSide
+from nautilus_trader.model.identifiers import ClientOrderId
+from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import PositionId
+from nautilus_trader.model.identifiers import Symbol
+from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.identifiers import VenueOrderId
+from nautilus_trader.model.identifiers import new_generic_spread_id
+from nautilus_trader.model.instruments import OptionContract
+from nautilus_trader.model.instruments import OptionSpread
+from nautilus_trader.model.objects import Currency
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.test_kit.stubs.commands import TestCommandStubs
@@ -71,6 +87,7 @@ def order_setup(
         instrument=instrument,
         client_order_id=client_order_id,
     )
+
     if status == OrderStatus.SUBMITTED:
         order = TestExecStubs.make_submitted_order(order)
     elif status == OrderStatus.ACCEPTED:
@@ -79,6 +96,48 @@ def order_setup(
         raise ValueError(status)
     exec_client._cache.add_order(order, PositionId("1"))
     return order
+
+
+def make_option_contract(symbol_str: str, kind: OptionKind) -> OptionContract:
+    return OptionContract(
+        instrument_id=InstrumentId(Symbol(symbol_str), Venue("SMART")),
+        raw_symbol=Symbol(symbol_str),
+        asset_class=AssetClass.EQUITY,
+        currency=Currency.from_str("USD"),
+        price_precision=2,
+        price_increment=Price.from_str("0.01"),
+        multiplier=Quantity.from_int(100),
+        lot_size=Quantity.from_int(1),
+        underlying="SPY",
+        option_kind=kind,
+        activation_ns=0,
+        expiration_ns=1640995200000000000,
+        strike_price=Price.from_str("400.0")
+        if kind == OptionKind.CALL
+        else Price.from_str("390.0"),
+        ts_event=0,
+        ts_init=0,
+    )
+
+
+def make_option_spread(call: OptionContract, put: OptionContract) -> OptionSpread:
+    spread_id = new_generic_spread_id([(call.id, 1), (put.id, -1)])
+    return OptionSpread(
+        instrument_id=spread_id,
+        raw_symbol=spread_id.symbol,
+        asset_class=AssetClass.EQUITY,
+        currency=Currency.from_str("USD"),
+        price_precision=2,
+        price_increment=Price.from_str("0.01"),
+        multiplier=Quantity.from_int(100),
+        lot_size=Quantity.from_int(1),
+        underlying="SPY",
+        strategy_type="VERTICAL",
+        activation_ns=0,
+        expiration_ns=1640995200000000000,
+        ts_event=0,
+        ts_init=0,
+    )
 
 
 def account_summary_setup(client, **kwargs):
@@ -194,6 +253,26 @@ async def test_connect(mocker, exec_client):
 
 
 @pytest.mark.asyncio
+async def test_connect_propagates_client_ready_timeout(mocker, exec_client):
+    # Arrange
+    async def wait_until_ready(timeout):
+        raise TimeoutError
+
+    mocker.patch.object(
+        exec_client._client,
+        "wait_until_ready",
+        side_effect=wait_until_ready,
+    )
+    initialize = mocker.patch.object(exec_client.instrument_provider, "initialize")
+
+    # Act, Assert
+    with pytest.raises(TimeoutError):
+        await exec_client._connect()
+
+    initialize.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_disconnect(mocker, exec_client):
     # Arrange
     mocker.patch.object(
@@ -261,6 +340,42 @@ async def test_submit_order(
     assert cache.order(client_order_id).quantity == expected.quantity
     assert cache.order(client_order_id).price == expected.price
     assert cache.order(client_order_id).status == OrderStatus.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_submit_order_rejects_when_ib_client_not_ready(
+    mocker,
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+    client_order_id,
+):
+    # Arrange
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+    exec_client._set_connected(True)
+    exec_client._client._is_client_ready.clear()
+    place_order = mocker.patch.object(exec_client._client, "place_order")
+
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        client_order_id=client_order_id,
+    )
+    cache.add_order(order, None)
+    command = TestCommandStubs.submit_order_command(order=order)
+
+    # Act
+    exec_client.submit_order(command=command)
+    await asyncio.sleep(0)
+
+    # Assert
+    place_order.assert_not_called()
+    assert cache.order(client_order_id).status == OrderStatus.REJECTED
 
 
 @pytest.mark.asyncio
@@ -529,6 +644,102 @@ async def test_modify_order_price(
 
 
 @pytest.mark.asyncio
+async def test_modify_order_child_before_parent_acceptance_skips_parent_id(
+    mocker,
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+):
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+
+    parent_client_order_id = ClientOrderId("O-BRACKET-PARENT-001")
+    child_client_order_id = ClientOrderId("O-BRACKET-CHILD-001")
+    order_list = TestExecStubs.limit_with_stop_market(
+        instrument=instrument,
+        entry_client_order_id=parent_client_order_id,
+        sl_client_order_id=child_client_order_id,
+    )
+    parent_order = TestExecStubs.make_submitted_order(order_list.orders[0])
+    child_order = TestExecStubs.make_accepted_order(
+        order_list.orders[1],
+        venue_order_id=VenueOrderId("9102"),
+    )
+    cache.add_order(parent_order, None)
+    cache.add_order(child_order, None)
+    exec_client._client._is_client_ready.set()
+
+    place_order = mocker.patch.object(exec_client._client, "place_order")
+
+    command = TestCommandStubs.modify_order_command(
+        quantity=Quantity.from_str("150"),
+        order=child_order,
+    )
+    await exec_client._modify_order(command)
+
+    assert place_order.call_count == 1
+    ib_order = place_order.call_args.args[0]
+    assert ib_order.orderId == 9102
+    assert ib_order.parentId == 0
+    assert ib_order.totalQuantity == 150.0
+
+
+@pytest.mark.asyncio
+async def test_modify_order_rejects_when_ib_client_not_ready(
+    mocker,
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+    client_order_id,
+    venue_order_id,
+):
+    # Arrange
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+    exec_client._set_connected(True)
+    exec_client._client._is_client_ready.clear()
+    place_order = mocker.patch.object(exec_client._client, "place_order")
+    generate_order_modify_rejected = mocker.patch.object(
+        exec_client,
+        "generate_order_modify_rejected",
+    )
+
+    order = order_setup(
+        exec_client=exec_client,
+        instrument=instrument,
+        client_order_id=client_order_id,
+        venue_order_id=venue_order_id,
+        status=OrderStatus.ACCEPTED,
+    )
+    command = TestCommandStubs.modify_order_command(
+        price=Price.from_int(95),
+        order=order,
+    )
+
+    # Act
+    exec_client.modify_order(command=command)
+    await asyncio.sleep(0)
+
+    # Assert
+    place_order.assert_not_called()
+    generate_order_modify_rejected.assert_called_once()
+    assert (
+        generate_order_modify_rejected.call_args.kwargs["reason"]
+        == "Interactive Brokers client is not ready; refusing to modify order"
+    )
+
+
+@pytest.mark.asyncio
 async def test_cancel_order(
     mocker,
     exec_client,
@@ -577,6 +788,161 @@ async def test_cancel_order(
 
     # Assert
     assert cache.order(client_order_id).status == OrderStatus.CANCELED
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_rejects_when_ib_client_not_ready(
+    mocker,
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+    client_order_id,
+    venue_order_id,
+):
+    # Arrange
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+    exec_client._set_connected(True)
+    exec_client._client._is_client_ready.clear()
+    cancel_order = mocker.patch.object(exec_client._client, "cancel_order")
+    generate_order_cancel_rejected = mocker.patch.object(
+        exec_client,
+        "generate_order_cancel_rejected",
+    )
+
+    order = order_setup(
+        exec_client=exec_client,
+        instrument=instrument,
+        client_order_id=client_order_id,
+        venue_order_id=venue_order_id,
+        status=OrderStatus.ACCEPTED,
+    )
+    command = TestCommandStubs.cancel_order_command(order=order)
+
+    # Act
+    exec_client.cancel_order(command=command)
+    await asyncio.sleep(0)
+
+    # Assert
+    cancel_order.assert_not_called()
+    generate_order_cancel_rejected.assert_called_once()
+    assert (
+        generate_order_cancel_rejected.call_args.kwargs["reason"]
+        == "Interactive Brokers client is not ready; refusing to cancel order"
+    )
+
+
+@pytest.mark.asyncio
+async def test_batch_cancel_orders_rejects_when_ib_client_not_ready(
+    mocker,
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+    client_order_id,
+    venue_order_id,
+):
+    # Arrange
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+    exec_client._set_connected(True)
+    exec_client._client._is_client_ready.clear()
+    cancel_order = mocker.patch.object(exec_client._client, "cancel_order")
+    generate_order_cancel_rejected = mocker.patch.object(
+        exec_client,
+        "generate_order_cancel_rejected",
+    )
+
+    order = order_setup(
+        exec_client=exec_client,
+        instrument=instrument,
+        client_order_id=client_order_id,
+        venue_order_id=venue_order_id,
+        status=OrderStatus.ACCEPTED,
+    )
+    cancel = TestCommandStubs.cancel_order_command(order=order)
+    command = BatchCancelOrders(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        cancels=[cancel],
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act
+    await exec_client._batch_cancel_orders(command)
+
+    # Assert
+    cancel_order.assert_not_called()
+    generate_order_cancel_rejected.assert_called_once()
+    assert (
+        generate_order_cancel_rejected.call_args.kwargs["reason"]
+        == "Interactive Brokers client is not ready; refusing to cancel order"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_orders_rejects_when_ib_client_not_ready(
+    mocker,
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+    client_order_id,
+    venue_order_id,
+):
+    # Arrange
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+    exec_client._set_connected(True)
+    exec_client._client._is_client_ready.clear()
+    cancel_order = mocker.patch.object(exec_client._client, "cancel_order")
+    generate_order_cancel_rejected = mocker.patch.object(
+        exec_client,
+        "generate_order_cancel_rejected",
+    )
+
+    order = order_setup(
+        exec_client=exec_client,
+        instrument=instrument,
+        client_order_id=client_order_id,
+        venue_order_id=venue_order_id,
+        status=OrderStatus.ACCEPTED,
+    )
+    cache.update_order(order)
+    command = CancelAllOrders(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        order_side=OrderSide.NO_ORDER_SIDE,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act
+    await exec_client._cancel_all_orders(command)
+
+    # Assert
+    cancel_order.assert_not_called()
+    generate_order_cancel_rejected.assert_called_once()
+    assert (
+        generate_order_cancel_rejected.call_args.kwargs["reason"]
+        == "Interactive Brokers client is not ready; refusing to cancel orders"
+    )
 
 
 @pytest.mark.asyncio
@@ -714,6 +1080,126 @@ async def test_on_order_status_with_avg_px(
 
 
 @pytest.mark.asyncio
+async def test_generate_order_status_report_open_order_miss_does_not_cancel(
+    mocker,
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+):
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+
+    client_order_id = ClientOrderId("O-STATUS-MISS-001")
+    venue_order_id = VenueOrderId("9301")
+    order = order_setup(
+        exec_client=exec_client,
+        instrument=instrument,
+        client_order_id=client_order_id,
+        venue_order_id=venue_order_id,
+        status=OrderStatus.ACCEPTED,
+    )
+    cache.add_venue_order_id(order.client_order_id, venue_order_id)
+
+    mocker.patch.object(exec_client._client, "get_open_orders", return_value=[])
+    on_order_status = mocker.spy(exec_client, "_on_order_status")
+    command = GenerateOrderStatusReport(
+        instrument_id=instrument.id,
+        client_order_id=client_order_id,
+        venue_order_id=venue_order_id,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    report = await exec_client.generate_order_status_report(command)
+
+    assert report is None
+    assert on_order_status.call_count == 0
+    assert cache.order(client_order_id).status == OrderStatus.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_on_order_status_resolves_cached_external_order_by_venue_order_id(
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+):
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+
+    venue_order_id = VenueOrderId("9001")
+    external_order_id = TestIdStubs.client_order_id()
+    order = order_setup(
+        exec_client=exec_client,
+        instrument=instrument,
+        client_order_id=external_order_id,
+        venue_order_id=venue_order_id,
+        status=OrderStatus.ACCEPTED,
+    )
+    cache.add_venue_order_id(order.client_order_id, venue_order_id)
+
+    exec_client._on_order_status(
+        order_ref="",
+        order_status="Cancelled",
+        avg_fill_price=0.0,
+        filled=Decimal(0),
+        remaining=Decimal(100),
+        venue_order_id=venue_order_id,
+    )
+
+    assert cache.order(external_order_id).status == OrderStatus.CANCELED
+
+
+@pytest.mark.asyncio
+async def test_on_exec_details_resolves_cached_external_order_by_venue_order_id(
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+):
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+
+    venue_order_id = VenueOrderId("9002")
+    external_order_id = TestIdStubs.client_order_id()
+    order = order_setup(
+        exec_client=exec_client,
+        instrument=instrument,
+        client_order_id=external_order_id,
+        venue_order_id=venue_order_id,
+        status=OrderStatus.ACCEPTED,
+    )
+    cache.add_venue_order_id(order.client_order_id, venue_order_id)
+
+    execution = IBTestExecStubs.execution(order_id=int(venue_order_id.value))
+    execution.orderRef = ""
+    commission_report = IBTestExecStubs.commission()
+
+    exec_client._on_exec_details(
+        order_ref="",
+        execution=execution,
+        commission_report=commission_report,
+        contract=contract_details.contract,
+    )
+
+    assert cache.order(external_order_id).filled_qty == Quantity(100, 0)
+    assert cache.order(external_order_id).status == OrderStatus.FILLED
+
+
+@pytest.mark.asyncio
 async def test_on_exec_details_uses_stored_avg_px(
     mocker,
     exec_client,
@@ -808,9 +1294,521 @@ async def test_on_exec_details_uses_stored_avg_px(
 
 
 @pytest.mark.asyncio
+async def test_spread_combo_fill_waits_for_order_status_avg_px(mocker, exec_client, cache):
+    call = make_option_contract("SPY C400", OptionKind.CALL)
+    put = make_option_contract("SPY P390", OptionKind.PUT)
+    spread = make_option_spread(call, put)
+
+    for instrument in [call, put, spread]:
+        exec_client.instrument_provider.add(instrument)
+        cache.add_instrument(instrument)
+
+    call_contract = IBTestContractStubs.create_contract(
+        conId=9001,
+        symbol="SPY",
+        secType="OPT",
+        exchange="SMART",
+        currency="USD",
+        localSymbol="SPY C400",
+    )
+    exec_client.instrument_provider.contract_id_to_instrument_id[call_contract.conId] = call.id
+
+    client_order_id = ClientOrderId("O-SPREAD-001")
+    venue_order_id = VenueOrderId("7001")
+    order = TestExecStubs.limit_order(
+        instrument=spread,
+        client_order_id=client_order_id,
+        quantity=Quantity.from_int(1),
+        price=Price.from_str("1.00"),
+    )
+    order = TestExecStubs.make_accepted_order(order, venue_order_id=venue_order_id)
+    cache.add_order(order, None)
+    cache.add_venue_order_id(client_order_id, venue_order_id)
+
+    generate_order_filled = mocker.patch.object(exec_client, "generate_order_filled")
+
+    execution = IBTestExecStubs.execution(order_id=int(venue_order_id.value))
+    execution.orderRef = str(client_order_id)
+    execution.execId = "combo-fill-1"
+    execution.shares = Decimal(1)
+    execution.price = 3.30
+
+    commission_report = IBTestExecStubs.commission()
+    commission_report.execId = execution.execId
+
+    exec_client._on_exec_details(
+        order_ref=str(client_order_id),
+        execution=execution,
+        commission_report=commission_report,
+        contract=call_contract,
+    )
+
+    assert generate_order_filled.call_count == 1
+    leg_fill_call = generate_order_filled.call_args_list[0].kwargs
+    assert leg_fill_call["instrument_id"] == call.id
+    assert leg_fill_call["info"] is None
+    assert client_order_id in exec_client._pending_combo_fills
+
+    exec_client._on_order_status(
+        order_ref=str(client_order_id),
+        order_status="Filled",
+        avg_fill_price=2.75,
+        filled=Decimal(1),
+        remaining=Decimal(0),
+        venue_order_id=venue_order_id,
+    )
+
+    assert generate_order_filled.call_count == 2
+    combo_fill_call = generate_order_filled.call_args_list[1].kwargs
+    assert combo_fill_call["instrument_id"] == spread.id
+    assert combo_fill_call["info"] == {"avg_px": Price.from_str("2.75")}
+    assert client_order_id not in exec_client._pending_combo_fills
+
+
+@pytest.mark.asyncio
+async def test_spread_combo_fill_allows_negative_avg_px_credit(
+    mocker,
+    exec_client,
+    cache,
+):
+    call = make_option_contract("SPY C400", OptionKind.CALL)
+    put = make_option_contract("SPY P390", OptionKind.PUT)
+    spread = make_option_spread(call, put)
+
+    for instrument in [call, put, spread]:
+        exec_client.instrument_provider.add(instrument)
+        cache.add_instrument(instrument)
+
+    call_contract = IBTestContractStubs.create_contract(
+        conId=9011,
+        symbol="SPY",
+        secType="OPT",
+        exchange="SMART",
+        currency="USD",
+        localSymbol="SPY C400",
+    )
+    exec_client.instrument_provider.contract_id_to_instrument_id[call_contract.conId] = call.id
+
+    client_order_id = ClientOrderId("O-SPREAD-CREDIT-001")
+    venue_order_id = VenueOrderId("7011")
+    order = TestExecStubs.limit_order(
+        instrument=spread,
+        client_order_id=client_order_id,
+        quantity=Quantity.from_int(1),
+        price=Price.from_str("-1.00"),
+    )
+    order = TestExecStubs.make_accepted_order(order, venue_order_id=venue_order_id)
+    cache.add_order(order, None)
+    cache.add_venue_order_id(client_order_id, venue_order_id)
+
+    generate_order_filled = mocker.patch.object(exec_client, "generate_order_filled")
+
+    execution = IBTestExecStubs.execution(order_id=int(venue_order_id.value))
+    execution.orderRef = str(client_order_id)
+    execution.execId = "combo-credit-fill-1"
+    execution.shares = Decimal(1)
+    execution.price = 1.25
+
+    commission_report = IBTestExecStubs.commission()
+    commission_report.execId = execution.execId
+
+    exec_client._on_exec_details(
+        order_ref=str(client_order_id),
+        execution=execution,
+        commission_report=commission_report,
+        contract=call_contract,
+    )
+
+    assert generate_order_filled.call_count == 1
+    assert client_order_id in exec_client._pending_combo_fills
+
+    exec_client._on_order_status(
+        order_ref=str(client_order_id),
+        order_status="Filled",
+        avg_fill_price=-2.75,
+        filled=Decimal(1),
+        remaining=Decimal(0),
+        venue_order_id=venue_order_id,
+    )
+
+    assert generate_order_filled.call_count == 2
+    combo_fill_call = generate_order_filled.call_args_list[1].kwargs
+    assert combo_fill_call["instrument_id"] == spread.id
+    assert combo_fill_call["info"] == {"avg_px": Price.from_str("-2.75")}
+    assert exec_client._order_avg_prices[client_order_id] == Price.from_str("-2.75")
+    assert client_order_id not in exec_client._pending_combo_fills
+
+
+@pytest.mark.asyncio
+async def test_spread_combo_fill_uses_incremental_avg_px_for_multiple_fills(
+    mocker,
+    exec_client,
+    cache,
+):
+    call = make_option_contract("SPY C400", OptionKind.CALL)
+    put = make_option_contract("SPY P390", OptionKind.PUT)
+    spread = make_option_spread(call, put)
+
+    for instrument in [call, put, spread]:
+        exec_client.instrument_provider.add(instrument)
+        cache.add_instrument(instrument)
+
+    put_contract = IBTestContractStubs.create_contract(
+        conId=9002,
+        symbol="SPY",
+        secType="OPT",
+        exchange="SMART",
+        currency="USD",
+        localSymbol="SPY P390",
+    )
+    call_contract = IBTestContractStubs.create_contract(
+        conId=9003,
+        symbol="SPY",
+        secType="OPT",
+        exchange="SMART",
+        currency="USD",
+        localSymbol="SPY C400",
+    )
+    exec_client.instrument_provider.contract_id_to_instrument_id[put_contract.conId] = put.id
+    exec_client.instrument_provider.contract_id_to_instrument_id[call_contract.conId] = call.id
+
+    client_order_id = ClientOrderId("O-SPREAD-MULTI-001")
+    venue_order_id = VenueOrderId("7002")
+    order = TestExecStubs.limit_order(
+        instrument=spread,
+        client_order_id=client_order_id,
+        quantity=Quantity.from_int(3),
+        price=Price.from_str("1.00"),
+    )
+    order = TestExecStubs.make_accepted_order(order, venue_order_id=venue_order_id)
+    cache.add_order(order, None)
+    cache.add_venue_order_id(client_order_id, venue_order_id)
+
+    generate_order_filled = mocker.patch.object(exec_client, "generate_order_filled")
+
+    execution1 = IBTestExecStubs.execution(order_id=int(venue_order_id.value))
+    execution1.orderRef = str(client_order_id)
+    execution1.execId = "combo-fill-1"
+    execution1.shares = Decimal(1)
+    execution1.price = 2.40
+
+    commission_report1 = IBTestExecStubs.commission()
+    commission_report1.execId = execution1.execId
+
+    exec_client._on_exec_details(
+        order_ref=str(client_order_id),
+        execution=execution1,
+        commission_report=commission_report1,
+        contract=put_contract,
+    )
+    execution1_leg2 = IBTestExecStubs.execution(order_id=int(venue_order_id.value))
+    execution1_leg2.orderRef = str(client_order_id)
+    execution1_leg2.execId = "combo-fill-1-leg-2"
+    execution1_leg2.shares = Decimal(1)
+    execution1_leg2.price = 2.60
+
+    commission_report1_leg2 = IBTestExecStubs.commission()
+    commission_report1_leg2.execId = execution1_leg2.execId
+
+    exec_client._on_exec_details(
+        order_ref=str(client_order_id),
+        execution=execution1_leg2,
+        commission_report=commission_report1_leg2,
+        contract=call_contract,
+    )
+    exec_client._on_order_status(
+        order_ref=str(client_order_id),
+        order_status="Submitted",
+        avg_fill_price=2.50,
+        filled=Decimal(1),
+        remaining=Decimal(2),
+        venue_order_id=venue_order_id,
+    )
+
+    execution2 = IBTestExecStubs.execution(order_id=int(venue_order_id.value))
+    execution2.orderRef = str(client_order_id)
+    execution2.execId = "combo-fill-2"
+    execution2.shares = Decimal(2)
+    execution2.price = 3.20
+
+    commission_report2 = IBTestExecStubs.commission()
+    commission_report2.execId = execution2.execId
+
+    exec_client._on_exec_details(
+        order_ref=str(client_order_id),
+        execution=execution2,
+        commission_report=commission_report2,
+        contract=put_contract,
+    )
+    execution2_leg2 = IBTestExecStubs.execution(order_id=int(venue_order_id.value))
+    execution2_leg2.orderRef = str(client_order_id)
+    execution2_leg2.execId = "combo-fill-2-leg-2"
+    execution2_leg2.shares = Decimal(2)
+    execution2_leg2.price = 3.00
+
+    commission_report2_leg2 = IBTestExecStubs.commission()
+    commission_report2_leg2.execId = execution2_leg2.execId
+
+    exec_client._on_exec_details(
+        order_ref=str(client_order_id),
+        execution=execution2_leg2,
+        commission_report=commission_report2_leg2,
+        contract=call_contract,
+    )
+    exec_client._on_order_status(
+        order_ref=str(client_order_id),
+        order_status="Filled",
+        avg_fill_price=2.90,
+        filled=Decimal(3),
+        remaining=Decimal(0),
+        venue_order_id=venue_order_id,
+    )
+
+    combo_fill_calls = [
+        call.kwargs
+        for call in generate_order_filled.call_args_list
+        if call.kwargs["instrument_id"] == spread.id
+    ]
+
+    assert len(combo_fill_calls) == 2
+    assert combo_fill_calls[0]["last_qty"] == Quantity.from_int(1)
+    assert combo_fill_calls[0]["info"] == {"avg_px": Price.from_str("2.50")}
+    assert combo_fill_calls[1]["last_qty"] == Quantity.from_int(2)
+    assert combo_fill_calls[1]["info"] == {"avg_px": Price.from_str("3.10")}
+    assert client_order_id not in exec_client._pending_combo_fills
+
+
+@pytest.mark.asyncio
+async def test_spread_execution_handles_exec_details_before_open_order(mocker, exec_client, cache):
+    # Regression test: when IB delivers execDetails before openOrder has assigned
+    # venue_order_id (typical for fast market-order combo fills), the spread fill
+    # paths must derive venue_order_id from the Execution and not crash with
+    # NoneType errors. The cache must also learn the venue_order_id mapping so
+    # subsequent FillReports during reconciliation can be attributed correctly.
+    call = make_option_contract("SPY C400", OptionKind.CALL)
+    put = make_option_contract("SPY P390", OptionKind.PUT)
+    spread = make_option_spread(call, put)
+
+    for instrument in [call, put, spread]:
+        exec_client.instrument_provider.add(instrument)
+        cache.add_instrument(instrument)
+
+    call_contract = IBTestContractStubs.create_contract(
+        conId=9101,
+        symbol="SPY",
+        secType="OPT",
+        exchange="SMART",
+        currency="USD",
+        localSymbol="SPY C400",
+    )
+    exec_client.instrument_provider.contract_id_to_instrument_id[call_contract.conId] = call.id
+
+    client_order_id = ClientOrderId("O-SPREAD-RACE-001")
+    # Order is in SUBMITTED state without venue_order_id — i.e. openOrder has not
+    # fired yet. This is the precondition for the race.
+    order = TestExecStubs.limit_order(
+        instrument=spread,
+        client_order_id=client_order_id,
+        quantity=Quantity.from_int(1),
+        price=Price.from_str("1.00"),
+    )
+    order = TestExecStubs.make_submitted_order(order)
+    cache.add_order(order, None)
+    assert order.venue_order_id is None
+
+    venue_order_id = VenueOrderId("7101")
+    generate_order_accepted = mocker.spy(exec_client, "generate_order_accepted")
+    generate_order_filled = mocker.patch.object(exec_client, "generate_order_filled")
+
+    execution = IBTestExecStubs.execution(order_id=int(venue_order_id.value))
+    execution.orderRef = str(client_order_id)
+    execution.execId = "race-fill-1"
+    execution.shares = Decimal(1)
+    execution.price = 3.30
+    commission_report = IBTestExecStubs.commission()
+    commission_report.execId = execution.execId
+
+    # Should not raise (regression: previously crashed with TypeError /
+    # AttributeError on nautilus_order.venue_order_id == None).
+    exec_client._on_exec_details(
+        order_ref=str(client_order_id),
+        execution=execution,
+        commission_report=commission_report,
+        contract=call_contract,
+    )
+
+    # An OrderAccepted event must be synthesized so the cache learns the
+    # venue_order_id mapping.
+    assert generate_order_accepted.call_count == 1
+    assert generate_order_accepted.call_args.kwargs["venue_order_id"] == venue_order_id
+    assert (
+        generate_order_accepted.call_args.kwargs["ts_event"]
+        == timestring_to_timestamp(execution.time).value
+    )
+
+    # The leg fill must be generated with venue_order_id derived from the
+    # execution rather than crashing.
+    assert generate_order_filled.call_count == 1
+    leg_fill_call = generate_order_filled.call_args_list[0].kwargs
+    assert leg_fill_call["instrument_id"] == call.id
+    assert leg_fill_call["venue_order_id"] == VenueOrderId(f"{venue_order_id.value}-LEG-0")
+
+
+@pytest.mark.asyncio
+async def test_exec_details_does_not_accept_rejected_order(
+    mocker,
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+):
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+
+    client_order_id = ClientOrderId("O-REJECTED-RACE-001")
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        client_order_id=client_order_id,
+    )
+    order = TestExecStubs.make_submitted_order(order)
+    cache.add_order(order, None)
+
+    exec_client._handle_order_event(
+        status=OrderStatus.REJECTED,
+        order=order,
+        reason="Rejected before late execDetails",
+    )
+    assert cache.order(client_order_id).status == OrderStatus.REJECTED
+    assert cache.order(client_order_id).venue_order_id is None
+
+    venue_order_id = VenueOrderId("7201")
+    generate_order_accepted = mocker.spy(exec_client, "generate_order_accepted")
+    mocker.patch.object(exec_client, "generate_order_filled")
+
+    execution = IBTestExecStubs.execution(order_id=int(venue_order_id.value))
+    execution.orderRef = str(client_order_id)
+    commission_report = IBTestExecStubs.commission()
+    commission_report.execId = execution.execId
+
+    exec_client._on_exec_details(
+        order_ref=str(client_order_id),
+        execution=execution,
+        commission_report=commission_report,
+        contract=contract_details.contract,
+    )
+
+    assert generate_order_accepted.call_count == 0
+    assert cache.order(client_order_id).status == OrderStatus.REJECTED
+
+
+@pytest.mark.asyncio
+async def test_on_order_status_cancel_propagates_venue_order_id_when_order_unaccepted(
+    mocker,
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+):
+    # Regression test: when an orderStatus(Cancelled) callback arrives before
+    # openOrder has set venue_order_id on the cached Order, the OrderCanceled
+    # event must still carry the venue_order_id from the orderStatus payload.
+    # Otherwise the cache loses the venue_order_id->client_order_id mapping
+    # and subsequent FillReports during reconciliation can't be attributed.
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+
+    client_order_id = ClientOrderId("O-CANCEL-RACE-001")
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        client_order_id=client_order_id,
+    )
+    order = TestExecStubs.make_submitted_order(order)
+    cache.add_order(order, None)
+    assert order.venue_order_id is None
+
+    venue_order_id = VenueOrderId("8201")
+    generate_order_canceled = mocker.spy(exec_client, "generate_order_canceled")
+
+    exec_client._on_order_status(
+        order_ref=str(client_order_id),
+        order_status="Cancelled",
+        venue_order_id=venue_order_id,
+    )
+
+    assert generate_order_canceled.call_count == 1
+    assert generate_order_canceled.call_args.kwargs["venue_order_id"] == venue_order_id
+    assert cache.order(client_order_id).status == OrderStatus.CANCELED
+
+    exec_client._on_order_status(
+        order_ref=str(client_order_id),
+        order_status="Cancelled",
+        venue_order_id=venue_order_id,
+    )
+
+    assert generate_order_canceled.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_on_account_update(mocker, exec_client):
     # TODO:
     pass
+
+
+@pytest.mark.asyncio
+async def test_handle_position_update_retries_flat_report_after_transient_instrument_lookup_failure(
+    mocker,
+    exec_client,
+    cache,
+    instrument,
+    contract_details,
+):
+    instrument_setup(
+        exec_client=exec_client,
+        cache=cache,
+        instrument=instrument,
+        contract_details=contract_details,
+    )
+
+    contract_id = contract_details.contract.conId
+    exec_client._known_positions[contract_id] = Decimal(2)
+    ib_position = SimpleNamespace(
+        contract=contract_details.contract,
+        quantity=Decimal(0),
+        avg_cost=0.0,
+    )
+
+    get_instrument = mocker.patch.object(
+        exec_client.instrument_provider,
+        "get_instrument",
+        side_effect=[None, instrument],
+    )
+    send_position_status_report = mocker.patch.object(
+        exec_client,
+        "_send_position_status_report",
+    )
+
+    await exec_client._handle_position_update(ib_position)
+
+    assert exec_client._known_positions[contract_id] == Decimal(2)
+    send_position_status_report.assert_not_called()
+
+    await exec_client._handle_position_update(ib_position)
+
+    assert get_instrument.call_count == 2
+    send_position_status_report.assert_called_once()
+    position_report = send_position_status_report.call_args.args[0]
+    assert position_report.instrument_id == instrument.id
+    assert position_report.position_side == PositionSide.FLAT
+    assert position_report.quantity == instrument.make_qty(0)
+    assert contract_id not in exec_client._known_positions
 
 
 @pytest.fixture

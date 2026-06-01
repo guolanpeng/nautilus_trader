@@ -52,7 +52,7 @@ pub struct CollectEvent {
 impl CollectEvent {
     /// Creates a new [`CollectEvent`] instance with the specified parameters.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         dex: SharedDex,
         pool_identifier: PoolIdentifier,
@@ -84,13 +84,12 @@ impl CollectEvent {
     }
 
     /// Converts a collect event into a `PoolFeeCollect`.
-    #[allow(clippy::too_many_arguments)]
     pub fn to_pool_fee_collect(
         &self,
         chain: SharedChain,
         dex: SharedDex,
         instrument_id: InstrumentId,
-        timestamp: Option<UnixNanos>,
+        timestamp: UnixNanos,
     ) -> PoolFeeCollect {
         PoolFeeCollect::new(
             chain,
@@ -106,7 +105,8 @@ impl CollectEvent {
             self.amount1,
             self.tick_lower,
             self.tick_upper,
-            timestamp,
+            timestamp, // ts_event
+            timestamp, // ts_init (same block timestamp)
         )
     }
 }

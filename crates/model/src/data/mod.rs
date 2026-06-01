@@ -47,6 +47,8 @@ use nautilus_core::{Params, UnixNanos};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, to_string};
 
+#[cfg(feature = "defi")]
+use crate::defi::DefiData;
 // Re-exports
 #[rustfmt::skip]  // Keep these grouped
 pub use bar::{Bar, BarSpecification, BarType};
@@ -74,16 +76,19 @@ pub use option_chain::{OptionChainSlice, OptionGreeks, OptionStrikeData, StrikeR
 pub use order::{BookOrder, NULL_ORDER};
 pub use prices::{IndexPriceUpdate, MarkPriceUpdate};
 pub use quote::QuoteTick;
+#[cfg(feature = "arrow")]
 pub use registry::{
-    ArrowDecoder, ArrowEncoder, decode_custom_from_arrow, deserialize_custom_from_json,
-    encode_custom_to_arrow, ensure_arrow_registered, ensure_json_deserializer_registered,
-    get_arrow_schema, register_arrow, register_json_deserializer,
+    ArrowDecoder, ArrowEncoder, decode_custom_from_arrow, encode_custom_to_arrow,
+    ensure_arrow_registered, get_arrow_schema, register_arrow,
 };
 #[cfg(feature = "python")]
 pub use registry::{
     PyExtractor, ensure_py_extractor_registered, ensure_rust_extractor_factory_registered,
     ensure_rust_extractor_registered, get_rust_extractor, register_py_extractor,
     register_rust_extractor, register_rust_extractor_factory, try_extract_from_py,
+};
+pub use registry::{
+    deserialize_custom_from_json, ensure_json_deserializer_registered, register_json_deserializer,
 };
 pub use status::InstrumentStatus;
 pub use trade::TradeTick;
@@ -103,8 +108,13 @@ pub enum Data {
     Bar(Bar),
     MarkPriceUpdate(MarkPriceUpdate), // TODO: Rename to MarkPrice once Cython gone
     IndexPriceUpdate(IndexPriceUpdate), // TODO: Rename to IndexPrice once Cython gone
+    FundingRateUpdate(FundingRateUpdate),
+    InstrumentStatus(InstrumentStatus),
+    OptionGreeks(OptionGreeks),
     InstrumentClose(InstrumentClose),
     Custom(CustomData),
+    #[cfg(feature = "defi")]
+    Defi(Box<DefiData>), // This variant is significantly larger
 }
 
 /// A C-compatible representation of [`Data`] for FFI.
@@ -141,8 +151,19 @@ impl TryFrom<Data> for DataFFI {
             Data::Bar(x) => Ok(Self::Bar(x)),
             Data::MarkPriceUpdate(x) => Ok(Self::MarkPriceUpdate(x)),
             Data::IndexPriceUpdate(x) => Ok(Self::IndexPriceUpdate(x)),
+            Data::FundingRateUpdate(_) => {
+                anyhow::bail!("Cannot convert Data::FundingRateUpdate to DataFFI")
+            }
+            Data::InstrumentStatus(_) => {
+                anyhow::bail!("Cannot convert Data::InstrumentStatus to DataFFI")
+            }
+            Data::OptionGreeks(_) => {
+                anyhow::bail!("Cannot convert Data::OptionGreeks to DataFFI")
+            }
             Data::InstrumentClose(x) => Ok(Self::InstrumentClose(x)),
             Data::Custom(_) => anyhow::bail!("Cannot convert Data::Custom to DataFFI"),
+            #[cfg(feature = "defi")]
+            Data::Defi(_) => anyhow::bail!("Cannot convert Data::Defi to DataFFI"),
         }
     }
 }
@@ -202,6 +223,15 @@ impl<'de> Deserialize<'de> for Data {
             "IndexPriceUpdate" => Ok(Self::IndexPriceUpdate(
                 serde_json::from_value(value).map_err(D::Error::custom)?,
             )),
+            "FundingRateUpdate" => Ok(Self::FundingRateUpdate(
+                serde_json::from_value(value).map_err(D::Error::custom)?,
+            )),
+            "InstrumentStatus" => Ok(Self::InstrumentStatus(
+                serde_json::from_value(value).map_err(D::Error::custom)?,
+            )),
+            "OptionGreeks" => Ok(Self::OptionGreeks(
+                serde_json::from_value(value).map_err(D::Error::custom)?,
+            )),
             "InstrumentClose" => Ok(Self::InstrumentClose(
                 serde_json::from_value(value).map_err(D::Error::custom)?,
             )),
@@ -229,8 +259,13 @@ impl Clone for Data {
             Self::Bar(x) => Self::Bar(*x),
             Self::MarkPriceUpdate(x) => Self::MarkPriceUpdate(*x),
             Self::IndexPriceUpdate(x) => Self::IndexPriceUpdate(*x),
+            Self::FundingRateUpdate(x) => Self::FundingRateUpdate(*x),
+            Self::InstrumentStatus(x) => Self::InstrumentStatus(*x),
+            Self::OptionGreeks(x) => Self::OptionGreeks(*x),
             Self::InstrumentClose(x) => Self::InstrumentClose(*x),
             Self::Custom(x) => Self::Custom(x.clone()),
+            #[cfg(feature = "defi")]
+            Self::Defi(x) => Self::Defi(x.clone()),
         }
     }
 }
@@ -246,8 +281,13 @@ impl PartialEq for Data {
             (Self::Bar(a), Self::Bar(b)) => a == b,
             (Self::MarkPriceUpdate(a), Self::MarkPriceUpdate(b)) => a == b,
             (Self::IndexPriceUpdate(a), Self::IndexPriceUpdate(b)) => a == b,
+            (Self::FundingRateUpdate(a), Self::FundingRateUpdate(b)) => a == b,
+            (Self::InstrumentStatus(a), Self::InstrumentStatus(b)) => a == b,
+            (Self::OptionGreeks(a), Self::OptionGreeks(b)) => a == b,
             (Self::InstrumentClose(a), Self::InstrumentClose(b)) => a == b,
             (Self::Custom(a), Self::Custom(b)) => a == b,
+            #[cfg(feature = "defi")]
+            (Self::Defi(a), Self::Defi(b)) => a == b,
             _ => false,
         }
     }
@@ -267,8 +307,15 @@ impl Serialize for Data {
             Self::Bar(x) => x.serialize(serializer),
             Self::MarkPriceUpdate(x) => x.serialize(serializer),
             Self::IndexPriceUpdate(x) => x.serialize(serializer),
+            Self::FundingRateUpdate(x) => x.serialize(serializer),
+            Self::InstrumentStatus(x) => x.serialize(serializer),
+            Self::OptionGreeks(x) => x.serialize(serializer),
             Self::InstrumentClose(x) => x.serialize(serializer),
             Self::Custom(x) => x.serialize(serializer),
+            #[cfg(feature = "defi")]
+            Self::Defi(_) => Err(serde::ser::Error::custom(
+                "Data::Defi serialization is not supported",
+            )),
         }
     }
 }
@@ -306,12 +353,16 @@ impl_try_from_data!(Trade, TradeTick);
 impl_try_from_data!(Bar, Bar);
 impl_try_from_data!(MarkPriceUpdate, MarkPriceUpdate);
 impl_try_from_data!(IndexPriceUpdate, IndexPriceUpdate);
+impl_try_from_data!(FundingRateUpdate, FundingRateUpdate);
+impl_try_from_data!(InstrumentStatus, InstrumentStatus);
+impl_try_from_data!(OptionGreeks, OptionGreeks);
 impl_try_from_data!(InstrumentClose, InstrumentClose);
 
 /// Converts a vector of `Data` items to a specific variant type.
 ///
 /// Filters and converts the data vector, keeping only items that can be
 /// successfully converted to the target type `T`.
+#[must_use]
 pub fn to_variant<T: TryFrom<Data>>(data: Vec<Data>) -> Vec<T> {
     data.into_iter()
         .filter_map(|d| T::try_from(d).ok())
@@ -320,6 +371,7 @@ pub fn to_variant<T: TryFrom<Data>>(data: Vec<Data>) -> Vec<T> {
 
 impl Data {
     /// Returns the instrument ID for the data.
+    #[must_use]
     pub fn instrument_id(&self) -> InstrumentId {
         match self {
             Self::Delta(delta) => delta.instrument_id,
@@ -330,6 +382,9 @@ impl Data {
             Self::Bar(bar) => bar.bar_type.instrument_id(),
             Self::MarkPriceUpdate(mark_price) => mark_price.instrument_id,
             Self::IndexPriceUpdate(index_price) => index_price.instrument_id,
+            Self::FundingRateUpdate(funding_rate) => funding_rate.instrument_id,
+            Self::InstrumentStatus(status) => status.instrument_id,
+            Self::OptionGreeks(greeks) => greeks.instrument_id,
             Self::InstrumentClose(close) => close.instrument_id,
             Self::Custom(custom) => custom
                 .data_type
@@ -343,10 +398,13 @@ impl Data {
                         .and_then(|s| InstrumentId::from_str(s).ok())
                 })
                 .unwrap_or_else(|| InstrumentId::from("NULL.NULL")),
+            #[cfg(feature = "defi")]
+            Self::Defi(defi) => defi.instrument_id(),
         }
     }
 
     /// Returns whether the data is a type of order book data.
+    #[must_use]
     pub fn is_order_book_data(&self) -> bool {
         matches!(self, Self::Delta(_) | Self::Deltas(_) | Self::Depth10(_))
     }
@@ -396,6 +454,9 @@ impl_catalog_path_prefix!(OrderBookDepth10, "order_book_depths");
 impl_catalog_path_prefix!(Bar, "bars");
 impl_catalog_path_prefix!(IndexPriceUpdate, "index_prices");
 impl_catalog_path_prefix!(MarkPriceUpdate, "mark_prices");
+impl_catalog_path_prefix!(FundingRateUpdate, "funding_rate_update");
+impl_catalog_path_prefix!(InstrumentStatus, "instrument_status");
+impl_catalog_path_prefix!(OptionGreeks, "option_greeks");
 impl_catalog_path_prefix!(InstrumentClose, "instrument_closes");
 
 use crate::instruments::InstrumentAny;
@@ -412,8 +473,13 @@ impl HasTsInit for Data {
             Self::Bar(b) => b.ts_init,
             Self::MarkPriceUpdate(p) => p.ts_init,
             Self::IndexPriceUpdate(p) => p.ts_init,
+            Self::FundingRateUpdate(f) => f.ts_init,
+            Self::InstrumentStatus(s) => s.ts_init,
+            Self::OptionGreeks(g) => g.ts_init,
             Self::InstrumentClose(c) => c.ts_init,
             Self::Custom(c) => c.data.ts_init(),
+            #[cfg(feature = "defi")]
+            Self::Defi(d) => d.ts_init(),
         }
     }
 }
@@ -474,9 +540,34 @@ impl From<IndexPriceUpdate> for Data {
     }
 }
 
+impl From<FundingRateUpdate> for Data {
+    fn from(value: FundingRateUpdate) -> Self {
+        Self::FundingRateUpdate(value)
+    }
+}
+
+impl From<InstrumentStatus> for Data {
+    fn from(value: InstrumentStatus) -> Self {
+        Self::InstrumentStatus(value)
+    }
+}
+
+impl From<OptionGreeks> for Data {
+    fn from(value: OptionGreeks) -> Self {
+        Self::OptionGreeks(value)
+    }
+}
+
 impl From<InstrumentClose> for Data {
     fn from(value: InstrumentClose) -> Self {
         Self::InstrumentClose(value)
+    }
+}
+
+#[cfg(feature = "defi")]
+impl From<DefiData> for Data {
+    fn from(value: DefiData) -> Self {
+        Self::Defi(Box::new(value))
     }
 }
 
@@ -537,6 +628,7 @@ pub struct DataType {
 
 impl DataType {
     /// Creates a new [`DataType`] instance.
+    #[must_use]
     pub fn new(type_name: &str, metadata: Option<Params>, identifier: Option<String>) -> Self {
         // Precompute topic from type_name + metadata (string-only view for backward compatibility)
         let topic = if let Some(ref meta) = metadata {
@@ -562,9 +654,10 @@ impl DataType {
         }
     }
 
-    /// Creates a [`DataType`] from persisted parts (type_name, topic, metadata).
-    /// Hash is recomputed from topic. Use when restoring from legacy data_type column.
+    /// Creates a [`DataType`] from persisted parts (`type_name`, topic, metadata).
+    /// Hash is recomputed from topic. Use when restoring from legacy `data_type` column.
     /// Identifier is set to None.
+    #[must_use]
     pub fn from_parts(type_name: &str, topic: &str, metadata: Option<Params>) -> Self {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         topic.hash(&mut hasher);
@@ -577,7 +670,7 @@ impl DataType {
         }
     }
 
-    /// Serializes to JSON for persistence (type_name, metadata, identifier; no topic, no hash).
+    /// Serializes to JSON for persistence (`type_name`, metadata, identifier; no topic, no hash).
     ///
     /// # Errors
     ///
@@ -605,7 +698,7 @@ impl DataType {
     }
 
     /// Deserializes from JSON produced by `to_persistence_json`.
-    /// Accepts legacy JSON with `topic` (ignored); topic is rebuilt from type_name + metadata.
+    /// Accepts legacy JSON with `topic` (ignored); topic is rebuilt from `type_name` + metadata.
     ///
     /// # Errors
     ///
@@ -637,16 +730,19 @@ impl DataType {
     }
 
     /// Returns the type name for the data type.
+    #[must_use]
     pub fn type_name(&self) -> &str {
         self.type_name.as_str()
     }
 
     /// Returns the metadata for the data type.
+    #[must_use]
     pub fn metadata(&self) -> Option<&Params> {
         self.metadata.as_ref()
     }
 
     /// Returns a string representation of the metadata.
+    #[must_use]
     pub fn metadata_str(&self) -> String {
         self.metadata.as_ref().map_or_else(
             || "null".to_string(),
@@ -655,6 +751,7 @@ impl DataType {
     }
 
     /// Returns metadata as a string-only map (e.g. for Arrow schema metadata).
+    #[must_use]
     pub fn metadata_string_map(&self) -> Option<std::collections::HashMap<String, String>> {
         self.metadata.as_ref().map(|p| {
             p.iter()
@@ -663,12 +760,20 @@ impl DataType {
         })
     }
 
+    /// Returns the precomputed hash for this data type.
+    #[must_use]
+    pub fn precomputed_hash(&self) -> u64 {
+        self.hash
+    }
+
     /// Returns the messaging topic for the data type.
+    #[must_use]
     pub fn topic(&self) -> &str {
         self.topic.as_str()
     }
 
     /// Returns the optional catalog path identifier (can contain subdirs, e.g. `"venue//symbol"`).
+    #[must_use]
     pub fn identifier(&self) -> Option<&str> {
         self.identifier.as_deref()
     }
@@ -680,6 +785,7 @@ impl DataType {
     /// This function panics if:
     /// - There is no metadata.
     /// - The `instrument_id` value contained in the metadata is invalid.
+    #[must_use]
     pub fn instrument_id(&self) -> Option<InstrumentId> {
         let metadata = self.metadata.as_ref().expect("metadata was `None`");
         let instrument_id = metadata.get_str("instrument_id")?;
@@ -696,6 +802,7 @@ impl DataType {
     /// This function panics if:
     /// - There is no metadata.
     /// - The `venue` value contained in the metadata is invalid.
+    #[must_use]
     pub fn venue(&self) -> Option<Venue> {
         let metadata = self.metadata.as_ref().expect("metadata was `None`");
         let venue_str = metadata.get_str("venue")?;
@@ -709,6 +816,7 @@ impl DataType {
     /// This function panics if:
     /// - There is no metadata.
     /// - The `start` value contained in the metadata is invalid.
+    #[must_use]
     pub fn start(&self) -> Option<UnixNanos> {
         let metadata = self.metadata.as_ref()?;
         let start_str = metadata.get_str("start")?;
@@ -722,6 +830,7 @@ impl DataType {
     /// This function panics if:
     /// - There is no metadata.
     /// - The `end` value contained in the metadata is invalid.
+    #[must_use]
     pub fn end(&self) -> Option<UnixNanos> {
         let metadata = self.metadata.as_ref()?;
         let end_str = metadata.get_str("end")?;
@@ -735,6 +844,7 @@ impl DataType {
     /// This function panics if:
     /// - There is no metadata.
     /// - The `limit` value contained in the metadata is invalid.
+    #[must_use]
     pub fn limit(&self) -> Option<usize> {
         let metadata = self.metadata.as_ref()?;
         metadata.get_usize("limit").or_else(|| {
@@ -798,6 +908,26 @@ mod tests {
 
     fn params_from_json(value: serde_json::Value) -> Params {
         serde_json::from_value(value).expect("valid Params JSON")
+    }
+
+    #[cfg(feature = "ffi")]
+    #[rstest]
+    fn test_funding_rate_update_does_not_convert_to_data_ffi() {
+        let funding_rate = FundingRateUpdate::new(
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+            "0.0001".parse().unwrap(),
+            Some(480),
+            Some(UnixNanos::from(1_000_000_000)),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+        );
+
+        let err = DataFFI::try_from(Data::FundingRateUpdate(funding_rate)).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Cannot convert Data::FundingRateUpdate to DataFFI"
+        );
     }
 
     #[rstest]
@@ -916,7 +1046,7 @@ mod tests {
 
     #[rstest]
     fn test_parse_start_from_metadata() {
-        let start_ns = 1600054595844758000;
+        let start_ns = 1_600_054_595_844_758_000;
         let metadata = Some(params_from_json(json!({"start": start_ns.to_string()})));
         let data_type = DataType::new(stringify!(TradeTick), metadata, None);
 
@@ -925,7 +1055,7 @@ mod tests {
 
     #[rstest]
     fn test_parse_end_from_metadata() {
-        let end_ns = 1720954595844758000;
+        let end_ns = 1_720_954_595_844_758_000;
         let metadata = Some(params_from_json(json!({"end": end_ns.to_string()})));
         let data_type = DataType::new(stringify!(TradeTick), metadata, None);
 

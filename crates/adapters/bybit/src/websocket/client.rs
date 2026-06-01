@@ -27,12 +27,12 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use nautilus_common::live::get_runtime;
-use nautilus_core::{UUID4, consts::NAUTILUS_USER_AGENT};
+use nautilus_core::{AtomicMap, AtomicSet, UUID4, consts::NAUTILUS_USER_AGENT};
 use nautilus_model::{
     data::BarType,
-    enums::{AggregationSource, OrderSide, OrderType, PriceType, TimeInForce},
+    enums::{AggregationSource, OrderSide, OrderType, PriceType, TimeInForce, TriggerType},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
@@ -41,8 +41,8 @@ use nautilus_network::{
     backoff::ExponentialBackoff,
     mode::ConnectionMode,
     websocket::{
-        AuthTracker, PingHandler, SubscriptionState, WebSocketClient, WebSocketConfig,
-        channel_message_handler,
+        AuthTracker, PingHandler, SubscriptionState, TransportBackend, WebSocketClient,
+        WebSocketConfig, channel_message_handler,
     },
 };
 use serde_json::Value;
@@ -54,12 +54,13 @@ use crate::{
         consts::{BYBIT_NAUTILUS_BROKER_ID, BYBIT_WS_TOPIC_DELIMITER},
         credential::Credential,
         enums::{
-            BybitEnvironment, BybitOrderSide, BybitOrderType, BybitProductType, BybitTimeInForce,
-            BybitTriggerType, BybitWsOrderRequestOp,
+            BybitBboSideType, BybitEnvironment, BybitOrderSide, BybitOrderType, BybitPositionIdx,
+            BybitProductType, BybitTimeInForce, BybitTpSlMode, BybitWsOrderRequestOp,
+            resolve_trigger_type,
         },
         parse::{
-            bar_spec_to_bybit_interval, extract_raw_symbol, map_time_in_force, spot_leverage,
-            spot_market_unit, trigger_direction,
+            bar_spec_to_bybit_interval, extract_base_coin, extract_raw_symbol, map_time_in_force,
+            spot_leverage, spot_market_unit, trigger_direction,
         },
         symbol::BybitSymbol,
         urls::{bybit_ws_private_url, bybit_ws_public_url, bybit_ws_trade_url},
@@ -78,8 +79,8 @@ use crate::{
     },
 };
 
-const DEFAULT_HEARTBEAT_SECS: u64 = 20;
 const WEBSOCKET_AUTH_WINDOW_MS: i64 = 5_000;
+const AUTH_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const BATCH_PROCESSING_LIMIT: usize = 20;
 
 /// Tracks a pending Python execution request for OrderResponse correlation.
@@ -95,6 +96,10 @@ pub struct PendingPyRequest {
 
 /// Public/market data WebSocket client for Bybit.
 #[cfg_attr(feature = "python", pyo3::pyclass(from_py_object))]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.bybit")
+)]
 pub struct BybitWebSocketClient {
     url: String,
     environment: BybitEnvironment,
@@ -111,12 +116,15 @@ pub struct BybitWebSocketClient {
     subscriptions: SubscriptionState,
     account_id: Option<AccountId>,
     mm_level: Arc<AtomicU8>,
-    bar_types_cache: Arc<DashMap<String, BarType>>,
-    instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
-    option_greeks_subs: Arc<DashSet<InstrumentId>>,
+    bar_types_cache: Arc<AtomicMap<String, BarType>>,
+    instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
+    trade_subs: Arc<AtomicSet<InstrumentId>>,
+    option_greeks_subs: Arc<AtomicSet<InstrumentId>>,
     bars_timestamp_on_close: Arc<AtomicBool>,
     pending_py_requests: Arc<DashMap<String, Vec<PendingPyRequest>>>,
+    transport_backend: TransportBackend,
     cancellation_token: CancellationToken,
+    proxy_url: Option<String>,
 }
 
 impl Debug for BybitWebSocketClient {
@@ -152,10 +160,13 @@ impl Clone for BybitWebSocketClient {
             mm_level: Arc::clone(&self.mm_level),
             bar_types_cache: Arc::clone(&self.bar_types_cache),
             instruments_cache: Arc::clone(&self.instruments_cache),
+            trade_subs: Arc::clone(&self.trade_subs),
             option_greeks_subs: Arc::clone(&self.option_greeks_subs),
             bars_timestamp_on_close: Arc::clone(&self.bars_timestamp_on_close),
             pending_py_requests: Arc::clone(&self.pending_py_requests),
+            transport_backend: self.transport_backend,
             cancellation_token: self.cancellation_token.clone(),
+            proxy_url: self.proxy_url.clone(),
         }
     }
 }
@@ -163,12 +174,14 @@ impl Clone for BybitWebSocketClient {
 impl BybitWebSocketClient {
     /// Creates a new Bybit public WebSocket client.
     #[must_use]
-    pub fn new_public(url: Option<String>, heartbeat: Option<u64>) -> Self {
+    pub fn new_public(url: Option<String>, heartbeat: u64) -> Self {
         Self::new_public_with(
             BybitProductType::Linear,
             BybitEnvironment::Mainnet,
             url,
             heartbeat,
+            TransportBackend::default(),
+            None,
         )
     }
 
@@ -178,7 +191,9 @@ impl BybitWebSocketClient {
         product_type: BybitProductType,
         environment: BybitEnvironment,
         url: Option<String>,
-        heartbeat: Option<u64>,
+        heartbeat: u64,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
     ) -> Self {
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
 
@@ -192,21 +207,24 @@ impl BybitWebSocketClient {
             credential: None,
             requires_auth: false,
             auth_tracker: AuthTracker::new(),
-            heartbeat: heartbeat.or(Some(DEFAULT_HEARTBEAT_SECS)),
+            heartbeat: Some(heartbeat),
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
             signal: Arc::new(AtomicBool::new(false)),
             task_handle: None,
             subscriptions: SubscriptionState::new(BYBIT_WS_TOPIC_DELIMITER),
-            bar_types_cache: Arc::new(DashMap::new()),
-            instruments_cache: Arc::new(DashMap::new()),
-            option_greeks_subs: Arc::new(DashSet::new()),
+            bar_types_cache: Arc::new(AtomicMap::new()),
+            instruments_cache: Arc::new(AtomicMap::new()),
+            trade_subs: Arc::new(AtomicSet::new()),
+            option_greeks_subs: Arc::new(AtomicSet::new()),
             bars_timestamp_on_close: Arc::new(AtomicBool::new(true)),
             pending_py_requests: Arc::new(DashMap::new()),
             account_id: None,
             mm_level: Arc::new(AtomicU8::new(0)),
+            transport_backend,
             cancellation_token: CancellationToken::new(),
+            proxy_url,
         }
     }
 
@@ -223,7 +241,9 @@ impl BybitWebSocketClient {
         api_key: Option<String>,
         api_secret: Option<String>,
         url: Option<String>,
-        heartbeat: Option<u64>,
+        heartbeat: u64,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
     ) -> Self {
         let credential = Credential::resolve(api_key, api_secret, environment);
 
@@ -239,21 +259,24 @@ impl BybitWebSocketClient {
             credential,
             requires_auth: true,
             auth_tracker: AuthTracker::new(),
-            heartbeat: heartbeat.or(Some(DEFAULT_HEARTBEAT_SECS)),
+            heartbeat: Some(heartbeat),
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
             signal: Arc::new(AtomicBool::new(false)),
             task_handle: None,
             subscriptions: SubscriptionState::new(BYBIT_WS_TOPIC_DELIMITER),
-            bar_types_cache: Arc::new(DashMap::new()),
-            instruments_cache: Arc::new(DashMap::new()),
-            option_greeks_subs: Arc::new(DashSet::new()),
+            bar_types_cache: Arc::new(AtomicMap::new()),
+            instruments_cache: Arc::new(AtomicMap::new()),
+            trade_subs: Arc::new(AtomicSet::new()),
+            option_greeks_subs: Arc::new(AtomicSet::new()),
             bars_timestamp_on_close: Arc::new(AtomicBool::new(true)),
             pending_py_requests: Arc::new(DashMap::new()),
             account_id: None,
             mm_level: Arc::new(AtomicU8::new(0)),
+            transport_backend,
             cancellation_token: CancellationToken::new(),
+            proxy_url,
         }
     }
 
@@ -270,7 +293,9 @@ impl BybitWebSocketClient {
         api_key: Option<String>,
         api_secret: Option<String>,
         url: Option<String>,
-        heartbeat: Option<u64>,
+        heartbeat: u64,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
     ) -> Self {
         let credential = Credential::resolve(api_key, api_secret, environment);
 
@@ -286,21 +311,24 @@ impl BybitWebSocketClient {
             credential,
             requires_auth: true,
             auth_tracker: AuthTracker::new(),
-            heartbeat: heartbeat.or(Some(DEFAULT_HEARTBEAT_SECS)),
+            heartbeat: Some(heartbeat),
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
             signal: Arc::new(AtomicBool::new(false)),
             task_handle: None,
             subscriptions: SubscriptionState::new(BYBIT_WS_TOPIC_DELIMITER),
-            bar_types_cache: Arc::new(DashMap::new()),
-            instruments_cache: Arc::new(DashMap::new()),
-            option_greeks_subs: Arc::new(DashSet::new()),
+            bar_types_cache: Arc::new(AtomicMap::new()),
+            instruments_cache: Arc::new(AtomicMap::new()),
+            trade_subs: Arc::new(AtomicSet::new()),
+            option_greeks_subs: Arc::new(AtomicSet::new()),
             bars_timestamp_on_close: Arc::new(AtomicBool::new(true)),
             pending_py_requests: Arc::new(DashMap::new()),
             account_id: None,
             mm_level: Arc::new(AtomicU8::new(0)),
+            transport_backend,
             cancellation_token: CancellationToken::new(),
+            proxy_url,
         }
     }
 
@@ -327,6 +355,7 @@ impl BybitWebSocketClient {
         let ping_msg = serde_json::to_string(&BybitSubscription {
             op: BybitWsOperation::Ping,
             args: vec![],
+            req_id: None,
         })?;
 
         let config = WebSocketConfig {
@@ -341,6 +370,8 @@ impl BybitWebSocketClient {
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: self.transport_backend,
+            proxy_url: self.proxy_url.clone(),
         };
 
         // Retry initial connection with exponential backoff to handle transient DNS/network issues
@@ -418,6 +449,7 @@ impl BybitWebSocketClient {
         };
 
         self.connection_mode.store(client.connection_mode_atomic());
+        client.set_auth_tracker(self.auth_tracker.clone(), self.requires_auth);
 
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<BybitWsMessage>();
         self.out_rx = Some(Arc::new(out_rx));
@@ -468,6 +500,7 @@ impl BybitWebSocketClient {
                     let message = BybitSubscription {
                         op: BybitWsOperation::Subscribe,
                         args: vec![topic.clone()],
+                        req_id: Some(topic.clone()),
                     };
 
                     if let Ok(payload) = serde_json::to_string(&message) {
@@ -496,6 +529,7 @@ impl BybitWebSocketClient {
                         let confirmed_topics: Vec<String> = {
                             let confirmed = subscriptions.confirmed();
                             let mut topics = Vec::new();
+
                             for entry in confirmed.iter() {
                                 let (channel, symbols) = entry.pair();
                                 for symbol in symbols {
@@ -514,6 +548,7 @@ impl BybitWebSocketClient {
                                 "Marking confirmed subscriptions as pending for replay: count={}",
                                 confirmed_topics.len()
                             );
+
                             for topic in confirmed_topics {
                                 subscriptions.mark_failure(&topic);
                             }
@@ -722,6 +757,7 @@ impl BybitWebSocketClient {
             let message = BybitSubscription {
                 op: BybitWsOperation::Subscribe,
                 args: vec![topic.clone()],
+                req_id: Some(topic.clone()),
             };
             let payload = serde_json::to_string(&message).map_err(|e| {
                 BybitWsError::Json(format!("Failed to serialize subscription: {e}"))
@@ -775,6 +811,7 @@ impl BybitWebSocketClient {
             let message = BybitSubscription {
                 op: BybitWsOperation::Unsubscribe,
                 args: vec![topic.clone()],
+                req_id: Some(topic.clone()),
             };
 
             if let Ok(payload) = serde_json::to_string(&message) {
@@ -844,7 +881,7 @@ impl BybitWebSocketClient {
 
     /// Returns a reference to the bar types cache.
     #[must_use]
-    pub fn bar_types_cache(&self) -> &Arc<DashMap<String, BarType>> {
+    pub fn bar_types_cache(&self) -> &Arc<AtomicMap<String, BarType>> {
         &self.bar_types_cache
     }
 
@@ -857,10 +894,7 @@ impl BybitWebSocketClient {
     /// Returns a snapshot of the instruments cache keyed by symbol.
     #[must_use]
     pub fn instruments_snapshot(&self) -> ahash::AHashMap<Ustr, InstrumentAny> {
-        self.instruments_cache
-            .iter()
-            .map(|entry| (*entry.key(), entry.value().clone()))
-            .collect()
+        (**self.instruments_cache.load()).clone()
     }
 
     /// Sets whether bar timestamps use the close time.
@@ -886,8 +920,14 @@ impl BybitWebSocketClient {
 
     /// Returns a reference to the option greeks subscription set.
     #[must_use]
-    pub fn option_greeks_subs(&self) -> &Arc<DashSet<InstrumentId>> {
+    pub fn option_greeks_subs(&self) -> &Arc<AtomicSet<InstrumentId>> {
         &self.option_greeks_subs
+    }
+
+    /// Returns a reference to the trade subscriptions set.
+    #[must_use]
+    pub fn trade_subs(&self) -> &Arc<AtomicSet<InstrumentId>> {
+        &self.trade_subs
     }
 
     /// Returns a reference to the pending Python requests map.
@@ -898,7 +938,7 @@ impl BybitWebSocketClient {
 
     /// Returns a reference to the live instruments cache Arc.
     #[must_use]
-    pub fn instruments_cache_ref(&self) -> &Arc<DashMap<Ustr, InstrumentAny>> {
+    pub fn instruments_cache_ref(&self) -> &Arc<AtomicMap<Ustr, InstrumentAny>> {
         &self.instruments_cache
     }
 
@@ -948,9 +988,15 @@ impl BybitWebSocketClient {
     ///
     /// <https://bybit-exchange.github.io/docs/v5/websocket/public/trade>
     pub async fn subscribe_trades(&self, instrument_id: InstrumentId) -> BybitWsResult<()> {
+        self.trade_subs.insert(instrument_id);
         let raw_symbol = extract_raw_symbol(instrument_id.symbol.as_str());
+        // Bybit option trades use baseCoin topic (e.g. publicTrade.BTC)
+        let topic_symbol = match self.product_type {
+            Some(BybitProductType::Option) => extract_base_coin(raw_symbol),
+            _ => raw_symbol,
+        };
         let topic = format!(
-            "{}.{raw_symbol}",
+            "{}.{topic_symbol}",
             BybitWsPublicChannel::PublicTrade.as_ref()
         );
         self.subscribe(vec![topic]).await
@@ -958,9 +1004,14 @@ impl BybitWebSocketClient {
 
     /// Unsubscribes from public trade updates for a specific instrument.
     pub async fn unsubscribe_trades(&self, instrument_id: InstrumentId) -> BybitWsResult<()> {
+        self.trade_subs.remove(&instrument_id);
         let raw_symbol = extract_raw_symbol(instrument_id.symbol.as_str());
+        let topic_symbol = match self.product_type {
+            Some(BybitProductType::Option) => extract_base_coin(raw_symbol),
+            _ => raw_symbol,
+        };
         let topic = format!(
-            "{}.{raw_symbol}",
+            "{}.{topic_symbol}",
             BybitWsPublicChannel::PublicTrade.as_ref()
         );
         self.unsubscribe(vec![topic]).await
@@ -998,6 +1049,12 @@ impl BybitWebSocketClient {
     ///
     /// <https://bybit-exchange.github.io/docs/v5/websocket/public/kline>
     pub async fn subscribe_bars(&self, bar_type: BarType) -> BybitWsResult<()> {
+        if self.product_type == Some(BybitProductType::Option) {
+            return Err(BybitWsError::ClientError(
+                "Bybit does not support kline/bar data for options".to_string(),
+            ));
+        }
+
         let spec = bar_type.spec();
 
         if spec.price_type != PriceType::Last {
@@ -1105,6 +1162,35 @@ impl BybitWebSocketClient {
             .await
     }
 
+    /// Subscribes to fast execution updates (slim payload, lower latency).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription request fails or if not authenticated.
+    ///
+    /// # References
+    ///
+    /// <https://bybit-exchange.github.io/docs/v5/websocket/private/fast-execution>
+    pub async fn subscribe_executions_fast(&self) -> BybitWsResult<()> {
+        if !self.requires_auth {
+            return Err(BybitWsError::Authentication(
+                "Fast execution subscription requires authentication".to_string(),
+            ));
+        }
+        self.subscribe(vec![
+            BybitWsPrivateChannel::ExecutionFast.as_ref().to_string(),
+        ])
+        .await
+    }
+
+    /// Unsubscribes from fast execution updates.
+    pub async fn unsubscribe_executions_fast(&self) -> BybitWsResult<()> {
+        self.unsubscribe(vec![
+            BybitWsPrivateChannel::ExecutionFast.as_ref().to_string(),
+        ])
+        .await
+    }
+
     /// Subscribes to position updates.
     ///
     /// # Errors
@@ -1155,17 +1241,52 @@ impl BybitWebSocketClient {
             .await
     }
 
+    /// Waits for the session to be authenticated, aborting early if the client
+    /// enters a terminal state (closed or disconnecting) during the wait.
+    async fn require_authenticated(&self) -> BybitWsResult<()> {
+        if self.is_closed() {
+            return Err(BybitWsError::ClientError(
+                "WebSocket client is closed".to_string(),
+            ));
+        }
+
+        if self.auth_tracker.is_authenticated() {
+            return Ok(());
+        }
+
+        tokio::select! {
+            authenticated = self.auth_tracker.wait_for_authenticated(AUTH_WAIT_TIMEOUT) => {
+                if authenticated {
+                    Ok(())
+                } else {
+                    Err(BybitWsError::Authentication(
+                        "Must be authenticated".to_string(),
+                    ))
+                }
+            }
+            () = async {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+
+                    if self.is_closed() {
+                        return;
+                    }
+                }
+            } => {
+                Err(BybitWsError::ClientError(
+                    "WebSocket client closed during authentication wait".to_string(),
+                ))
+            }
+        }
+    }
+
     /// Places an order via WebSocket, returning the request ID for correlation.
     ///
     /// # Errors
     ///
     /// Returns an error if the order request fails or if not authenticated.
     pub async fn place_order(&self, params: BybitWsPlaceOrderParams) -> BybitWsResult<String> {
-        if !self.auth_tracker.is_authenticated() {
-            return Err(BybitWsError::Authentication(
-                "Must be authenticated to place orders".to_string(),
-            ));
-        }
+        self.require_authenticated().await?;
 
         let req_id = UUID4::new().to_string();
 
@@ -1194,11 +1315,7 @@ impl BybitWebSocketClient {
     ///
     /// Returns an error if the amend request fails or if not authenticated.
     pub async fn amend_order(&self, params: BybitWsAmendOrderParams) -> BybitWsResult<String> {
-        if !self.auth_tracker.is_authenticated() {
-            return Err(BybitWsError::Authentication(
-                "Must be authenticated to amend orders".to_string(),
-            ));
-        }
+        self.require_authenticated().await?;
 
         let req_id = UUID4::new().to_string();
 
@@ -1221,11 +1338,7 @@ impl BybitWebSocketClient {
     ///
     /// Returns an error if the cancel request fails or if not authenticated.
     pub async fn cancel_order(&self, params: BybitWsCancelOrderParams) -> BybitWsResult<String> {
-        if !self.auth_tracker.is_authenticated() {
-            return Err(BybitWsError::Authentication(
-                "Must be authenticated to cancel orders".to_string(),
-            ));
-        }
+        self.require_authenticated().await?;
 
         let req_id = UUID4::new().to_string();
 
@@ -1251,11 +1364,7 @@ impl BybitWebSocketClient {
         &self,
         orders: Vec<BybitWsPlaceOrderParams>,
     ) -> BybitWsResult<Vec<String>> {
-        if !self.auth_tracker.is_authenticated() {
-            return Err(BybitWsError::Authentication(
-                "Must be authenticated to place orders".to_string(),
-            ));
-        }
+        self.require_authenticated().await?;
 
         if orders.is_empty() {
             log::warn!("Batch place orders called with empty orders list");
@@ -1263,6 +1372,7 @@ impl BybitWebSocketClient {
         }
 
         let mut req_ids = Vec::new();
+
         for chunk in orders.chunks(BATCH_PROCESSING_LIMIT) {
             let req_id = self.batch_place_orders_chunk(chunk.to_vec()).await?;
             req_ids.push(req_id);
@@ -1316,6 +1426,11 @@ impl BybitWebSocketClient {
                 tp_order_type: order.tp_order_type,
                 sl_limit_price: order.sl_limit_price,
                 tp_limit_price: order.tp_limit_price,
+                order_iv: order.order_iv,
+                mmp: order.mmp,
+                position_idx: order.position_idx,
+                bbo_side_type: order.bbo_side_type,
+                bbo_level: order.bbo_level,
             })
             .collect();
 
@@ -1346,11 +1461,7 @@ impl BybitWebSocketClient {
         &self,
         orders: Vec<BybitWsAmendOrderParams>,
     ) -> BybitWsResult<Vec<String>> {
-        if !self.auth_tracker.is_authenticated() {
-            return Err(BybitWsError::Authentication(
-                "Must be authenticated to amend orders".to_string(),
-            ));
-        }
+        self.require_authenticated().await?;
 
         if orders.is_empty() {
             log::warn!("Batch amend orders called with empty orders list");
@@ -1358,6 +1469,7 @@ impl BybitWebSocketClient {
         }
 
         let mut req_ids = Vec::new();
+
         for chunk in orders.chunks(BATCH_PROCESSING_LIMIT) {
             let req_id = self.batch_amend_orders_chunk(chunk.to_vec()).await?;
             req_ids.push(req_id);
@@ -1394,11 +1506,7 @@ impl BybitWebSocketClient {
         &self,
         orders: Vec<BybitWsCancelOrderParams>,
     ) -> BybitWsResult<Vec<String>> {
-        if !self.auth_tracker.is_authenticated() {
-            return Err(BybitWsError::Authentication(
-                "Must be authenticated to cancel orders".to_string(),
-            ));
-        }
+        self.require_authenticated().await?;
 
         if orders.is_empty() {
             log::warn!("Batch cancel orders called with empty orders list");
@@ -1406,6 +1514,7 @@ impl BybitWebSocketClient {
         }
 
         let mut req_ids = Vec::new();
+
         for chunk in orders.chunks(BATCH_PROCESSING_LIMIT) {
             let req_id = self.batch_cancel_orders_chunk(chunk.to_vec()).await?;
             req_ids.push(req_id);
@@ -1457,7 +1566,7 @@ impl BybitWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if order submission fails or if not authenticated.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn submit_order(
         &self,
         product_type: BybitProductType,
@@ -1470,9 +1579,13 @@ impl BybitWebSocketClient {
         time_in_force: Option<TimeInForce>,
         price: Option<Price>,
         trigger_price: Option<Price>,
+        trigger_type: Option<TriggerType>,
         post_only: Option<bool>,
         reduce_only: Option<bool>,
         is_leverage: bool,
+        position_idx: Option<BybitPositionIdx>,
+        bbo_side_type: Option<BybitBboSideType>,
+        bbo_level: Option<String>,
     ) -> BybitWsResult<String> {
         let params = self.build_place_order_params(
             product_type,
@@ -1485,11 +1598,15 @@ impl BybitWebSocketClient {
             time_in_force,
             price,
             trigger_price,
+            trigger_type,
             post_only,
             reduce_only,
             is_leverage,
             None,
             None,
+            position_idx,
+            bbo_side_type,
+            bbo_level,
         )?;
 
         self.place_order(params).await
@@ -1500,7 +1617,6 @@ impl BybitWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if modification fails or if not authenticated.
-    #[allow(clippy::too_many_arguments)]
     pub async fn modify_order(
         &self,
         product_type: BybitProductType,
@@ -1545,7 +1661,7 @@ impl BybitWebSocketClient {
     }
 
     /// Builds order params for placing an order.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn build_place_order_params(
         &self,
         product_type: BybitProductType,
@@ -1558,11 +1674,15 @@ impl BybitWebSocketClient {
         time_in_force: Option<TimeInForce>,
         price: Option<Price>,
         trigger_price: Option<Price>,
+        trigger_type: Option<TriggerType>,
         post_only: Option<bool>,
         reduce_only: Option<bool>,
         is_leverage: bool,
         take_profit: Option<Price>,
         stop_loss: Option<Price>,
+        position_idx: Option<BybitPositionIdx>,
+        bbo_side_type: Option<BybitBboSideType>,
+        bbo_level: Option<String>,
     ) -> BybitWsResult<BybitWsPlaceOrderParams> {
         let bybit_symbol = BybitSymbol::new(instrument_id.symbol.as_str())
             .map_err(|e| BybitWsError::ClientError(e.to_string()))?;
@@ -1608,29 +1728,38 @@ impl BybitWebSocketClient {
                 qty: quantity.to_string(),
                 is_leverage: is_leverage_value,
                 market_unit,
-                price: price.map(|p| p.to_string()),
+                price: if bbo_side_type.is_some() {
+                    None
+                } else {
+                    price.map(|p| p.to_string())
+                },
                 time_in_force: bybit_tif,
                 order_link_id: Some(client_order_id.to_string()),
                 reduce_only: reduce_only.filter(|&r| r),
                 close_on_trigger: None,
                 trigger_price: trigger_price.map(|p| p.to_string()),
-                trigger_by: Some(BybitTriggerType::LastPrice),
+                trigger_by: Some(resolve_trigger_type(trigger_type)),
                 trigger_direction: trigger_dir,
                 tpsl_mode: if take_profit.is_some() || stop_loss.is_some() {
-                    Some("Full".to_string())
+                    Some(BybitTpSlMode::Full)
                 } else {
                     None
                 },
                 take_profit: take_profit.map(|p| p.to_string()),
                 stop_loss: stop_loss.map(|p| p.to_string()),
-                tp_trigger_by: take_profit.map(|_| BybitTriggerType::LastPrice),
-                sl_trigger_by: stop_loss.map(|_| BybitTriggerType::LastPrice),
+                tp_trigger_by: take_profit.map(|_| resolve_trigger_type(trigger_type)),
+                sl_trigger_by: stop_loss.map(|_| resolve_trigger_type(trigger_type)),
                 sl_trigger_price: None,
                 tp_trigger_price: None,
                 sl_order_type: None,
                 tp_order_type: None,
                 sl_limit_price: None,
                 tp_limit_price: None,
+                order_iv: None,
+                mmp: None,
+                position_idx,
+                bbo_side_type,
+                bbo_level,
             }
         } else {
             BybitWsPlaceOrderParams {
@@ -1641,7 +1770,11 @@ impl BybitWebSocketClient {
                 qty: quantity.to_string(),
                 is_leverage: is_leverage_value,
                 market_unit,
-                price: price.map(|p| p.to_string()),
+                price: if bbo_side_type.is_some() {
+                    None
+                } else {
+                    price.map(|p| p.to_string())
+                },
                 time_in_force: bybit_tif,
                 order_link_id: Some(client_order_id.to_string()),
                 reduce_only: reduce_only.filter(|&r| r),
@@ -1650,20 +1783,25 @@ impl BybitWebSocketClient {
                 trigger_by: None,
                 trigger_direction: None,
                 tpsl_mode: if take_profit.is_some() || stop_loss.is_some() {
-                    Some("Full".to_string())
+                    Some(BybitTpSlMode::Full)
                 } else {
                     None
                 },
                 take_profit: take_profit.map(|p| p.to_string()),
                 stop_loss: stop_loss.map(|p| p.to_string()),
-                tp_trigger_by: take_profit.map(|_| BybitTriggerType::LastPrice),
-                sl_trigger_by: stop_loss.map(|_| BybitTriggerType::LastPrice),
+                tp_trigger_by: take_profit.map(|_| resolve_trigger_type(trigger_type)),
+                sl_trigger_by: stop_loss.map(|_| resolve_trigger_type(trigger_type)),
                 sl_trigger_price: None,
                 tp_trigger_price: None,
                 sl_order_type: None,
                 tp_order_type: None,
                 sl_limit_price: None,
                 tp_limit_price: None,
+                order_iv: None,
+                mmp: None,
+                position_idx,
+                bbo_side_type,
+                bbo_level,
             }
         };
 
@@ -1671,7 +1809,6 @@ impl BybitWebSocketClient {
     }
 
     /// Builds order params for amending an order.
-    #[allow(clippy::too_many_arguments)]
     pub fn build_amend_order_params(
         &self,
         product_type: BybitProductType,
@@ -1697,6 +1834,7 @@ impl BybitWebSocketClient {
             stop_loss: None,
             tp_trigger_by: None,
             sl_trigger_by: None,
+            order_iv: None,
         })
     }
 
@@ -1802,43 +1940,40 @@ mod tests {
 
     use super::*;
     use crate::{
-        common::{
-            consts::{BYBIT_BASE_COIN, BYBIT_QUOTE_COIN},
-            testing::load_test_json,
-        },
-        websocket::classify_bybit_message,
+        common::{enums::BybitMarketUnit, testing::load_test_json},
+        websocket::{messages::BybitWsFrame, parse_bybit_ws_frame},
     };
 
     #[rstest]
     fn classify_orderbook_snapshot() {
         let json: Value = serde_json::from_str(&load_test_json("ws_orderbook_snapshot.json"))
             .expect("invalid fixture");
-        let message = classify_bybit_message(json);
-        assert!(matches!(message, BybitWsMessage::Orderbook(_)));
+        let frame = parse_bybit_ws_frame(json);
+        assert!(matches!(frame, BybitWsFrame::Orderbook(_)));
     }
 
     #[rstest]
     fn classify_trade_snapshot() {
         let json: Value =
             serde_json::from_str(&load_test_json("ws_public_trade.json")).expect("invalid fixture");
-        let message = classify_bybit_message(json);
-        assert!(matches!(message, BybitWsMessage::Trade(_)));
+        let frame = parse_bybit_ws_frame(json);
+        assert!(matches!(frame, BybitWsFrame::Trade(_)));
     }
 
     #[rstest]
     fn classify_ticker_linear_snapshot() {
         let json: Value = serde_json::from_str(&load_test_json("ws_ticker_linear.json"))
             .expect("invalid fixture");
-        let message = classify_bybit_message(json);
-        assert!(matches!(message, BybitWsMessage::TickerLinear(_)));
+        let frame = parse_bybit_ws_frame(json);
+        assert!(matches!(frame, BybitWsFrame::TickerLinear(_)));
     }
 
     #[rstest]
     fn classify_ticker_option_snapshot() {
         let json: Value = serde_json::from_str(&load_test_json("ws_ticker_option.json"))
             .expect("invalid fixture");
-        let message = classify_bybit_message(json);
-        assert!(matches!(message, BybitWsMessage::TickerOption(_)));
+        let frame = parse_bybit_ws_frame(json);
+        assert!(matches!(frame, BybitWsFrame::TickerOption(_)));
     }
 
     #[rstest]
@@ -1991,7 +2126,9 @@ mod tests {
             Some("test-key".to_string()),
             Some("test-secret".to_string()),
             None,
-            Some(20),
+            20,
+            TransportBackend::default(),
+            None,
         );
 
         let params = client
@@ -2008,7 +2145,11 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 is_leverage,
+                None,
+                None,
+                None,
                 None,
                 None,
             )
@@ -2018,8 +2159,18 @@ mod tests {
     }
 
     #[rstest]
-    #[case::spot_market_quote_quantity(BybitProductType::Spot, OrderType::Market, true, Some(BYBIT_QUOTE_COIN.to_string()))]
-    #[case::spot_market_base_quantity(BybitProductType::Spot, OrderType::Market, false, Some(BYBIT_BASE_COIN.to_string()))]
+    #[case::spot_market_quote_quantity(
+        BybitProductType::Spot,
+        OrderType::Market,
+        true,
+        Some(BybitMarketUnit::QuoteCoin)
+    )]
+    #[case::spot_market_base_quantity(
+        BybitProductType::Spot,
+        OrderType::Market,
+        false,
+        Some(BybitMarketUnit::BaseCoin)
+    )]
     #[case::spot_limit_no_unit(BybitProductType::Spot, OrderType::Limit, false, None)]
     #[case::spot_limit_quote(BybitProductType::Spot, OrderType::Limit, true, None)]
     #[case::linear_market_no_unit(BybitProductType::Linear, OrderType::Market, false, None)]
@@ -2028,7 +2179,7 @@ mod tests {
         #[case] product_type: BybitProductType,
         #[case] order_type: OrderType,
         #[case] is_quote_quantity: bool,
-        #[case] expected: Option<String>,
+        #[case] expected: Option<BybitMarketUnit>,
     ) {
         let symbol = match product_type {
             BybitProductType::Spot => "BTCUSDT-SPOT.BYBIT",
@@ -2046,7 +2197,9 @@ mod tests {
             Some("test-key".to_string()),
             Some("test-secret".to_string()),
             None,
-            Some(20),
+            20,
+            TransportBackend::default(),
+            None,
         );
 
         let params = client
@@ -2067,12 +2220,57 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 false,
+                None,
+                None,
+                None,
                 None,
                 None,
             )
             .expect("Failed to build params");
 
         assert_eq!(params.market_unit, expected);
+    }
+
+    #[rstest]
+    fn test_build_place_order_params_with_bbo_omits_price() {
+        let client = BybitWebSocketClient::new_trade(
+            BybitEnvironment::Testnet,
+            Some("test-key".to_string()),
+            Some("test-secret".to_string()),
+            None,
+            20,
+            TransportBackend::default(),
+            None,
+        );
+
+        let params = client
+            .build_place_order_params(
+                BybitProductType::Linear,
+                InstrumentId::from("ETHUSDT-LINEAR.BYBIT"),
+                ClientOrderId::from("test-bbo-order-1"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                Quantity::from("1.0"),
+                false,
+                Some(TimeInForce::Gtc),
+                Some(Price::from("50000.0")),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                Some(BybitBboSideType::Queue),
+                Some("2".to_string()),
+            )
+            .expect("Failed to build params");
+
+        assert_eq!(params.price, None);
+        assert_eq!(params.bbo_side_type, Some(BybitBboSideType::Queue));
+        assert_eq!(params.bbo_level.as_deref(), Some("2"));
     }
 }

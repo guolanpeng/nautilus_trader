@@ -39,7 +39,7 @@ flowchart LR
 | Component            | Purpose                                                    |
 |----------------------|------------------------------------------------------------|
 | `HttpClient`         | REST API communication.                                    |
-| `WebSocketClient`    | Real-time streaming connection.                            |
+| `WebSocketClient`    | Real‑time streaming connection.                            |
 | `InstrumentProvider` | Loads and parses instrument definitions from the venue.    |
 | `DataClient`         | Handles market data subscriptions and requests.            |
 | `ExecutionClient`    | Handles order submission, modification, and cancellation.  |
@@ -63,6 +63,7 @@ import asyncio
 import os
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
+from nautilus_trader.adapters.binance.common.enums import BinanceEnvironment
 from nautilus_trader.adapters.binance import get_cached_binance_http_client
 from nautilus_trader.adapters.binance.futures.providers import BinanceFuturesInstrumentProvider
 from nautilus_trader.common.component import LiveClock
@@ -76,7 +77,7 @@ async def main():
         account_type=BinanceAccountType.USDT_FUTURES,
         api_key=os.getenv("BINANCE_FUTURES_TESTNET_API_KEY"),
         api_secret=os.getenv("BINANCE_FUTURES_TESTNET_API_SECRET"),
-        is_testnet=True,
+        environment=BinanceEnvironment.TESTNET,
     )
 
     provider = BinanceFuturesInstrumentProvider(
@@ -114,6 +115,10 @@ InstrumentProviderConfig(load_all=True)
 InstrumentProviderConfig(load_ids=["BTCUSDT-PERP.BINANCE", "ETHUSDT-PERP.BINANCE"])
 ```
 
+Subscriptions do not load instruments by themselves. Before a strategy subscribes to
+live data, configure the provider to load the instrument at startup or request the
+instrument explicitly and wait until it reaches the cache.
+
 ## Data clients
 
 Data clients handle market data subscriptions and requests for a venue. They connect to venue APIs
@@ -149,6 +154,7 @@ For real-time data, use subscription methods:
 
 ```python
 def on_start(self) -> None:
+    # Assumes the instrument has already been loaded into the cache
     # Subscribe to live trade updates
     self.subscribe_trade_ticks(InstrumentId.from_str("BTCUSDT-PERP.BINANCE"))
 

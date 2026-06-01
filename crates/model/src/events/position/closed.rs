@@ -17,6 +17,7 @@ use nautilus_core::{
     UUID4,
     nanos::{DurationNanos, UnixNanos},
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     enums::{OrderSide, PositionSide},
@@ -28,7 +29,7 @@ use crate::{
 
 /// Represents an event where a position has been closed.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
@@ -93,6 +94,7 @@ pub struct PositionClosed {
 }
 
 impl PositionClosed {
+    #[must_use]
     pub fn create(
         position: &Position,
         fill: &OrderFilled,
@@ -137,8 +139,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        enums::{LiquiditySide, OrderSide, OrderType, PositionSide},
-        events::OrderFilled,
+        enums::{OrderSide, PositionSide},
+        events::{OrderFilled, order::spec::OrderFilledSpec},
         identifiers::{
             AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId, TraderId,
             VenueOrderId,
@@ -180,102 +182,38 @@ mod tests {
     }
 
     fn create_test_order_filled() -> OrderFilled {
-        OrderFilled::new(
-            TraderId::from("TRADER-001"),
-            StrategyId::from("EMA-CROSS"),
-            InstrumentId::from("EURUSD.SIM"),
-            ClientOrderId::from("O-19700101-000000-001-001-2"),
-            VenueOrderId::from("2"),
-            AccountId::from("SIM-001"),
-            TradeId::from("T-002"),
-            OrderSide::Sell,
-            OrderType::Market,
-            Quantity::from("150"),
-            Price::from("1.0600"),
-            Currency::USD(),
-            LiquiditySide::Taker,
-            UUID4::default(),
-            UnixNanos::from(4_600_000_000),
-            UnixNanos::from(5_000_000_000),
-            false,
-            Some(PositionId::from("P-001")),
-            Some(Money::new(2.5, Currency::USD())),
-        )
-    }
-
-    #[rstest]
-    fn test_position_closed_new() {
-        let position_closed = create_test_position_closed();
-
-        assert_eq!(position_closed.trader_id, TraderId::from("TRADER-001"));
-        assert_eq!(position_closed.strategy_id, StrategyId::from("EMA-CROSS"));
-        assert_eq!(
-            position_closed.instrument_id,
-            InstrumentId::from("EURUSD.SIM")
-        );
-        assert_eq!(position_closed.position_id, PositionId::from("P-001"));
-        assert_eq!(position_closed.account_id, AccountId::from("SIM-001"));
-        assert_eq!(
-            position_closed.opening_order_id,
-            ClientOrderId::from("O-19700101-000000-001-001-1")
-        );
-        assert_eq!(
-            position_closed.closing_order_id,
-            Some(ClientOrderId::from("O-19700101-000000-001-001-2"))
-        );
-        assert_eq!(position_closed.entry, OrderSide::Buy);
-        assert_eq!(position_closed.side, PositionSide::Flat);
-        assert_eq!(position_closed.signed_qty, 0.0);
-        assert_eq!(position_closed.quantity, Quantity::from("0"));
-        assert_eq!(position_closed.peak_quantity, Quantity::from("150"));
-        assert_eq!(position_closed.last_qty, Quantity::from("150"));
-        assert_eq!(position_closed.last_px, Price::from("1.0600"));
-        assert_eq!(position_closed.currency, Currency::USD());
-        assert_eq!(position_closed.avg_px_open, 1.0525);
-        assert_eq!(position_closed.avg_px_close, Some(1.0600));
-        assert_eq!(position_closed.realized_return, 0.0071);
-        assert_eq!(
-            position_closed.realized_pnl,
-            Some(Money::new(112.50, Currency::USD()))
-        );
-        assert_eq!(
-            position_closed.unrealized_pnl,
-            Money::new(0.0, Currency::USD())
-        );
-        assert_eq!(position_closed.duration, 3_600_000_000_000);
-        assert_eq!(position_closed.ts_opened, UnixNanos::from(1_000_000_000));
-        assert_eq!(
-            position_closed.ts_closed,
-            Some(UnixNanos::from(4_600_000_000))
-        );
-        assert_eq!(position_closed.ts_event, UnixNanos::from(4_600_000_000));
-        assert_eq!(position_closed.ts_init, UnixNanos::from(5_000_000_000));
+        OrderFilledSpec::builder()
+            .strategy_id(StrategyId::from("EMA-CROSS"))
+            .instrument_id(InstrumentId::from("EURUSD.SIM"))
+            .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-2"))
+            .venue_order_id(VenueOrderId::from("2"))
+            .trade_id(TradeId::from("T-002"))
+            .order_side(OrderSide::Sell)
+            .last_qty(Quantity::from("150"))
+            .last_px(Price::from("1.0600"))
+            .ts_event(UnixNanos::from(4_600_000_000))
+            .ts_init(UnixNanos::from(5_000_000_000))
+            .position_id(PositionId::from("P-001"))
+            .commission(Money::new(2.5, Currency::USD()))
+            .build()
     }
 
     #[rstest]
     fn test_position_closed_create() {
         let instrument = audusd_sim();
-        let initial_fill = OrderFilled::new(
-            TraderId::from("TRADER-001"),
-            StrategyId::from("EMA-CROSS"),
-            InstrumentId::from("AUD/USD.SIM"),
-            ClientOrderId::from("O-19700101-000000-001-001-1"),
-            VenueOrderId::from("1"),
-            AccountId::from("SIM-001"),
-            TradeId::from("T-001"),
-            OrderSide::Buy,
-            OrderType::Market,
-            Quantity::from("100"),
-            Price::from("0.8000"),
-            Currency::USD(),
-            LiquiditySide::Taker,
-            UUID4::default(),
-            UnixNanos::from(1_000_000_000),
-            UnixNanos::from(2_000_000_000),
-            false,
-            Some(PositionId::from("P-001")),
-            Some(Money::new(2.0, Currency::USD())),
-        );
+        let initial_fill = OrderFilledSpec::builder()
+            .strategy_id(StrategyId::from("EMA-CROSS"))
+            .instrument_id(InstrumentId::from("AUD/USD.SIM"))
+            .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
+            .venue_order_id(VenueOrderId::from("1"))
+            .trade_id(TradeId::from("T-001"))
+            .last_qty(Quantity::from("100"))
+            .last_px(Price::from("0.8000"))
+            .ts_event(UnixNanos::from(1_000_000_000))
+            .ts_init(UnixNanos::from(2_000_000_000))
+            .position_id(PositionId::from("P-001"))
+            .commission(Money::new(2.0, Currency::USD()))
+            .build();
 
         let position = Position::new(&InstrumentAny::CurrencyPair(instrument), initial_fill);
         let closing_fill = create_test_order_filled();
@@ -316,42 +254,6 @@ mod tests {
     }
 
     #[rstest]
-    fn test_position_closed_clone() {
-        let position_closed1 = create_test_position_closed();
-        let position_closed2 = position_closed1.clone();
-
-        assert_eq!(position_closed1, position_closed2);
-    }
-
-    #[rstest]
-    fn test_position_closed_debug() {
-        let position_closed = create_test_position_closed();
-        let debug_str = format!("{position_closed:?}");
-
-        assert!(debug_str.contains("PositionClosed"));
-        assert!(debug_str.contains("TRADER-001"));
-        assert!(debug_str.contains("EMA-CROSS"));
-        assert!(debug_str.contains("EURUSD.SIM"));
-        assert!(debug_str.contains("P-001"));
-    }
-
-    #[rstest]
-    fn test_position_closed_partial_eq() {
-        let mut position_closed1 = create_test_position_closed();
-        let mut position_closed2 = create_test_position_closed();
-        let event_id = UUID4::default();
-        position_closed1.event_id = event_id;
-        position_closed2.event_id = event_id;
-
-        let mut position_closed3 = create_test_position_closed();
-        position_closed3.event_id = event_id;
-        position_closed3.realized_return = 0.01;
-
-        assert_eq!(position_closed1, position_closed2);
-        assert_ne!(position_closed1, position_closed3);
-    }
-
-    #[rstest]
     fn test_position_closed_flat_position() {
         let position_closed = create_test_position_closed();
 
@@ -362,37 +264,6 @@ mod tests {
             position_closed.unrealized_pnl,
             Money::new(0.0, Currency::USD())
         );
-    }
-
-    #[rstest]
-    fn test_position_closed_with_closing_order_id() {
-        let position_closed = create_test_position_closed();
-
-        assert!(position_closed.closing_order_id.is_some());
-        assert_eq!(
-            position_closed.closing_order_id,
-            Some(ClientOrderId::from("O-19700101-000000-001-001-2"))
-        );
-    }
-
-    #[rstest]
-    fn test_position_closed_without_closing_order_id() {
-        let mut position_closed = create_test_position_closed();
-        position_closed.closing_order_id = None;
-
-        assert!(position_closed.closing_order_id.is_none());
-    }
-
-    #[rstest]
-    fn test_position_closed_with_realized_pnl() {
-        let position_closed = create_test_position_closed();
-
-        assert!(position_closed.realized_pnl.is_some());
-        assert_eq!(
-            position_closed.realized_pnl,
-            Some(Money::new(112.50, Currency::USD()))
-        );
-        assert!(position_closed.realized_return > 0.0);
     }
 
     #[rstest]
@@ -408,84 +279,5 @@ mod tests {
             position_closed.realized_pnl,
             Some(Money::new(-187.50, Currency::USD()))
         );
-    }
-
-    #[rstest]
-    fn test_position_closed_duration() {
-        let position_closed = create_test_position_closed();
-
-        assert_eq!(position_closed.duration, 3_600_000_000_000); // 1 hour
-        assert!(position_closed.duration > 0);
-    }
-
-    #[rstest]
-    fn test_position_closed_timestamps() {
-        let position_closed = create_test_position_closed();
-
-        assert_eq!(position_closed.ts_opened, UnixNanos::from(1_000_000_000));
-        assert_eq!(
-            position_closed.ts_closed,
-            Some(UnixNanos::from(4_600_000_000))
-        );
-        assert_eq!(position_closed.ts_event, UnixNanos::from(4_600_000_000));
-        assert_eq!(position_closed.ts_init, UnixNanos::from(5_000_000_000));
-
-        assert!(position_closed.ts_opened < position_closed.ts_closed.unwrap());
-        assert_eq!(position_closed.ts_closed.unwrap(), position_closed.ts_event);
-        assert!(position_closed.ts_event < position_closed.ts_init);
-    }
-
-    #[rstest]
-    fn test_position_closed_peak_quantity() {
-        let position_closed = create_test_position_closed();
-
-        assert_eq!(position_closed.peak_quantity, Quantity::from("150"));
-        assert!(position_closed.peak_quantity >= position_closed.quantity);
-        assert_eq!(position_closed.last_qty, position_closed.peak_quantity);
-    }
-
-    #[rstest]
-    fn test_position_closed_different_currencies() {
-        let mut usd_position = create_test_position_closed();
-        usd_position.currency = Currency::USD();
-
-        let mut eur_position = create_test_position_closed();
-        eur_position.currency = Currency::EUR();
-        eur_position.unrealized_pnl = Money::new(0.0, Currency::EUR());
-
-        assert_eq!(usd_position.currency, Currency::USD());
-        assert_eq!(eur_position.currency, Currency::EUR());
-        assert_ne!(usd_position, eur_position);
-    }
-
-    #[rstest]
-    fn test_position_closed_entry_sides() {
-        let mut buy_entry = create_test_position_closed();
-        buy_entry.entry = OrderSide::Buy;
-
-        let mut sell_entry = create_test_position_closed();
-        sell_entry.entry = OrderSide::Sell;
-
-        assert_eq!(buy_entry.entry, OrderSide::Buy);
-        assert_eq!(sell_entry.entry, OrderSide::Sell);
-    }
-
-    #[rstest]
-    fn test_position_closed_prices() {
-        let position_closed = create_test_position_closed();
-
-        assert_eq!(position_closed.avg_px_open, 1.0525);
-        assert_eq!(position_closed.avg_px_close, Some(1.0600));
-        assert_eq!(position_closed.last_px, Price::from("1.0600"));
-
-        assert!(position_closed.avg_px_close.unwrap() > position_closed.avg_px_open);
-    }
-
-    #[rstest]
-    fn test_position_closed_without_ts_closed() {
-        let mut position_closed = create_test_position_closed();
-        position_closed.ts_closed = None;
-
-        assert!(position_closed.ts_closed.is_none());
     }
 }

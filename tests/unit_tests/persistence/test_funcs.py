@@ -16,6 +16,7 @@
 import pandas as pd
 import pytest
 
+from nautilus_trader.model.data import OptionGreeks
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.data import TradeTick
@@ -28,6 +29,7 @@ from nautilus_trader.persistence.funcs import filename_to_class
     [
         (TradeTick, "trade_tick"),
         (OrderBookDelta, "order_book_deltas"),
+        (OptionGreeks, "option_greeks"),
         (pd.DataFrame, "custom_data_frame"),
     ],
 )
@@ -40,6 +42,7 @@ def test_class_to_filename(s, expected):
     [
         ("trade_tick", TradeTick),
         ("order_book_deltas", OrderBookDelta),
+        ("option_greeks", OptionGreeks),
         ("quote_tick", QuoteTick),
         ("nonexistent_filename", None),
     ],
@@ -84,3 +87,36 @@ def test_filename_to_class_custom_data():
         # Restore original encoders
         _ARROW_ENCODERS.clear()
         _ARROW_ENCODERS.update(original_encoders)
+
+
+def test_filename_to_class_rust_custom_serializer():
+    """
+    Test that filename_to_class can find custom data types registered via
+    register_rust_custom_serializer (not just _ARROW_ENCODERS).
+    """
+    from nautilus_trader.serialization.arrow.serializer import _RUST_CUSTOM_SERIALIZERS
+    from nautilus_trader.serialization.arrow.serializer import _RUST_CUSTOM_TYPE_REGISTRY
+    from nautilus_trader.serialization.arrow.serializer import register_rust_custom_serializer
+
+    class MockRustCustomData:
+        pass
+
+    original_serializers = _RUST_CUSTOM_SERIALIZERS.copy()
+    original_registry = _RUST_CUSTOM_TYPE_REGISTRY.copy()
+    try:
+        register_rust_custom_serializer(
+            data_cls=MockRustCustomData,
+            class_name="MockRustCustomData",
+            encoder_fn=lambda x: None,
+            converter_fn=lambda x: x,
+        )
+
+        # filename_to_class should find it via the Rust custom type registry
+        result = filename_to_class("custom_mock_rust_custom_data")
+        assert result == MockRustCustomData
+
+    finally:
+        _RUST_CUSTOM_SERIALIZERS.clear()
+        _RUST_CUSTOM_SERIALIZERS.update(original_serializers)
+        _RUST_CUSTOM_TYPE_REGISTRY.clear()
+        _RUST_CUSTOM_TYPE_REGISTRY.update(original_registry)

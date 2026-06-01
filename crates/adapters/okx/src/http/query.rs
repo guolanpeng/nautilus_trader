@@ -32,8 +32,8 @@ use serde::{self, Deserialize, Serialize};
 
 use crate::{
     common::enums::{
-        OKXInstrumentType, OKXOrderStatus, OKXOrderType, OKXPositionMode, OKXPositionSide,
-        OKXTradeMode,
+        OKXAlgoOrderType, OKXInstrumentType, OKXOrderStatus, OKXOrderType, OKXPositionMode,
+        OKXPositionSide, OKXTradeMode,
     },
     http::error::BuildError,
 };
@@ -96,6 +96,184 @@ pub struct GetInstrumentsParams {
     /// Instrument ID, e.g. BTC-USD-SWAP.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inst_id: Option<String>,
+    /// Series ID. Required when `inst_type` is EVENTS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_id: Option<String>,
+}
+
+/// Parameters for the GET /api/v5/sprd/spreads endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetSpreadsParams {
+    /// Currency the spread is based in, e.g. BTC or ETH.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_ccy: Option<String>,
+    /// Instrument ID to include in the spread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inst_id: Option<String>,
+    /// Spread ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sprd_id: Option<String>,
+    /// Spread state: live, suspend, or expired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+}
+
+/// Parameters for the GET /api/v5/sprd/order endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetSpreadOrderParams {
+    /// Exchange-assigned order ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ord_id: Option<String>,
+    /// User-assigned client order ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cl_ord_id: Option<String>,
+}
+
+/// Parameters for the GET /api/v5/sprd/orders-pending and orders-history endpoints.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetSpreadOrdersParams {
+    /// Spread ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sprd_id: Option<String>,
+    /// Order type filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ord_type: Option<OKXOrderType>,
+    /// Order state filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<OKXOrderStatus>,
+    /// Start order ID cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub begin_id: Option<String>,
+    /// End order ID cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_id: Option<String>,
+    /// Start timestamp in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub begin: Option<String>,
+    /// End timestamp in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    /// Maximum number of records to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Parameters for the GET /api/v5/sprd/trades endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetSpreadTradesParams {
+    /// Spread ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sprd_id: Option<String>,
+    /// Trade ID filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trade_id: Option<String>,
+    /// Order ID filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ord_id: Option<String>,
+    /// Start ID cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub begin_id: Option<String>,
+    /// End ID cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_id: Option<String>,
+    /// Start timestamp in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub begin: Option<String>,
+    /// End timestamp in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    /// Maximum number of records to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Parameters for the GET /api/v5/public/event-contract/series endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetEventContractSeriesParams {
+    /// Series ID, e.g. BTC-ABOVE-DAILY. If absent, all series are returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series_id: Option<String>,
+}
+
+/// Parameters for the GET /api/v5/public/event-contract/events endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetEventContractEventsParams {
+    /// Series ID, e.g. BTC-ABOVE-DAILY.
+    pub series_id: String,
+    /// Event ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// Event state filter: preopen, live, settling, or expired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Maximum number of records to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<String>,
+    /// Pagination cursor. Returns records newer than this expiry time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// Pagination cursor. Returns records older than this expiry time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+/// Parameters for the GET /api/v5/public/event-contract/markets endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetEventContractMarketsParams {
+    /// Series ID, e.g. BTC-ABOVE-DAILY.
+    pub series_id: String,
+    /// Event ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// Instrument ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inst_id: Option<String>,
+    /// Market state filter: preopen, live, settling, or expired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Maximum number of records to return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<String>,
+    /// Pagination cursor. Returns records newer than this expiry time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// Pagination cursor. Returns records older than this expiry time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+/// Parameters for the GET /api/v5/public/opt-summary endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetOptionSummaryParams {
+    /// Instrument family. Only applicable to OPTION.
+    pub inst_family: String,
+    /// Contract expiry date in YYMMDD format, e.g. "250328".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exp_time: Option<String>,
 }
 
 /// Parameters for the GET /api/v5/market/history-trades endpoint.
@@ -399,7 +577,7 @@ pub struct GetAlgoOrdersParams {
     pub inst_id: Option<String>,
     /// Order type filter (optional).
     #[serde(rename = "ordType", skip_serializing_if = "Option::is_none")]
-    pub ord_type: Option<OKXOrderType>,
+    pub ord_type: Option<OKXAlgoOrderType>,
     /// State filter (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<OKXOrderStatus>,

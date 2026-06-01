@@ -26,7 +26,10 @@ use super::{
 };
 use crate::{
     enums::{LiquiditySide, OrderSide, OrderType, TimeInForce, TrailingOffsetType, TriggerType},
-    events::{OrderAccepted, OrderCanceled, OrderEventAny, OrderFilled, OrderSubmitted},
+    events::{
+        OrderEventAny,
+        order::spec::{OrderAcceptedSpec, OrderCanceledSpec, OrderFilledSpec, OrderSubmittedSpec},
+    },
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId, TraderId, Venue,
         VenueOrderId,
@@ -339,64 +342,56 @@ impl TestDefault for TrailingStopMarketOrder {
 pub struct TestOrderEventStubs;
 
 impl TestOrderEventStubs {
+    #[must_use]
     pub fn submitted(order: &OrderAny, account_id: AccountId) -> OrderEventAny {
-        let event = OrderSubmitted::new(
-            order.trader_id(),
-            order.strategy_id(),
-            order.instrument_id(),
-            order.client_order_id(),
-            account_id,
-            UUID4::new(),
-            UnixNanos::default(),
-            UnixNanos::default(),
-        );
+        let event = OrderSubmittedSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(order.client_order_id())
+            .account_id(account_id)
+            .build();
         OrderEventAny::Submitted(event)
     }
 
+    #[must_use]
     pub fn accepted(
         order: &OrderAny,
         account_id: AccountId,
         venue_order_id: VenueOrderId,
     ) -> OrderEventAny {
-        let event = OrderAccepted::new(
-            order.trader_id(),
-            order.strategy_id(),
-            order.instrument_id(),
-            order.client_order_id(),
-            venue_order_id,
-            account_id,
-            UUID4::new(),
-            UnixNanos::default(),
-            UnixNanos::default(),
-            false,
-        );
+        let event = OrderAcceptedSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(order.client_order_id())
+            .venue_order_id(venue_order_id)
+            .account_id(account_id)
+            .build();
         OrderEventAny::Accepted(event)
     }
 
+    #[must_use]
     pub fn canceled(
         order: &OrderAny,
         account_id: AccountId,
         venue_order_id: Option<VenueOrderId>,
     ) -> OrderEventAny {
-        let event = OrderCanceled::new(
-            order.trader_id(),
-            order.strategy_id(),
-            order.instrument_id(),
-            order.client_order_id(),
-            UUID4::new(),
-            UnixNanos::default(),
-            UnixNanos::default(),
-            false, // reconciliation
-            venue_order_id,
-            Some(account_id),
-        );
+        let event = OrderCanceledSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(order.client_order_id())
+            .account_id(account_id)
+            .maybe_venue_order_id(venue_order_id)
+            .build();
         OrderEventAny::Canceled(event)
     }
 
     /// # Panics
     ///
     /// Panics if parsing the fallback price string fails or unwrapping default values fails.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn filled(
         order: &OrderAny,
         instrument: &InstrumentAny,
@@ -419,34 +414,30 @@ impl TestOrderEventStubs {
             order.client_order_id().as_str().replace('O', "E").as_str(),
         ));
         let liquidity_side = liquidity_side.unwrap_or(LiquiditySide::Maker);
-        let event = UUID4::new();
         let position_id = position_id
             .or_else(|| order.position_id())
             .unwrap_or(PositionId::new("1"));
         let commission = commission.unwrap_or(Money::from("2 USD"));
         let last_px = last_px.unwrap_or(Price::from_str("1.0").unwrap());
         let last_qty = last_qty.unwrap_or(order.quantity());
-        let event = OrderFilled::new(
-            order.trader_id(),
-            order.strategy_id(),
-            instrument.id(),
-            order.client_order_id(),
-            venue_order_id,
-            account_id,
-            trade_id,
-            order.order_side(),
-            order.order_type(),
-            last_qty,
-            last_px,
-            instrument.quote_currency(),
-            liquidity_side,
-            event,
-            ts_filled_ns.unwrap_or_default(),
-            UnixNanos::default(),
-            false,
-            Some(position_id),
-            Some(commission),
-        );
+        let event = OrderFilledSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(instrument.id())
+            .client_order_id(order.client_order_id())
+            .venue_order_id(venue_order_id)
+            .account_id(account_id)
+            .trade_id(trade_id)
+            .order_side(order.order_side())
+            .order_type(order.order_type())
+            .last_qty(last_qty)
+            .last_px(last_px)
+            .currency(instrument.quote_currency())
+            .liquidity_side(liquidity_side)
+            .ts_event(ts_filled_ns.unwrap_or_default())
+            .position_id(position_id)
+            .commission(commission)
+            .build();
         OrderEventAny::Filled(event)
     }
 }
@@ -458,6 +449,7 @@ impl TestOrderStubs {
     /// # Panics
     ///
     /// Panics if applying the accepted event via `new_order.apply(...)` fails.
+    #[must_use]
     pub fn make_accepted_order(order: &OrderAny) -> OrderAny {
         let mut new_order = order.clone();
         let accepted_event = TestOrderEventStubs::accepted(
@@ -472,6 +464,7 @@ impl TestOrderStubs {
     /// # Panics
     ///
     /// Panics if applying the filled event via `accepted_order.apply(...)` fails.
+    #[must_use]
     pub fn make_filled_order(
         order: &OrderAny,
         instrument: &InstrumentAny,
@@ -503,6 +496,7 @@ pub struct TestOrdersGenerator {
 }
 
 impl TestOrdersGenerator {
+    #[must_use]
     pub fn new(order_type: OrderType) -> Self {
         Self {
             order_type,
@@ -530,8 +524,10 @@ impl TestOrdersGenerator {
             .build()
     }
 
+    #[must_use]
     pub fn build(&self) -> Vec<OrderAny> {
         let mut orders = Vec::new();
+
         for (venue, total_instruments) in &self.venue_instruments {
             for i in 0..*total_instruments {
                 let instrument_id = InstrumentId::from(format!("SYMBOL-{i}.{venue}"));
@@ -545,6 +541,7 @@ impl TestOrdersGenerator {
     }
 }
 
+#[must_use]
 pub fn create_order_list_sample(
     total_venues: u8,
     total_instruments: u32,
@@ -553,6 +550,7 @@ pub fn create_order_list_sample(
     // Create Limit orders list from order generator with spec:
     // x venues * x instruments * x orders per instrument
     let mut order_generator = TestOrdersGenerator::new(OrderType::Limit);
+
     for i in 0..total_venues {
         let venue = Venue::from(format!("VENUE-{i}"));
         order_generator.add_venue_and_total_instruments(venue, total_instruments);

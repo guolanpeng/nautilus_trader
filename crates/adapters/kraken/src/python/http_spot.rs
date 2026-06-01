@@ -22,12 +22,18 @@ use nautilus_core::{
 };
 use nautilus_model::{
     data::BarType,
-    enums::{OrderSide, OrderType, TimeInForce},
+    enums::{AccountType, OrderSide, OrderType, TimeInForce, TriggerType},
     identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
     python::instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
     types::{Price, Quantity},
 };
-use pyo3::{conversion::IntoPyObjectExt, prelude::*, types::PyList};
+use pyo3::{
+    conversion::IntoPyObjectExt,
+    prelude::*,
+    types::{PyDict, PyList},
+};
+use rust_decimal::Decimal;
+use ustr::Ustr;
 
 use crate::{
     common::{credential::KrakenCredential, enums::KrakenEnvironment},
@@ -35,29 +41,28 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl KrakenSpotHttpClient {
+    /// High-level HTTP client for the Kraken Spot REST API.
+    ///
+    /// This client wraps the raw client and provides Nautilus domain types.
+    /// It maintains an instrument cache and uses it to parse venue responses
+    /// into Nautilus domain objects.
     #[new]
-    #[pyo3(signature = (api_key=None, api_secret=None, base_url=None, demo=false, timeout_secs=None, max_retries=None, retry_delay_ms=None, retry_delay_max_ms=None, proxy_url=None, max_requests_per_second=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (api_key=None, api_secret=None, base_url=None, timeout_secs=60, max_retries=None, retry_delay_ms=None, retry_delay_max_ms=None, proxy_url=None, max_requests_per_second=5))]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         api_key: Option<String>,
         api_secret: Option<String>,
         base_url: Option<String>,
-        demo: bool,
-        timeout_secs: Option<u64>,
+        timeout_secs: u64,
         max_retries: Option<u32>,
         retry_delay_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
         proxy_url: Option<String>,
-        max_requests_per_second: Option<u32>,
+        max_requests_per_second: u32,
     ) -> PyResult<Self> {
-        let timeout = timeout_secs.or(Some(60));
-
-        let environment = if demo {
-            KrakenEnvironment::Demo
-        } else {
-            KrakenEnvironment::Mainnet
-        };
+        let environment = KrakenEnvironment::Live;
 
         if let Some(cred) = KrakenCredential::resolve_spot(api_key, api_secret) {
             let (k, s) = cred.into_parts();
@@ -66,7 +71,7 @@ impl KrakenSpotHttpClient {
                 s,
                 environment,
                 base_url,
-                timeout,
+                timeout_secs,
                 max_retries,
                 retry_delay_ms,
                 retry_delay_max_ms,
@@ -78,7 +83,7 @@ impl KrakenSpotHttpClient {
             Self::new(
                 environment,
                 base_url,
-                timeout,
+                timeout_secs,
                 max_retries,
                 retry_delay_ms,
                 retry_delay_max_ms,
@@ -110,6 +115,7 @@ impl KrakenSpotHttpClient {
         self.inner.credential().map(|c| c.api_key_masked())
     }
 
+    /// Caches an instrument for symbol lookup.
     #[pyo3(name = "cache_instrument")]
     fn py_cache_instrument(&self, py: Python, instrument: Py<PyAny>) -> PyResult<()> {
         let inst_any = pyobject_to_instrument_any(py, instrument)?;
@@ -117,19 +123,10 @@ impl KrakenSpotHttpClient {
         Ok(())
     }
 
+    /// Cancels all pending HTTP requests.
     #[pyo3(name = "cancel_all_requests")]
     fn py_cancel_all_requests(&self) {
         self.cancel_all_requests();
-    }
-
-    #[pyo3(name = "set_use_spot_position_reports")]
-    fn py_set_use_spot_position_reports(&self, value: bool) {
-        self.set_use_spot_position_reports(value);
-    }
-
-    #[pyo3(name = "set_spot_positions_quote_currency")]
-    fn py_set_spot_positions_quote_currency(&self, currency: &str) {
-        self.set_spot_positions_quote_currency(currency);
     }
 
     #[pyo3(name = "get_server_time")]
@@ -150,6 +147,10 @@ impl KrakenSpotHttpClient {
         })
     }
 
+    /// Requests tradable instruments from Kraken.
+    ///
+    /// When `pairs` is `None` (loading all), also fetches tokenized asset pairs
+    /// (xStocks) and merges them with the default currency pairs.
     #[pyo3(name = "request_instruments")]
     #[pyo3(signature = (pairs=None))]
     fn py_request_instruments<'py>(
@@ -176,6 +177,40 @@ impl KrakenSpotHttpClient {
         })
     }
 
+    /// Requests the current market status for Kraken Spot instruments.
+    ///
+    /// Fetches both regular and tokenized asset pairs. The call returns an error if
+    /// either fetch fails so callers can avoid emitting partial snapshots that would
+    /// otherwise cause the missing tokenized symbols to be diffed as removed.
+    #[pyo3(name = "request_instrument_statuses")]
+    #[pyo3(signature = (pairs=None))]
+    fn py_request_instrument_statuses<'py>(
+        &self,
+        py: Python<'py>,
+        pairs: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let statuses = client
+                .request_instrument_statuses(pairs)
+                .await
+                .map_err(to_pyruntime_err)?;
+
+            Python::attach(|py| {
+                let dict = PyDict::new(py);
+                for (instrument_id, action) in statuses {
+                    dict.set_item(
+                        instrument_id.into_bound_py_any(py)?,
+                        action.into_bound_py_any(py)?,
+                    )?;
+                }
+                Ok(dict.into_any().unbind())
+            })
+        })
+    }
+
+    /// Requests historical trades for an instrument.
     #[pyo3(name = "request_trades")]
     #[pyo3(signature = (instrument_id, start=None, end=None, limit=None))]
     fn py_request_trades<'py>(
@@ -205,6 +240,28 @@ impl KrakenSpotHttpClient {
         })
     }
 
+    /// Requests an order book snapshot for an instrument.
+    #[pyo3(name = "request_book_snapshot")]
+    #[pyo3(signature = (instrument_id, depth=None))]
+    fn py_request_book_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        depth: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let book = client
+                .request_book_snapshot(instrument_id, depth)
+                .await
+                .map_err(to_pyruntime_err)?;
+
+            Python::attach(|py| book.into_py_any(py))
+        })
+    }
+
+    /// Requests historical bars/OHLC data for an instrument.
     #[pyo3(name = "request_bars")]
     #[pyo3(signature = (bar_type, start=None, end=None, limit=None))]
     fn py_request_bars<'py>(
@@ -232,17 +289,30 @@ impl KrakenSpotHttpClient {
         })
     }
 
+    /// Requests account state (balances) from Kraken.
+    ///
+    /// In cash mode returns wallet balances only.
+    /// In margin mode additionally calls `TradeBalance` to build `MarginBalance` entries.
+    /// `margin_balance_asset` selects the summary-display denomination for `TradeBalance`
+    /// (e.g. `"ZUSD"`, `"ZGBP"`); `None` lets Kraken default to `ZUSD`.
+    ///
+    /// Callers that also need the `TradeBalance` metrics dictionary should use
+    /// `Self.request_account_state_with_metrics` to avoid issuing two `TradeBalance`
+    /// HTTP requests per account update.
     #[pyo3(name = "request_account_state")]
+    #[pyo3(signature = (account_id, account_type = AccountType::Cash, margin_balance_asset = None))]
     fn py_request_account_state<'py>(
         &self,
         py: Python<'py>,
         account_id: AccountId,
+        account_type: AccountType,
+        margin_balance_asset: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let account_state = client
-                .request_account_state(account_id)
+                .request_account_state(account_id, account_type, margin_balance_asset.as_deref())
                 .await
                 .map_err(to_pyruntime_err)?;
 
@@ -250,6 +320,95 @@ impl KrakenSpotHttpClient {
         })
     }
 
+    /// Returns a flattened snapshot of Kraken's `TradeBalance` margin metrics.
+    ///
+    /// Caller is expected to invoke this only when operating in margin mode; consumers
+    /// surface the values via `AccountState.info` (Python-side) for strategy access.
+    /// Strings preserve venue precision exactly. Keys: `equivalent_balance`,
+    /// `trade_balance`, `used_margin`, `unexecuted_value`, `unrealized_pnl`,
+    /// `cost_basis`, `valuation`, `equity`, `free_margin`, `margin_level` (omitted
+    /// when Kraken returns no value, i.e. no open positions), `asset`.
+    ///
+    /// When the metrics are needed alongside the `AccountState`, prefer
+    /// `Self.request_account_state_with_metrics` to share a single `TradeBalance`
+    /// HTTP request between both.
+    #[pyo3(name = "request_margin_metrics")]
+    #[pyo3(signature = (asset = None))]
+    fn py_request_margin_metrics<'py>(
+        &self,
+        py: Python<'py>,
+        asset: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let metrics = client
+                .request_margin_metrics(asset.as_deref())
+                .await
+                .map_err(to_pyruntime_err)?;
+
+            Python::attach(|py| {
+                let dict = pyo3::types::PyDict::new(py);
+                for (k, v) in metrics {
+                    dict.set_item(k, v)?;
+                }
+                Ok::<_, PyErr>(dict.unbind().into_any())
+            })
+        })
+    }
+
+    /// Requests the full margin account snapshot in a single round-trip.
+    ///
+    /// Returns the `AccountState` (including `MarginBalance` entries when
+    /// `account_type` is `Margin`) and the `TradeBalance` metrics dictionary that
+    /// callers attach to `AccountState.info`. In cash mode the metrics map is empty
+    /// and `TradeBalance` is not called.
+    ///
+    /// In margin mode, replaces the raw `margin_balance_asset` wallet with a
+    /// synthetic `AccountBalance` using `total = e` and `free = mf` from
+    /// `TradeBalance`. Kraken reports these values across all collateral, which
+    /// avoids clamping free margin to one wallet bucket in multi-asset accounts.
+    ///
+    /// The single shared fetch keeps Kraken rate-limit usage symmetric with `Balance`
+    /// (one request per account update), instead of two as if `request_account_state`
+    /// and `request_margin_metrics` were called in sequence.
+    #[pyo3(name = "request_account_state_with_metrics")]
+    #[pyo3(signature = (account_id, account_type = AccountType::Cash, margin_balance_asset = None))]
+    fn py_request_account_state_with_metrics<'py>(
+        &self,
+        py: Python<'py>,
+        account_id: AccountId,
+        account_type: AccountType,
+        margin_balance_asset: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (account_state, metrics) = client
+                .request_account_state_with_metrics(
+                    account_id,
+                    account_type,
+                    margin_balance_asset.as_deref(),
+                )
+                .await
+                .map_err(to_pyruntime_err)?;
+
+            Python::attach(|py| {
+                let state_obj = account_state.into_pyobject(py)?.unbind();
+                let dict = pyo3::types::PyDict::new(py);
+                for (k, v) in metrics {
+                    dict.set_item(k, v)?;
+                }
+                let tuple = pyo3::types::PyTuple::new(
+                    py,
+                    [state_obj.into_any(), dict.unbind().into_any()],
+                )?;
+                Ok::<_, PyErr>(tuple.unbind().into_any())
+            })
+        })
+    }
+
+    /// Requests order status reports from Kraken.
     #[pyo3(name = "request_order_status_reports")]
     #[pyo3(signature = (account_id, instrument_id=None, start=None, end=None, open_only=false))]
     fn py_request_order_status_reports<'py>(
@@ -280,6 +439,7 @@ impl KrakenSpotHttpClient {
         })
     }
 
+    /// Requests fill/trade reports from Kraken.
     #[pyo3(name = "request_fill_reports")]
     #[pyo3(signature = (account_id, instrument_id=None, start=None, end=None))]
     fn py_request_fill_reports<'py>(
@@ -309,19 +469,34 @@ impl KrakenSpotHttpClient {
         })
     }
 
+    /// Requests position status reports for SPOT instruments.
+    ///
+    /// In margin mode: calls `OpenPositions` and returns reports for each open leveraged position.
+    /// When `use_spot_position_reports` is enabled (cash mode): derives reports from wallet balances.
+    /// Otherwise returns an empty vector.
     #[pyo3(name = "request_position_status_reports")]
-    #[pyo3(signature = (account_id, instrument_id=None))]
+    #[pyo3(signature = (account_id, instrument_id=None, account_type=AccountType::Cash, use_spot_position_reports=false, quote_currency="USDT"))]
     fn py_request_position_status_reports<'py>(
         &self,
         py: Python<'py>,
         account_id: AccountId,
         instrument_id: Option<InstrumentId>,
+        account_type: AccountType,
+        use_spot_position_reports: bool,
+        quote_currency: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
+        let quote_currency = Ustr::from(quote_currency);
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let reports = client
-                .request_position_status_reports(account_id, instrument_id)
+                .request_position_status_reports(
+                    account_id,
+                    instrument_id,
+                    account_type,
+                    use_spot_position_reports,
+                    quote_currency,
+                )
                 .await
                 .map_err(to_pyruntime_err)?;
 
@@ -336,9 +511,12 @@ impl KrakenSpotHttpClient {
         })
     }
 
+    /// Submits a new order to the Kraken Spot exchange.
+    ///
+    /// Returns the venue order ID on success. WebSocket handles all execution events.
     #[pyo3(name = "submit_order")]
-    #[pyo3(signature = (account_id, instrument_id, client_order_id, order_side, order_type, quantity, time_in_force, expire_time=None, price=None, trigger_price=None, reduce_only=false, post_only=false))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (account_id, instrument_id, client_order_id, order_side, order_type, quantity, time_in_force, expire_time=None, price=None, trigger_price=None, trigger_type=None, trailing_offset=None, limit_offset=None, reduce_only=false, post_only=false, quote_quantity=false, display_qty=None, leverage=None, account_type=AccountType::Cash))]
+    #[expect(clippy::too_many_arguments)]
     fn py_submit_order<'py>(
         &self,
         py: Python<'py>,
@@ -352,11 +530,30 @@ impl KrakenSpotHttpClient {
         expire_time: Option<u64>,
         price: Option<Price>,
         trigger_price: Option<Price>,
+        trigger_type: Option<TriggerType>,
+        trailing_offset: Option<String>,
+        limit_offset: Option<String>,
         reduce_only: bool,
         post_only: bool,
+        quote_quantity: bool,
+        display_qty: Option<Quantity>,
+        leverage: Option<u16>,
+        account_type: AccountType,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
         let expire_time = expire_time.map(UnixNanos::from);
+        let trailing_offset = trailing_offset
+            .map(|s| {
+                Decimal::from_str_exact(&s)
+                    .map_err(|e| to_pyvalue_err(format!("invalid trailing_offset: {e}")))
+            })
+            .transpose()?;
+        let limit_offset = limit_offset
+            .map(|s| {
+                Decimal::from_str_exact(&s)
+                    .map_err(|e| to_pyvalue_err(format!("invalid limit_offset: {e}")))
+            })
+            .transpose()?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let venue_order_id = client
@@ -371,8 +568,15 @@ impl KrakenSpotHttpClient {
                     expire_time,
                     price,
                     trigger_price,
+                    trigger_type,
+                    trailing_offset,
+                    limit_offset,
                     reduce_only,
                     post_only,
+                    quote_quantity,
+                    display_qty,
+                    leverage,
+                    account_type,
                 )
                 .await
                 .map_err(to_pyruntime_err)?;
@@ -381,6 +585,7 @@ impl KrakenSpotHttpClient {
         })
     }
 
+    /// Cancels an order on the Kraken Spot exchange.
     #[pyo3(name = "cancel_order")]
     #[pyo3(signature = (account_id, instrument_id, client_order_id=None, venue_order_id=None))]
     fn py_cancel_order<'py>(
@@ -416,7 +621,7 @@ impl KrakenSpotHttpClient {
         })
     }
 
-    /// Cancel multiple orders in a single batch request.
+    /// Cancels multiple orders on the Kraken Spot exchange (batched, max 50 per request).
     #[pyo3(name = "cancel_orders_batch")]
     fn py_cancel_orders_batch<'py>(
         &self,
@@ -433,10 +638,13 @@ impl KrakenSpotHttpClient {
         })
     }
 
-    /// Modify an existing order on the Kraken Spot exchange.
+    /// Modifies an existing order on the Kraken Spot exchange using atomic amend.
+    ///
+    /// Uses the AmendOrder endpoint which modifies the order in-place,
+    /// keeping the same order ID and queue position.
     #[pyo3(name = "modify_order")]
     #[pyo3(signature = (instrument_id, client_order_id=None, venue_order_id=None, quantity=None, price=None, trigger_price=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_modify_order<'py>(
         &self,
         py: Python<'py>,
@@ -463,6 +671,121 @@ impl KrakenSpotHttpClient {
                 .map_err(to_pyruntime_err)?;
 
             Python::attach(|py| new_venue_order_id.into_pyobject(py).map(|o| o.unbind()))
+        })
+    }
+}
+
+// Separate block to avoid pyo3_stub_gen trait bound issues with batch-order tuples.
+// Stub is maintained manually in nautilus_pyo3.pyi.
+#[pymethods]
+impl KrakenSpotHttpClient {
+    /// Submits multiple orders to the Kraken Spot exchange.
+    ///
+    /// Automatically groups orders by pair and chunks batch requests at the venue
+    /// limit. Single-order groups fall back to `AddOrder`.
+    #[pyo3(name = "submit_orders_batch", signature = (orders, leverage=None, account_type=AccountType::Cash, per_order_leverages=None, per_order_reduce_only=None))]
+    #[expect(clippy::type_complexity)]
+    fn py_submit_orders_batch<'py>(
+        &self,
+        py: Python<'py>,
+        orders: Vec<(
+            InstrumentId,
+            ClientOrderId,
+            OrderSide,
+            OrderType,
+            Quantity,
+            TimeInForce,
+            Option<Price>,
+            Option<Price>,
+            Option<TriggerType>,
+            bool,
+            bool,
+            Option<Quantity>,
+        )>,
+        leverage: Option<u16>,
+        account_type: AccountType,
+        per_order_leverages: Option<Vec<Option<u16>>>,
+        per_order_reduce_only: Option<Vec<bool>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let n = orders.len();
+
+        if let Some(ref v) = per_order_leverages
+            && v.len() != n
+        {
+            return Err(to_pyvalue_err(format!(
+                "per_order_leverages length must equal orders length, was {} for {n} orders",
+                v.len(),
+            )));
+        }
+
+        if let Some(ref v) = per_order_reduce_only
+            && v.len() != n
+        {
+            return Err(to_pyvalue_err(format!(
+                "per_order_reduce_only length must equal orders length, was {} for {n} orders",
+                v.len(),
+            )));
+        }
+
+        let leverages: Vec<Option<u16>> = match per_order_leverages {
+            Some(per_leverages) => per_leverages.into_iter().map(|v| v.or(leverage)).collect(),
+            None => vec![leverage; n],
+        };
+        let reduce_only_flags = per_order_reduce_only.unwrap_or_else(|| vec![false; n]);
+        let expanded_orders = orders
+            .into_iter()
+            .zip(leverages)
+            .zip(reduce_only_flags)
+            .map(
+                |(
+                    (
+                        (
+                            instrument_id,
+                            client_order_id,
+                            order_side,
+                            order_type,
+                            quantity,
+                            time_in_force,
+                            price,
+                            trigger_price,
+                            trigger_type,
+                            post_only,
+                            quote_quantity,
+                            display_qty,
+                        ),
+                        order_leverage,
+                    ),
+                    order_reduce_only,
+                )| {
+                    (
+                        instrument_id,
+                        client_order_id,
+                        order_side,
+                        order_type,
+                        quantity,
+                        time_in_force,
+                        None,
+                        price,
+                        trigger_price,
+                        trigger_type,
+                        None,
+                        None,
+                        order_reduce_only,
+                        post_only,
+                        quote_quantity,
+                        display_qty,
+                        order_leverage,
+                    )
+                },
+            )
+            .collect();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .submit_orders_batch(expanded_orders, account_type)
+                .await
+                .map_err(to_pyruntime_err)
         })
     }
 }

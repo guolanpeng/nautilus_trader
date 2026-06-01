@@ -15,6 +15,9 @@
 
 import os
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from nautilus_trader.core.nautilus_pyo3 import Bar
 from nautilus_trader.core.nautilus_pyo3 import BarAggregation
 from nautilus_trader.core.nautilus_pyo3 import BarSpecification
@@ -23,13 +26,13 @@ from nautilus_trader.core.nautilus_pyo3 import CurrencyPair
 from nautilus_trader.core.nautilus_pyo3 import IndexPriceUpdate
 from nautilus_trader.core.nautilus_pyo3 import InstrumentId
 from nautilus_trader.core.nautilus_pyo3 import MarkPriceUpdate
-from nautilus_trader.core.nautilus_pyo3 import ParquetDataCatalogV2
+from nautilus_trader.core.nautilus_pyo3 import ParquetDataCatalog
 from nautilus_trader.core.nautilus_pyo3 import Price
 from nautilus_trader.core.nautilus_pyo3 import PriceType
 from nautilus_trader.core.nautilus_pyo3 import Quantity
 from nautilus_trader.core.nautilus_pyo3 import Symbol
 from nautilus_trader.core.nautilus_pyo3 import Venue
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from nautilus_trader.persistence.catalog import ParquetDataCatalog as LegacyParquetDataCatalog
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.rust.data_pyo3 import TestDataProviderPyo3
 from nautilus_trader.test_kit.rust.identifiers_pyo3 import TestIdProviderPyo3
@@ -53,10 +56,30 @@ def bar(t):
     )
 
 
-def test_write_2_bars_to_catalog(catalog: ParquetDataCatalog):
+def make_audusd_snapshot(
+    ts_init: int,
+    venue_extra: str,
+    count: int,
+    enabled: bool,
+) -> CurrencyPair:
+    from typing import Any
+
+    from nautilus_trader.model.instruments import CurrencyPair as PyCurrencyPair
+
+    base = TestInstrumentProvider.default_fx_ccy("AUD/USD")
+    payload: dict[str, Any] = {
+        **PyCurrencyPair.to_dict(base),
+        "info": {"venue_extra": venue_extra, "count": count, "enabled": enabled},
+        "ts_event": ts_init,
+        "ts_init": ts_init,
+    }
+    return CurrencyPair.from_dict(payload)
+
+
+def test_write_2_bars_to_catalog(catalog: LegacyParquetDataCatalog):
     # Arrange
     # Note: we use a python catalog only to setup an empty catalog every time
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act
     pyo3_catalog.write_bars([bar(1), bar(2)])
@@ -68,31 +91,17 @@ def test_write_2_bars_to_catalog(catalog: ParquetDataCatalog):
     assert intervals == [(1, 2)]
 
 
-def test_catalog_v2_instrument_roundtrip_with_info_params(catalog: ParquetDataCatalog) -> None:
+def test_catalog_instrument_roundtrip_with_info_params(
+    catalog: LegacyParquetDataCatalog,
+) -> None:
     # Roundtrip PyO3 instruments (CurrencyPair with Params in info) via catalog v2.
-    from typing import Any
     from typing import cast
 
-    from nautilus_trader.model.instruments import CurrencyPair as PyCurrencyPair
-
-    base = TestInstrumentProvider.default_fx_ccy("AUD/USD")
-    d = PyCurrencyPair.to_dict(base)
-    payload1: dict[str, Any] = {
-        **d,
-        "info": {"venue_extra": "v1", "count": 1, "enabled": True},
-        "ts_event": 1000,
-        "ts_init": 1000,
-    }
-    payload2: dict[str, Any] = {
-        **d,
-        "info": {"venue_extra": "v2", "count": 2, "enabled": False},
-        "ts_event": 2000,
-        "ts_init": 2000,
-    }
-    inst1 = CurrencyPair.from_dict(payload1)
-    inst2 = CurrencyPair.from_dict(payload2)
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
-    pyo3_catalog.write_instruments([inst1, inst2])
+    inst1 = make_audusd_snapshot(1000, "v1", 1, True)
+    inst2 = make_audusd_snapshot(2000, "v2", 2, False)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
+    pyo3_catalog.write_instruments([inst1])
+    pyo3_catalog.write_instruments([inst2])
     read = cast(list[CurrencyPair], pyo3_catalog.instruments(instrument_ids=["AUD/USD.SIM"]))
     assert len(read) == 2
     by_ts = {inst.ts_init: inst for inst in read}
@@ -103,10 +112,64 @@ def test_catalog_v2_instrument_roundtrip_with_info_params(catalog: ParquetDataCa
     assert str(by_ts[1000].id) == "AUD/USD.SIM"
     assert str(by_ts[2000].id) == "AUD/USD.SIM"
 
+    filtered = cast(
+        list[CurrencyPair],
+        pyo3_catalog.instruments(instrument_ids=["AUD/USD.SIM"], start=1500, end=2500),
+    )
+    assert len(filtered) == 1
+    assert filtered[0].ts_init == 2000
 
-def test_append_data_to_catalog(catalog: ParquetDataCatalog):
+
+def test_catalog_instrument_time_range_query_with_multiple_versions(
+    catalog: LegacyParquetDataCatalog,
+) -> None:
+    from typing import cast
+
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
+    versions = [
+        make_audusd_snapshot(1000, "v1", 1, True),
+        make_audusd_snapshot(2000, "v2", 2, False),
+        make_audusd_snapshot(3000, "v3", 3, True),
+        make_audusd_snapshot(4000, "v4", 4, False),
+    ]
+
+    for instrument in versions:
+        pyo3_catalog.write_instruments([instrument])
+
+    read_all = cast(
+        list[CurrencyPair],
+        pyo3_catalog.instruments(instrument_ids=["AUD/USD.SIM"]),
+    )
+    assert [instrument.ts_init for instrument in read_all] == [1000, 2000, 3000, 4000]
+    assert [dict(instrument.info)["venue_extra"] for instrument in read_all] == [
+        "v1",
+        "v2",
+        "v3",
+        "v4",
+    ]
+
+    middle_range = cast(
+        list[CurrencyPair],
+        pyo3_catalog.instruments(instrument_ids=["AUD/USD.SIM"], start=1500, end=3500),
+    )
+    assert [instrument.ts_init for instrument in middle_range] == [2000, 3000]
+
+    upper_range = cast(
+        list[CurrencyPair],
+        pyo3_catalog.instruments(instrument_ids=["AUD/USD.SIM"], start=2500, end=4500),
+    )
+    assert [instrument.ts_init for instrument in upper_range] == [3000, 4000]
+
+    lower_range = cast(
+        list[CurrencyPair],
+        pyo3_catalog.instruments(instrument_ids=["AUD/USD.SIM"], start=0, end=2500),
+    )
+    assert [instrument.ts_init for instrument in lower_range] == [1000, 2000]
+
+
+def test_append_data_to_catalog(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act
     pyo3_catalog.write_bars([bar(1), bar(2)])
@@ -120,9 +183,9 @@ def test_append_data_to_catalog(catalog: ParquetDataCatalog):
     assert intervals == [(1, 2), (3, 3)]
 
 
-def test_consolidate_catalog(catalog: ParquetDataCatalog):
+def test_consolidate_catalog(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act
     pyo3_catalog.write_bars([bar(1), bar(2)])
@@ -136,9 +199,9 @@ def test_consolidate_catalog(catalog: ParquetDataCatalog):
     assert intervals == [(1, 3)]
 
 
-def test_consolidate_catalog_with_time_range(catalog: ParquetDataCatalog):
+def test_consolidate_catalog_with_time_range(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act
     pyo3_catalog.write_bars([bar(1)])
@@ -153,9 +216,9 @@ def test_consolidate_catalog_with_time_range(catalog: ParquetDataCatalog):
     assert intervals == [(1, 2), (3, 3)]
 
 
-def test_get_missing_intervals(catalog: ParquetDataCatalog):
+def test_get_missing_intervals(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_bars([bar(1), bar(2)])
     pyo3_catalog.write_bars([bar(5), bar(6)])
 
@@ -168,9 +231,9 @@ def test_get_missing_intervals(catalog: ParquetDataCatalog):
     assert missing == [(0, 0), (3, 4), (7, 10)]
 
 
-def test_reset_file_names(catalog: ParquetDataCatalog):
+def test_reset_file_names(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_bars([bar(1), bar(2), bar(3)])
 
     # For bars, identifier should be the full bar_type string, not just instrument_id
@@ -199,9 +262,9 @@ def test_reset_file_names(catalog: ParquetDataCatalog):
     assert intervals == [(1, 3)]
 
 
-def test_extend_file_name(catalog: ParquetDataCatalog):
+def test_extend_file_name(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     # Write data with a gap
     pyo3_catalog.write_bars([bar(1)])
     pyo3_catalog.write_bars([bar(4)])
@@ -218,9 +281,9 @@ def test_extend_file_name(catalog: ParquetDataCatalog):
     assert intervals == [(1, 3), (4, 4)]
 
 
-def test_reset_all_file_names(catalog: ParquetDataCatalog):
+def test_reset_all_file_names(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_bars([bar(1), bar(2)])
     pyo3_catalog.write_bars([bar(3)])
 
@@ -289,9 +352,9 @@ def index_price_update(t):
     )
 
 
-def test_write_quote_ticks(catalog: ParquetDataCatalog):
+def test_write_quote_ticks(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act
     pyo3_catalog.write_quote_ticks([quote_tick(1), quote_tick(2)])
@@ -302,9 +365,9 @@ def test_write_quote_ticks(catalog: ParquetDataCatalog):
     assert len(used_files) >= 1
 
 
-def test_write_trade_ticks(catalog: ParquetDataCatalog):
+def test_write_trade_ticks(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act
     pyo3_catalog.write_trade_ticks([trade_tick(1), trade_tick(2)])
@@ -315,9 +378,9 @@ def test_write_trade_ticks(catalog: ParquetDataCatalog):
     assert len(used_files) >= 1
 
 
-def test_write_order_book_deltas(catalog: ParquetDataCatalog):
+def test_write_order_book_deltas(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act
     pyo3_catalog.write_order_book_deltas([order_book_delta(1), order_book_delta(2)])
@@ -328,9 +391,9 @@ def test_write_order_book_deltas(catalog: ParquetDataCatalog):
     assert len(used_files) >= 1
 
 
-def test_write_mark_price_updates(catalog: ParquetDataCatalog):
+def test_write_mark_price_updates(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act
     pyo3_catalog.write_mark_price_updates([mark_price_update(1), mark_price_update(2)])
@@ -341,9 +404,9 @@ def test_write_mark_price_updates(catalog: ParquetDataCatalog):
     assert len(used_files) >= 1
 
 
-def test_write_index_price_updates(catalog: ParquetDataCatalog):
+def test_write_index_price_updates(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act
     pyo3_catalog.write_index_price_updates([index_price_update(1), index_price_update(2)])
@@ -354,9 +417,9 @@ def test_write_index_price_updates(catalog: ParquetDataCatalog):
     assert len(used_files) >= 1
 
 
-def test_query_files(catalog: ParquetDataCatalog):
+def test_query_files(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_bars([bar(1), bar(2)])
     pyo3_catalog.write_bars([bar(3), bar(4)])
 
@@ -367,9 +430,9 @@ def test_query_files(catalog: ParquetDataCatalog):
     assert len(files) == 2
 
 
-def test_query_files_with_multiple_files(catalog: ParquetDataCatalog):
+def test_query_files_with_multiple_files(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_bars([bar(1), bar(2)])
     pyo3_catalog.write_bars([bar(3), bar(4)])
     pyo3_catalog.write_bars([bar(5), bar(6)])
@@ -381,9 +444,9 @@ def test_query_files_with_multiple_files(catalog: ParquetDataCatalog):
     assert len(files) == 3
 
 
-def test_get_intervals_empty(catalog: ParquetDataCatalog):
+def test_get_intervals_empty(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act
     # For bars, identifier should be the full bar_type string, not just instrument_id
@@ -394,9 +457,9 @@ def test_get_intervals_empty(catalog: ParquetDataCatalog):
     assert len(intervals) == 0
 
 
-def test_query_bars(catalog: ParquetDataCatalog):
+def test_query_bars(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_bars([bar(1), bar(2)])
 
     # Act
@@ -408,9 +471,9 @@ def test_query_bars(catalog: ParquetDataCatalog):
     assert bars[1].ts_init == 2
 
 
-def test_query_quote_ticks(catalog: ParquetDataCatalog):
+def test_query_quote_ticks(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_quote_ticks([quote_tick(1), quote_tick(2)])
 
     # Act
@@ -422,9 +485,9 @@ def test_query_quote_ticks(catalog: ParquetDataCatalog):
     assert quotes[1].ts_init == 2
 
 
-def test_query_trade_ticks(catalog: ParquetDataCatalog):
+def test_query_trade_ticks(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_trade_ticks([trade_tick(1), trade_tick(2)])
 
     # Act
@@ -436,9 +499,9 @@ def test_query_trade_ticks(catalog: ParquetDataCatalog):
     assert trades[1].ts_init == 2
 
 
-def test_query_order_book_deltas(catalog: ParquetDataCatalog):
+def test_query_order_book_deltas(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_order_book_deltas([order_book_delta(1), order_book_delta(2)])
 
     # Act
@@ -450,9 +513,9 @@ def test_query_order_book_deltas(catalog: ParquetDataCatalog):
     assert deltas[1].ts_init == 2
 
 
-def test_query_mark_price_updates(catalog: ParquetDataCatalog):
+def test_query_mark_price_updates(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_mark_price_updates([mark_price_update(1), mark_price_update(2)])
 
     # Act
@@ -464,9 +527,9 @@ def test_query_mark_price_updates(catalog: ParquetDataCatalog):
     assert updates[1].ts_init == 2
 
 
-def test_query_index_price_updates(catalog: ParquetDataCatalog):
+def test_query_index_price_updates(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_index_price_updates([index_price_update(1), index_price_update(2)])
 
     # Act
@@ -478,9 +541,9 @@ def test_query_index_price_updates(catalog: ParquetDataCatalog):
     assert updates[1].ts_init == 2
 
 
-def test_query_bars_with_time_range(catalog: ParquetDataCatalog):
+def test_query_bars_with_time_range(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_bars([bar(1), bar(2), bar(3), bar(4)])
 
     # Act
@@ -492,9 +555,9 @@ def test_query_bars_with_time_range(catalog: ParquetDataCatalog):
     assert bars[1].ts_init == 3
 
 
-def test_query_bars_empty_result(catalog: ParquetDataCatalog):
+def test_query_bars_empty_result(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act
     bars = pyo3_catalog.query_bars(["AUD/USD.SIM"])
@@ -503,12 +566,12 @@ def test_query_bars_empty_result(catalog: ParquetDataCatalog):
     assert len(bars) == 0
 
 
-def test_query_bars_with_where_clause(catalog: ParquetDataCatalog):
+def test_query_bars_with_where_clause(catalog: LegacyParquetDataCatalog):
     """
     Test query_bars with WHERE clause filtering.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_bars([bar(1000), bar(2000), bar(3000)])
 
     # Act - query with WHERE clause
@@ -524,12 +587,12 @@ def test_query_bars_with_where_clause(catalog: ParquetDataCatalog):
     assert all(b.ts_init >= 2000 for b in bars)
 
 
-def test_query_quote_ticks_with_time_range(catalog: ParquetDataCatalog):
+def test_query_quote_ticks_with_time_range(catalog: LegacyParquetDataCatalog):
     """
     Test query_quote_ticks with time range filtering.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_quote_ticks([quote_tick(1000), quote_tick(2000), quote_tick(3000)])
 
     # Act - query quotes with time range
@@ -540,12 +603,12 @@ def test_query_quote_ticks_with_time_range(catalog: ParquetDataCatalog):
     assert quotes[0].ts_init == 2000
 
 
-def test_query_trade_ticks_with_time_range(catalog: ParquetDataCatalog):
+def test_query_trade_ticks_with_time_range(catalog: LegacyParquetDataCatalog):
     """
     Test query_trade_ticks with time range filtering.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_trade_ticks([trade_tick(1000), trade_tick(2000), trade_tick(3000)])
 
     # Act - query trades with time range
@@ -556,12 +619,12 @@ def test_query_trade_ticks_with_time_range(catalog: ParquetDataCatalog):
     assert trades[0].ts_init == 2000
 
 
-def test_consolidate_catalog_by_period_basic(catalog: ParquetDataCatalog):
+def test_consolidate_catalog_by_period_basic(catalog: LegacyParquetDataCatalog):
     """
     Test consolidate_catalog_by_period with period parameter.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Create multiple small files for different data types with contiguous timestamps
     pyo3_catalog.write_bars([bar(1000)])
@@ -593,12 +656,12 @@ def test_consolidate_catalog_by_period_basic(catalog: ParquetDataCatalog):
     assert len(quote_intervals_after) <= len(quote_intervals_before)
 
 
-def test_consolidate_catalog_by_period_empty_catalog(catalog: ParquetDataCatalog):
+def test_consolidate_catalog_by_period_empty_catalog(catalog: LegacyParquetDataCatalog):
     """
     Test consolidate_catalog_by_period on empty catalog.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act - consolidate empty catalog
     pyo3_catalog.consolidate_catalog_by_period(
@@ -615,12 +678,12 @@ def test_consolidate_catalog_by_period_empty_catalog(catalog: ParquetDataCatalog
     assert len(intervals) == 0
 
 
-def test_consolidate_catalog_by_period_mixed_data_types(catalog: ParquetDataCatalog):
+def test_consolidate_catalog_by_period_mixed_data_types(catalog: LegacyParquetDataCatalog):
     """
     Test consolidate_catalog_by_period with multiple data types.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Create data for multiple types with contiguous timestamps
     pyo3_catalog.write_bars([bar(1000)])
@@ -655,12 +718,12 @@ def test_consolidate_catalog_by_period_mixed_data_types(catalog: ParquetDataCata
     assert final_trade_count <= initial_trade_count
 
 
-def test_consolidate_data_by_period_basic(catalog: ParquetDataCatalog):
+def test_consolidate_data_by_period_basic(catalog: LegacyParquetDataCatalog):
     """
     Test basic consolidate_data_by_period functionality.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     test_bars = [bar(1000), bar(2000), bar(3000), bar(4000), bar(5000)]
     pyo3_catalog.write_bars(test_bars)
 
@@ -680,12 +743,12 @@ def test_consolidate_data_by_period_basic(catalog: ParquetDataCatalog):
     assert len(intervals) >= 1
 
 
-def test_consolidate_data_by_period_with_time_range(catalog: ParquetDataCatalog):
+def test_consolidate_data_by_period_with_time_range(catalog: LegacyParquetDataCatalog):
     """
     Test consolidate_data_by_period with specific time range.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     test_bars = [bar(1000), bar(5000), bar(10000), bar(15000), bar(20000)]
     pyo3_catalog.write_bars(test_bars)
 
@@ -709,12 +772,12 @@ def test_consolidate_data_by_period_with_time_range(catalog: ParquetDataCatalog)
     assert len(intervals) >= 1
 
 
-def test_consolidate_data_by_period_empty_data(catalog: ParquetDataCatalog):
+def test_consolidate_data_by_period_empty_data(catalog: LegacyParquetDataCatalog):
     """
     Test consolidate_data_by_period with no data (should not error).
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act - consolidate on empty catalog
     period_nanos = 86400_000_000_000  # 1 day
@@ -732,12 +795,12 @@ def test_consolidate_data_by_period_empty_data(catalog: ParquetDataCatalog):
     assert len(intervals) == 0
 
 
-def test_consolidate_data_by_period_default_parameters(catalog: ParquetDataCatalog):
+def test_consolidate_data_by_period_default_parameters(catalog: LegacyParquetDataCatalog):
     """
     Test consolidate_data_by_period with default parameters.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     test_bars = [bar(1000), bar(2000), bar(3000)]
     pyo3_catalog.write_bars(test_bars)
 
@@ -754,12 +817,12 @@ def test_consolidate_data_by_period_default_parameters(catalog: ParquetDataCatal
     assert len(intervals) >= 1
 
 
-def test_consolidate_data_by_period_different_periods(catalog: ParquetDataCatalog):
+def test_consolidate_data_by_period_different_periods(catalog: LegacyParquetDataCatalog):
     """
     Test consolidate_data_by_period with different period sizes.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     test_bars = [
         bar(1000),  # ~0 minutes
         bar(600_000),  # ~10 minutes
@@ -791,12 +854,12 @@ def test_consolidate_data_by_period_different_periods(catalog: ParquetDataCatalo
         assert len(intervals) >= 1
 
 
-def test_consolidate_data_by_period_ensure_contiguous_files_true(catalog: ParquetDataCatalog):
+def test_consolidate_data_by_period_ensure_contiguous_files_true(catalog: LegacyParquetDataCatalog):
     """
     Test consolidate_data_by_period with ensure_contiguous_files=True.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     test_bars = [bar(1000), bar(1001), bar(1002)]  # contiguous timestamps
     pyo3_catalog.write_bars(test_bars)
 
@@ -816,12 +879,12 @@ def test_consolidate_data_by_period_ensure_contiguous_files_true(catalog: Parque
     assert len(intervals) >= 1
 
 
-def test_query_functions_data_integrity(catalog: ParquetDataCatalog):
+def test_query_functions_data_integrity(catalog: LegacyParquetDataCatalog):
     """
     Test that query functions return data with correct integrity.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     test_bars = [bar(1000), bar(2000), bar(3000)]
     pyo3_catalog.write_bars(test_bars)
 
@@ -845,12 +908,12 @@ def test_query_functions_data_integrity(catalog: ParquetDataCatalog):
 # ================================================================================================
 
 
-def test_delete_data_range_complete_file_deletion(catalog: ParquetDataCatalog):
+def test_delete_data_range_complete_file_deletion(catalog: LegacyParquetDataCatalog):
     """
     Test deleting data that completely covers one or more files.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     test_bars = [bar(1_000_000_000), bar(2_000_000_000)]
     pyo3_catalog.write_bars(test_bars)
 
@@ -871,12 +934,12 @@ def test_delete_data_range_complete_file_deletion(catalog: ParquetDataCatalog):
     assert len(remaining_bars) == 0
 
 
-def test_delete_data_range_partial_file_overlap_start(catalog: ParquetDataCatalog):
+def test_delete_data_range_partial_file_overlap_start(catalog: LegacyParquetDataCatalog):
     """
     Test deleting data that partially overlaps with a file from the start.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     test_bars = [
         bar(1_000_000_000),
         bar(2_000_000_000),
@@ -899,12 +962,12 @@ def test_delete_data_range_partial_file_overlap_start(catalog: ParquetDataCatalo
     assert remaining_bars[1].ts_init == 3_000_000_000
 
 
-def test_delete_data_range_partial_file_overlap_end(catalog: ParquetDataCatalog):
+def test_delete_data_range_partial_file_overlap_end(catalog: LegacyParquetDataCatalog):
     """
     Test deleting data that partially overlaps with a file from the end.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     test_bars = [
         bar(1_000_000_000),
         bar(2_000_000_000),
@@ -927,12 +990,12 @@ def test_delete_data_range_partial_file_overlap_end(catalog: ParquetDataCatalog)
     assert remaining_bars[1].ts_init == 2_000_000_000
 
 
-def test_delete_data_range_partial_file_overlap_middle(catalog: ParquetDataCatalog):
+def test_delete_data_range_partial_file_overlap_middle(catalog: LegacyParquetDataCatalog):
     """
     Test deleting data that partially overlaps with a file in the middle.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     test_bars = [
         bar(1_000_000_000),
         bar(2_000_000_000),
@@ -956,12 +1019,12 @@ def test_delete_data_range_partial_file_overlap_middle(catalog: ParquetDataCatal
     assert remaining_bars[1].ts_init == 4_000_000_000
 
 
-def test_delete_data_range_no_data(catalog: ParquetDataCatalog):
+def test_delete_data_range_no_data(catalog: LegacyParquetDataCatalog):
     """
     Test deleting data when no data exists.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act - delete from empty catalog
     pyo3_catalog.delete_data_range(
@@ -976,12 +1039,12 @@ def test_delete_data_range_no_data(catalog: ParquetDataCatalog):
     assert len(remaining_bars) == 0
 
 
-def test_delete_data_range_no_intersection(catalog: ParquetDataCatalog):
+def test_delete_data_range_no_intersection(catalog: LegacyParquetDataCatalog):
     """
     Test deleting data that doesn't intersect with existing data.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     test_bars = [bar(2_000_000_000)]
     pyo3_catalog.write_bars(test_bars)
 
@@ -999,12 +1062,12 @@ def test_delete_data_range_no_intersection(catalog: ParquetDataCatalog):
     assert remaining_bars[0].ts_init == 2_000_000_000
 
 
-def test_delete_catalog_range_multiple_data_types(catalog: ParquetDataCatalog):
+def test_delete_catalog_range_multiple_data_types(catalog: LegacyParquetDataCatalog):
     """
     Test deleting data across multiple data types in the catalog.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Create data for multiple data types using pyo3 objects
     test_bars = [
@@ -1042,12 +1105,12 @@ def test_delete_catalog_range_multiple_data_types(catalog: ParquetDataCatalog):
     assert len(remaining_quotes) == 0
 
 
-def test_delete_catalog_range_complete_deletion(catalog: ParquetDataCatalog):
+def test_delete_catalog_range_complete_deletion(catalog: LegacyParquetDataCatalog):
     """
     Test deleting all data in the catalog.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Create data for multiple data types
     test_bars = [bar(1_000_000_000)]
@@ -1071,12 +1134,12 @@ def test_delete_catalog_range_complete_deletion(catalog: ParquetDataCatalog):
     assert len(pyo3_catalog.query_quote_ticks(["ETH/USDT.BINANCE"])) == 0
 
 
-def test_delete_catalog_range_empty_catalog(catalog: ParquetDataCatalog):
+def test_delete_catalog_range_empty_catalog(catalog: LegacyParquetDataCatalog):
     """
     Test deleting data from an empty catalog.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act - delete from empty catalog
     pyo3_catalog.delete_catalog_range(
@@ -1089,12 +1152,12 @@ def test_delete_catalog_range_empty_catalog(catalog: ParquetDataCatalog):
     assert len(pyo3_catalog.query_quote_ticks(["ETH/USDT.BINANCE"])) == 0
 
 
-def test_delete_catalog_range_open_boundaries(catalog: ParquetDataCatalog):
+def test_delete_catalog_range_open_boundaries(catalog: LegacyParquetDataCatalog):
     """
     Test deleting data with open start/end boundaries.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Create test data
     test_bars = [
@@ -1118,12 +1181,12 @@ def test_delete_catalog_range_open_boundaries(catalog: ParquetDataCatalog):
     )
 
 
-def test_delete_data_range_nanosecond_precision_boundaries(catalog: ParquetDataCatalog):
+def test_delete_data_range_nanosecond_precision_boundaries(catalog: LegacyParquetDataCatalog):
     """
     Test deleting data with nanosecond precision boundaries.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Create test data with precise nanosecond timestamps
     test_bars = [
@@ -1149,12 +1212,12 @@ def test_delete_data_range_nanosecond_precision_boundaries(catalog: ParquetDataC
     assert remaining_bars[1].ts_init == 1_000_000_003
 
 
-def test_delete_data_range_single_file_double_split(catalog: ParquetDataCatalog):
+def test_delete_data_range_single_file_double_split(catalog: LegacyParquetDataCatalog):
     """
     Test deleting from a single file that requires both split_before and split_after.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Create test data in a single file that will need both splits
     test_bars = [
@@ -1184,12 +1247,12 @@ def test_delete_data_range_single_file_double_split(catalog: ParquetDataCatalog)
     assert timestamps == [1_000_000_000, 2_000_000_000, 4_000_000_000, 5_000_000_000]
 
 
-def test_delete_data_range_file_contiguity_verification(catalog: ParquetDataCatalog):
+def test_delete_data_range_file_contiguity_verification(catalog: LegacyParquetDataCatalog):
     """
     Test that split files maintain proper timestamp contiguity.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Create test data that will be split
     test_bars = [
@@ -1230,7 +1293,7 @@ def test_delete_data_range_file_contiguity_verification(catalog: ParquetDataCata
 # ================================================================================================
 
 
-def test_pyo3_query_multiple_instruments_table_naming(catalog: ParquetDataCatalog):
+def test_pyo3_query_multiple_instruments_table_naming(catalog: LegacyParquetDataCatalog):
     """
     Test that pyo3 bindings handle multiple instruments correctly with identifier-
     dependent table names.
@@ -1240,7 +1303,7 @@ def test_pyo3_query_multiple_instruments_table_naming(catalog: ParquetDataCatalo
 
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Create quote ticks for multiple instruments with different identifier patterns
     eurusd_quotes = [
@@ -1281,6 +1344,7 @@ def test_pyo3_query_multiple_instruments_table_naming(catalog: ParquetDataCatalo
 
     # Verify we have data from all three instruments
     instrument_counts: dict[str, int] = {}
+
     for quote in quotes:
         instrument_id = quote.instrument_id.value
         instrument_counts[instrument_id] = instrument_counts.get(instrument_id, 0) + 1
@@ -1295,13 +1359,13 @@ def test_pyo3_query_multiple_instruments_table_naming(catalog: ParquetDataCatalo
     assert timestamps == sorted(timestamps)
 
 
-def test_pyo3_query_bars_multiple_instruments_table_naming(catalog: ParquetDataCatalog):
+def test_pyo3_query_bars_multiple_instruments_table_naming(catalog: LegacyParquetDataCatalog):
     """
     Test that pyo3 bindings handle multiple bar types correctly with identifier-
     dependent table names.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Create bars using the existing bar helper function but with different timestamps
     bars_set1 = [bar(1000000000 + i * 60000000000) for i in range(2)]  # Use nanosecond timestamps
@@ -1322,7 +1386,7 @@ def test_pyo3_query_bars_multiple_instruments_table_naming(catalog: ParquetDataC
     assert timestamps == sorted(timestamps)
 
 
-def test_pyo3_backend_session_special_characters_table_naming(catalog: ParquetDataCatalog):
+def test_pyo3_backend_session_special_characters_table_naming(catalog: LegacyParquetDataCatalog):
     """
     Test that pyo3 backend session handles special characters in identifiers correctly.
 
@@ -1331,7 +1395,7 @@ def test_pyo3_backend_session_special_characters_table_naming(catalog: ParquetDa
 
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Create trade ticks for instruments with various special characters
     trades_complex = [
@@ -1376,6 +1440,7 @@ def test_pyo3_backend_session_special_characters_table_naming(catalog: ParquetDa
 
     # Verify we have data from all instruments
     instrument_counts: dict[str, int] = {}
+
     for trade in trades:
         instrument_id = trade.instrument_id.value
         instrument_counts[instrument_id] = instrument_counts.get(instrument_id, 0) + 1
@@ -1386,9 +1451,9 @@ def test_pyo3_backend_session_special_characters_table_naming(catalog: ParquetDa
     assert instrument_counts.get("ADA-BTC.BINANCE_SPOT") == 2
 
 
-def test_query_first_timestamp(catalog: ParquetDataCatalog):
+def test_query_first_timestamp(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_bars([bar(1000), bar(2000), bar(3000)])
 
     # Act
@@ -1400,9 +1465,9 @@ def test_query_first_timestamp(catalog: ParquetDataCatalog):
     assert first_ts == 1000
 
 
-def test_query_first_timestamp_empty(catalog: ParquetDataCatalog):
+def test_query_first_timestamp_empty(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act
     first_ts = pyo3_catalog.query_first_timestamp("bars", "NONEXISTENT")
@@ -1411,9 +1476,9 @@ def test_query_first_timestamp_empty(catalog: ParquetDataCatalog):
     assert first_ts is None
 
 
-def test_query_last_timestamp(catalog: ParquetDataCatalog):
+def test_query_last_timestamp(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_bars([bar(1000), bar(2000), bar(3000)])
 
     # Act
@@ -1425,9 +1490,9 @@ def test_query_last_timestamp(catalog: ParquetDataCatalog):
     assert last_ts == 3000
 
 
-def test_list_data_types(catalog: ParquetDataCatalog):
+def test_list_data_types(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     pyo3_catalog.write_bars([bar(1000)])
 
     # Act
@@ -1437,9 +1502,9 @@ def test_list_data_types(catalog: ParquetDataCatalog):
     assert "bars" in data_types
 
 
-def test_list_backtest_runs(catalog: ParquetDataCatalog):
+def test_list_backtest_runs(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     import os
 
     backtest_dir = os.path.join(catalog.path, "backtest", "test_run_123")
@@ -1452,9 +1517,9 @@ def test_list_backtest_runs(catalog: ParquetDataCatalog):
     assert "test_run_123" in runs
 
 
-def test_list_live_runs(catalog: ParquetDataCatalog):
+def test_list_live_runs(catalog: LegacyParquetDataCatalog):
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
     import os
 
     live_dir = os.path.join(catalog.path, "live", "test_live_456")
@@ -1467,12 +1532,12 @@ def test_list_live_runs(catalog: ParquetDataCatalog):
     assert "test_live_456" in runs
 
 
-def test_convert_stream_to_data_no_files(catalog: ParquetDataCatalog):
+def test_convert_stream_to_data_no_files(catalog: LegacyParquetDataCatalog):
     """
     Test convert_stream_to_data when no files exist (should not error).
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act - should not raise an error when no files are found
     pyo3_catalog.convert_stream_to_data(
@@ -1485,12 +1550,12 @@ def test_convert_stream_to_data_no_files(catalog: ParquetDataCatalog):
     # (This is a valid use case - empty backtest/live runs)
 
 
-def test_convert_stream_to_data_default_subdirectory(catalog: ParquetDataCatalog):
+def test_convert_stream_to_data_default_subdirectory(catalog: LegacyParquetDataCatalog):
     """
     Test convert_stream_to_data with default subdirectory (backtest).
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act - should use "backtest" as default subdirectory
     pyo3_catalog.convert_stream_to_data(
@@ -1503,12 +1568,12 @@ def test_convert_stream_to_data_default_subdirectory(catalog: ParquetDataCatalog
     # (No files exist, but that's fine)
 
 
-def test_convert_stream_to_data_live_subdirectory(catalog: ParquetDataCatalog):
+def test_convert_stream_to_data_live_subdirectory(catalog: LegacyParquetDataCatalog):
     """
     Test convert_stream_to_data with live subdirectory.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act - should work with "live" subdirectory
     pyo3_catalog.convert_stream_to_data(
@@ -1521,12 +1586,12 @@ def test_convert_stream_to_data_live_subdirectory(catalog: ParquetDataCatalog):
     # (No files exist, but that's fine)
 
 
-def test_convert_stream_to_data_with_identifiers(catalog: ParquetDataCatalog):
+def test_convert_stream_to_data_with_identifiers(catalog: LegacyParquetDataCatalog):
     """
     Test convert_stream_to_data with identifier filtering.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act - should work with identifier filtering
     pyo3_catalog.convert_stream_to_data(
@@ -1540,12 +1605,12 @@ def test_convert_stream_to_data_with_identifiers(catalog: ParquetDataCatalog):
     # (No files exist, but that's fine)
 
 
-def test_convert_stream_to_data_with_ts_event_replacement(catalog: ParquetDataCatalog):
+def test_convert_stream_to_data_with_ts_event_replacement(catalog: LegacyParquetDataCatalog):
     """
     Test convert_stream_to_data with use_ts_event_for_ts_init option.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act - should work with use_ts_event_for_ts_init flag
     pyo3_catalog.convert_stream_to_data(
@@ -1559,12 +1624,12 @@ def test_convert_stream_to_data_with_ts_event_replacement(catalog: ParquetDataCa
     # (No files exist, but that's fine)
 
 
-def test_convert_stream_to_data_all_data_types(catalog: ParquetDataCatalog):
+def test_convert_stream_to_data_all_data_types(catalog: LegacyParquetDataCatalog):
     """
     Test convert_stream_to_data with all supported data types.
     """
     # Arrange
-    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
 
     # Act & Assert - should work with all data types
     data_types = [
@@ -1585,3 +1650,60 @@ def test_convert_stream_to_data_all_data_types(catalog: ParquetDataCatalog):
             subdirectory="backtest",
         )
         # Should complete without error for each type
+
+
+def test_convert_stream_to_data_writes_arrow_batches_without_deserializing(
+    catalog: LegacyParquetDataCatalog,
+) -> None:
+    # Arrange
+    pyo3_catalog = ParquetDataCatalog(catalog.path)
+    feather_dir = os.path.join(
+        catalog.path,
+        "backtest",
+        "test_instance_arrow_only",
+        "quotes",
+        "AUDUSD.SIM",
+    )
+    os.makedirs(feather_dir, exist_ok=True)
+
+    schema = pa.schema(
+        [
+            pa.field("ts_init", pa.uint64(), nullable=False),
+            pa.field("ts_event", pa.uint64(), nullable=False),
+            pa.field("payload", pa.string(), nullable=False),
+        ],
+        metadata={b"instrument_id": b"AUD/USD.SIM"},
+    )
+    batch = pa.record_batch(
+        [
+            pa.array([300, 100, 200], type=pa.uint64()),
+            pa.array([30, 10, 20], type=pa.uint64()),
+            pa.array(["c", "a", "b"], type=pa.string()),
+        ],
+        schema=schema,
+    )
+
+    feather_path = os.path.join(feather_dir, "AUDUSD.SIM_0.feather")
+    with (
+        open(feather_path, "wb") as feather_file,
+        pa.ipc.new_stream(feather_file, schema) as writer,
+    ):
+        writer.write_batch(batch)
+
+    # Act
+    pyo3_catalog.convert_stream_to_data(
+        "test_instance_arrow_only",
+        "quotes",
+        subdirectory="backtest",
+    )
+
+    # Assert
+    files = pyo3_catalog.query_files("quotes", ["AUD/USD.SIM"])
+    assert len(files) == 1
+
+    parquet_path = files[0] if os.path.isabs(files[0]) else os.path.join(catalog.path, files[0])
+    parquet_table = pq.read_table(parquet_path)
+    assert parquet_table.schema.metadata[b"instrument_id"] == b"AUD/USD.SIM"
+    assert parquet_table["ts_init"].to_pylist() == [100, 200, 300]
+    assert parquet_table["ts_event"].to_pylist() == [10, 20, 30]
+    assert parquet_table["payload"].to_pylist() == ["a", "b", "c"]

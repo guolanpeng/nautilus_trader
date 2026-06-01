@@ -30,6 +30,8 @@ pub enum BetfairHttpError {
     JsonError(String),
     /// Network-related error.
     NetworkError(String),
+    /// Invalid client configuration.
+    InvalidConfiguration(String),
     /// Request timeout.
     Timeout(String),
     /// Request canceled.
@@ -48,6 +50,7 @@ impl Display for BetfairHttpError {
             }
             Self::JsonError(msg) => write!(f, "JSON error: {msg}"),
             Self::NetworkError(msg) => write!(f, "Network error: {msg}"),
+            Self::InvalidConfiguration(msg) => write!(f, "Invalid configuration: {msg}"),
             Self::Timeout(msg) => write!(f, "Timeout: {msg}"),
             Self::Canceled(msg) => write!(f, "Canceled: {msg}"),
             Self::UnexpectedStatus { status, body } => {
@@ -81,6 +84,15 @@ impl BetfairHttpError {
             Self::BetfairError { code, .. } => is_retryable_error_code(*code),
             _ => false,
         }
+    }
+
+    /// Returns whether this is a login/auth rejection from the Identity API.
+    ///
+    /// `keep_alive` returns this when the session is expired or unrecognised.
+    /// Transient errors (network, timeout) return different variants.
+    #[must_use]
+    pub fn is_login_failed(&self) -> bool {
+        matches!(self, Self::LoginFailed { .. })
     }
 
     /// Returns whether this error is a session expiry that should trigger reconnection.
@@ -177,6 +189,12 @@ mod tests {
     }
 
     #[rstest]
+    fn test_display_invalid_configuration() {
+        let err = BetfairHttpError::InvalidConfiguration("bad rate".to_string());
+        assert_eq!(err.to_string(), "Invalid configuration: bad rate");
+    }
+
+    #[rstest]
     #[case(BetfairHttpError::NetworkError("timeout".to_string()), true)]
     #[case(BetfairHttpError::Timeout("read".to_string()), true)]
     #[case(BetfairHttpError::UnexpectedStatus { status: 500, body: String::new() }, true)]
@@ -227,6 +245,18 @@ mod tests {
     #[case(BetfairHttpError::UnexpectedStatus { status: 429, body: String::new() }, false)]
     fn test_is_session_error(#[case] error: BetfairHttpError, #[case] expected: bool) {
         assert_eq!(error.is_session_error(), expected);
+    }
+
+    #[rstest]
+    #[case(BetfairHttpError::LoginFailed { status: "NO_SESSION".to_string() }, true)]
+    #[case(BetfairHttpError::LoginFailed { status: "CERT_AUTH_REQUIRED".to_string() }, true)]
+    #[case(BetfairHttpError::NetworkError("timeout".to_string()), false)]
+    #[case(BetfairHttpError::Timeout("read".to_string()), false)]
+    #[case(BetfairHttpError::BetfairError { code: -32099, message: "server error".to_string() }, false)]
+    #[case(BetfairHttpError::JsonError("bad".to_string()), false)]
+    #[case(BetfairHttpError::MissingCredentials, false)]
+    fn test_is_login_failed(#[case] error: BetfairHttpError, #[case] expected: bool) {
+        assert_eq!(error.is_login_failed(), expected);
     }
 
     #[rstest]

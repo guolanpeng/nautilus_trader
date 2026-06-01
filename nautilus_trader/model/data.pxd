@@ -53,6 +53,7 @@ from nautilus_trader.model.objects cimport Quantity
 
 
 cpdef list capsule_to_list(capsule)
+cpdef list pyo3_list_to_data_list(list pyo3_items)
 cpdef Data capsule_to_data(capsule)
 
 cdef inline void capsule_destructor(object capsule):
@@ -541,6 +542,8 @@ cdef class FundingRateUpdate(Data):
     """The instrument ID for the funding rate.\n\n:returns: `InstrumentId`"""
     cdef readonly object rate
     """The current funding rate.\n\n:returns: `Decimal`"""
+    cdef readonly object interval
+    """Time interval (minutes) between funding payments.\n\n:returns: `int` or ``None``"""
     cdef readonly object next_funding_ns
     """UNIX timestamp (nanoseconds) of the next funding payment (if available, otherwise zero).\n\n:returns: `int` or ``None``"""
     cdef readonly uint64_t _ts_event
@@ -578,6 +581,8 @@ cdef class OptionGreeks(Data):
     """Underlying price.\n\n:returns: `float` or ``None``"""
     cdef readonly object open_interest
     """Open interest.\n\n:returns: `float` or ``None``"""
+    cdef readonly object convention
+    """Greeks convention (Black-Scholes or price-adjusted).\n\n:returns: `GreeksConvention`"""
     cdef readonly uint64_t ts_event
     """UNIX timestamp (nanoseconds) when the data event occurred.\n\n:returns: `uint64_t`"""
     cdef readonly uint64_t ts_init

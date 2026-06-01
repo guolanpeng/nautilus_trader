@@ -43,7 +43,7 @@ use crate::engine::{
     },
 };
 
-/// Extracts the block position tuple from a DexPoolData event.
+/// Extracts the block position tuple from a `DexPoolData` event.
 fn get_event_block_position(event: &DexPoolData) -> (u64, u32, u32) {
     match event {
         DexPoolData::Swap(s) => (s.block, s.transaction_index, s.log_index),
@@ -53,7 +53,7 @@ fn get_event_block_position(event: &DexPoolData) -> (u64, u32, u32) {
     }
 }
 
-/// Converts buffered DefiData events to DexPoolData and sorts by block position.
+/// Converts buffered `DefiData` events to `DexPoolData` and sorts by block position.
 fn convert_and_sort_buffered_events(buffered_events: Vec<DefiData>) -> Vec<DexPoolData> {
     let mut events: Vec<DexPoolData> = buffered_events
         .into_iter()
@@ -118,19 +118,19 @@ impl DataEngine {
     ///
     /// Returns an error if the subscription is invalid (e.g., synthetic instrument for book data),
     /// or if the underlying client operation fails.
-    pub fn execute_defi_subscribe(&mut self, cmd: &DefiSubscribeCommand) -> anyhow::Result<()> {
+    pub fn execute_defi_subscribe(&mut self, cmd: DefiSubscribeCommand) -> anyhow::Result<()> {
         if let Some(client_id) = cmd.client_id()
             && self.external_clients.contains(client_id)
         {
             if self.config.debug {
-                log::debug!("Skipping defi subscribe for external client {client_id}: {cmd:?}",);
+                log::debug!("Skipping defi subscribe for external client {client_id}: {cmd:?}");
             }
             return Ok(());
         }
 
         if let Some(client) = self.get_client(cmd.client_id(), cmd.venue()) {
             log::info!("Forwarding subscription to client {}", client.client_id);
-            client.execute_defi_subscribe(cmd);
+            client.execute_defi_subscribe(cmd.clone());
         } else {
             log::error!(
                 "Cannot handle command: no client found for client_id={:?}, venue={:?}",
@@ -171,7 +171,7 @@ impl DataEngine {
             && self.external_clients.contains(client_id)
         {
             if self.config.debug {
-                log::debug!("Skipping defi unsubscribe for external client {client_id}: {cmd:?}",);
+                log::debug!("Skipping defi unsubscribe for external client {client_id}: {cmd:?}");
             }
             return Ok(());
         }
@@ -219,6 +219,8 @@ impl DataEngine {
 
     /// Processes DeFi-specific data events.
     pub fn process_defi_data(&mut self, data: DefiData) {
+        self.increment_data_count();
+
         match data {
             DefiData::Block(block) => {
                 let topic = defi::switchboard::get_defi_blocks_topic(block.chain());
@@ -229,13 +231,24 @@ impl DataEngine {
                     log::error!("Failed to add Pool to cache: {e}");
                 }
 
-                // Check if pool profiler creation was deferred
-                if self.pool_updaters_pending.remove(&pool.instrument_id) {
-                    log::info!(
-                        "Pool {} now loaded, creating deferred pool profiler",
-                        pool.instrument_id
-                    );
-                    self.setup_pool_updater(&pool.instrument_id, None);
+                // Check if pool profiler creation was deferred. When a snapshot is also
+                // pending, leave the updater marker in place so a second subscription cannot
+                // race ahead and install a duplicate updater. The snapshot handler clears
+                // both flags and creates the updater once.
+                if self.pool_updaters_pending.contains(&pool.instrument_id) {
+                    if self.pool_snapshot_pending.contains(&pool.instrument_id) {
+                        log::debug!(
+                            "Pool {} loaded; deferring profiler creation to snapshot handler",
+                            pool.instrument_id
+                        );
+                    } else {
+                        self.pool_updaters_pending.remove(&pool.instrument_id);
+                        log::info!(
+                            "Pool {} now loaded, creating deferred pool profiler",
+                            pool.instrument_id
+                        );
+                        self.setup_pool_updater(&pool.instrument_id, None);
+                    }
                 }
 
                 let topic = defi::switchboard::get_defi_pool_topic(pool.instrument_id);
@@ -268,6 +281,24 @@ impl DataEngine {
                         return;
                     }
                 };
+
+                // Defensive: refuse stub snapshots that slipped past the bootstrap-side
+                // guards. Installing one would leave Python actors observing an initialized
+                // profiler with zero liquidity; better to leave the pool without a profiler
+                // so the bad state is visible.
+                if snapshot.positions.is_empty()
+                    && snapshot.ticks.is_empty()
+                    && snapshot.block_position.number == pool.creation_block
+                {
+                    log::warn!(
+                        "Refusing empty stub snapshot for {instrument_id} at pool creation block {}; pool will remain without profiler",
+                        snapshot.block_position.number,
+                    );
+                    self.pool_snapshot_pending.remove(&instrument_id);
+                    self.pool_updaters_pending.remove(&instrument_id);
+                    self.pool_event_buffers.remove(&instrument_id);
+                    return;
+                }
 
                 // Create profiler and restore from snapshot
                 let mut profiler = PoolProfiler::new(pool);
@@ -312,6 +343,7 @@ impl DataEngine {
 
                 // Create updater and subscribe to topics
                 self.pool_snapshot_pending.remove(&instrument_id);
+                self.pool_updaters_pending.remove(&instrument_id);
                 let updater = Rc::new(PoolUpdater::new(&instrument_id, self.cache.clone()));
 
                 self.subscribe_pool_updater_topics(instrument_id, updater.clone());
@@ -469,7 +501,11 @@ impl DataEngine {
                 let mut pool_profiler = PoolProfiler::new(pool.clone());
 
                 if let Some(initial_sqrt_price_x96) = pool.initial_sqrt_price_x96 {
-                    pool_profiler.initialize(initial_sqrt_price_x96);
+                    if let Err(e) = pool_profiler.initialize(initial_sqrt_price_x96) {
+                        log::error!("Failed to initialize pool profiler for {instrument_id}: {e}");
+                        drop(cache);
+                        return;
+                    }
                     log::debug!(
                         "Initialized pool profiler for {instrument_id} with sqrt_price {initial_sqrt_price_x96}"
                     );
@@ -525,6 +561,7 @@ mod tests {
     use std::sync::Arc;
 
     use alloy_primitives::{Address, I256, U160, U256};
+    use nautilus_core::UnixNanos;
     use nautilus_model::{
         defi::{
             Chain, DefiData, PoolFeeCollect, PoolFlash, PoolIdentifier, PoolLiquidityUpdate,
@@ -582,7 +619,8 @@ mod tests {
             format!("0x{block:064x}"),
             tx_index,
             log_index,
-            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
             Address::ZERO,
             Address::ZERO,
             I256::ZERO,
@@ -618,7 +656,8 @@ mod tests {
             U256::ZERO,
             0,
             0,
-            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
         )
     }
 
@@ -644,7 +683,8 @@ mod tests {
             0,
             0,
             0,
-            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
         )
     }
 
@@ -665,7 +705,8 @@ mod tests {
             format!("0x{block:064x}"),
             tx_index,
             log_index,
-            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
             Address::ZERO,
             Address::ZERO,
             U256::ZERO,

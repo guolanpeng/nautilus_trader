@@ -27,7 +27,9 @@ use crate::{
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OrderPendingCancel {
-    #[allow(clippy::too_many_arguments)]
+    /// Represents an event where a `CancelOrder` command has been sent to the
+    /// trading venue.
+    #[expect(clippy::too_many_arguments)]
     #[new]
     #[pyo3(signature = (trader_id, strategy_id, instrument_id, client_order_id, account_id, event_id, ts_event, ts_init, reconciliation, venue_order_id=None))]
     fn py_new(
@@ -135,7 +137,7 @@ impl OrderPendingCancel {
     #[getter]
     #[pyo3(name = "reconciliation")]
     fn py_reconciliation(&self) -> bool {
-        self.reconciliation != 0
+        self.reconciliation
     }
 
     #[pyo3(name = "to_dict")]
@@ -154,6 +156,11 @@ impl OrderPendingCancel {
         match self.venue_order_id {
             Some(venue_order_id) => dict.set_item("venue_order_id", venue_order_id.to_string())?,
             None => dict.set_item("venue_order_id", py.None())?,
+        }
+
+        match self.causation_id {
+            Some(causation_id) => dict.set_item("causation_id", causation_id.to_string())?,
+            None => dict.set_item("causation_id", py.None())?,
         }
         Ok(dict.into())
     }

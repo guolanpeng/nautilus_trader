@@ -20,12 +20,20 @@ use std::sync::LazyLock;
 use ahash::AHashSet;
 use nautilus_model::{
     enums::{OrderType, TimeInForce},
-    identifiers::Venue,
+    identifiers::{ClientId, Venue},
 };
 use ustr::Ustr;
 
+use super::enums::OKXInstrumentType;
+
+/// Venue identifier string.
 pub const OKX: &str = "OKX";
+
+/// Static venue instance.
 pub static OKX_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(Ustr::from(OKX)));
+
+/// Static client ID instance.
+pub static OKX_CLIENT_ID: LazyLock<ClientId> = LazyLock::new(|| ClientId::new(Ustr::from(OKX)));
 
 /// See <https://www.okx.com/docs-v5/en/#overview-broker-program> for further details.
 pub const OKX_NAUTILUS_BROKER_ID: &str = "5328c82e5542BCDE";
@@ -41,6 +49,56 @@ pub const OKX_WS_DEMO_PRIVATE_URL: &str = "wss://wspap.okx.com:8443/ws/v5/privat
 pub const OKX_WS_DEMO_BUSINESS_URL: &str = "wss://wspap.okx.com:8443/ws/v5/business";
 
 pub const OKX_WS_TOPIC_DELIMITER: char = ':';
+
+/// WebSocket heartbeat (ping/pong) interval in seconds.
+pub const OKX_WS_HEARTBEAT_SECS: u64 = 20;
+
+/// OKX success response code for WebSocket operations.
+pub const OKX_SUCCESS_CODE: &str = "0";
+
+/// JSON field key for sub-error code in order operation responses.
+pub const OKX_FIELD_SCODE: &str = "sCode";
+
+/// JSON field key for sub-error message in order operation responses.
+pub const OKX_FIELD_SMSG: &str = "sMsg";
+
+/// JSON field key for detailed sub-error code in order operation responses.
+pub const OKX_FIELD_SUBCODE: &str = "subCode";
+
+/// JSON field key for client order ID in order operation responses.
+pub const OKX_FIELD_CLORDID: &str = "clOrdId";
+
+/// Maximum length of a `clOrdId` accepted by OKX.
+///
+/// OKX requires `clOrdId` to be 1-32 case-sensitive alphanumeric characters.
+/// See <https://www.okx.com/docs-v5/en/#order-book-trading-trade>.
+pub const OKX_MAX_CLORDID_LEN: usize = 32;
+
+/// Validates a `clOrdId` against OKX's length and charset rules.
+///
+/// # Errors
+///
+/// Returns a human-readable reason when the ID exceeds
+/// [`OKX_MAX_CLORDID_LEN`] characters or contains non-alphanumeric characters
+/// (such as hyphens or underscores).
+pub fn validate_okx_client_order_id(cl_ord_id: &str) -> Result<(), String> {
+    let len = cl_ord_id.len();
+    if len > OKX_MAX_CLORDID_LEN {
+        return Err(format!(
+            "OKX requires clOrdId to be at most {OKX_MAX_CLORDID_LEN} characters, was {len} ({cl_ord_id:?}); \
+             set `use_uuid_client_order_ids=True` and `use_hyphens_in_client_order_ids=False` on the strategy config"
+        ));
+    }
+
+    if !cl_ord_id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "OKX requires clOrdId to be alphanumeric only, was {cl_ord_id:?}; \
+             set `use_hyphens_in_client_order_ids=False` on the strategy config"
+        ));
+    }
+
+    Ok(())
+}
 
 /// OKX supported order time in force.
 ///
@@ -88,7 +146,9 @@ pub const OKX_ADVANCE_ALGO_ORDER_TYPES: &[OrderType] = &[OrderType::TrailingStop
 
 /// OKX error codes that should trigger retries.
 ///
-/// Only retry on temporary network/system issues.
+/// Only retry on temporary network/system issues. `50004` ("request
+/// timeout, outcome unknown") is safe because every order/cancel/amend
+/// path sends `clOrdId` and OKX rejects duplicates with `51000`.
 ///
 /// # References
 ///
@@ -128,8 +188,102 @@ pub const OKX_POST_ONLY_CANCEL_SOURCE: &str = "31";
 /// Human-readable reason used when a post-only order is auto-cancelled for taking liquidity.
 pub const OKX_POST_ONLY_CANCEL_REASON: &str = "POST_ONLY would take liquidity";
 
+/// OKX error code returned when a market order's `slippagePct` would be exceeded by the
+/// projected fill, so the order is rejected.
+pub const OKX_SLIPPAGE_EXCEEDED_ERROR_CODE: &str = "54084";
+
+/// OKX error code returned when the supplied `slippagePct` value is outside the
+/// venue-permitted range.
+pub const OKX_SLIPPAGE_INVALID_ERROR_CODE: &str = "54085";
+
+/// Returns `true` if the OKX `sCode` identifies a slippage-related rejection emitted
+/// in response to the `slippagePct` parameter on market orders.
+#[must_use]
+pub fn is_slippage_rejection(error_code: &str) -> bool {
+    matches!(
+        error_code,
+        OKX_SLIPPAGE_EXCEEDED_ERROR_CODE | OKX_SLIPPAGE_INVALID_ERROR_CODE
+    )
+}
+
 /// Target currency literal for base currency.
 pub const OKX_TARGET_CCY_BASE: &str = "base_ccy";
 
 /// Target currency literal for quote currency.
 pub const OKX_TARGET_CCY_QUOTE: &str = "quote_ccy";
+
+/// Resolves instrument families for a given instrument type.
+///
+/// Returns `Some(families)` when the type supports family filtering, or `None`
+/// to skip the instrument type entirely (Option without configured families).
+/// An empty vec means no family filter is needed (Spot, Margin), or all
+/// discoverable families should be loaded (Events).
+pub fn resolve_instrument_families(
+    configured: &Option<Vec<String>>,
+    inst_type: OKXInstrumentType,
+) -> Option<Vec<String>> {
+    match (configured, inst_type) {
+        (Some(families), OKXInstrumentType::Option) => Some(families.clone()),
+        (
+            Some(families),
+            OKXInstrumentType::Futures | OKXInstrumentType::Swap | OKXInstrumentType::Events,
+        ) => Some(families.clone()),
+        (None, OKXInstrumentType::Option) => {
+            log::warn!("Skipping OPTION type: instrument_families required but not configured");
+            None
+        }
+        _ => Some(vec![]),
+    }
+}
+
+/// Clamps a requested book depth to the nearest OKX-supported value.
+///
+/// OKX WebSocket channels support depths of 50 and 400. Depth 0 means
+/// auto-select based on VIP level. Any other value rounds up to the nearest
+/// supported depth so the subscription succeeds and the data engine can
+/// truncate to the originally requested depth.
+pub fn resolve_book_depth(raw_depth: usize) -> usize {
+    match raw_depth {
+        0 | 400 => raw_depth,
+        1..=50 => 50,
+        _ => 400,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case("54084", true)]
+    #[case("54085", true)]
+    #[case("51019", false)]
+    #[case("", false)]
+    fn test_is_slippage_rejection(#[case] code: &str, #[case] expected: bool) {
+        assert_eq!(is_slippage_rejection(code), expected);
+    }
+
+    #[rstest]
+    #[case("O20260101000000ABC1", true)]
+    #[case("aB9", true)]
+    #[case("abcdefghij0123456789ABCDEFGHIJ12", true)] // exactly 32 chars
+    #[case("abcdefghij0123456789ABCDEFGHIJ123", false)] // 33 chars
+    #[case("O-20260101-000000-001-001-1", false)] // hyphens
+    #[case("O_20260101_000000", false)] // underscores
+    #[case("", true)] // empty: OKX rejects, but core ClientOrderId never produces empty
+    fn test_validate_okx_client_order_id(#[case] cl_ord_id: &str, #[case] expected_ok: bool) {
+        assert_eq!(validate_okx_client_order_id(cl_ord_id).is_ok(), expected_ok);
+    }
+
+    #[rstest]
+    fn test_validate_okx_client_order_id_length_message() {
+        // 35-char compact ID (the shape reported in the original bug report).
+        let cl_ord_id = "O20260522145501532392555aceLTCUSDT5";
+        let err = validate_okx_client_order_id(cl_ord_id).unwrap_err();
+        assert!(err.contains("at most 32"));
+        assert!(err.contains("was 35"));
+        assert!(err.contains("use_uuid_client_order_ids"));
+    }
+}

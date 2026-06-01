@@ -26,8 +26,9 @@ use nautilus_model::{
         option_chain::OptionGreeks,
     },
     enums::{
-        AggregationSource, AggressorSide, BarAggregation, BookAction, LiquiditySide, OrderSide,
-        OrderStatus, OrderType, PositionSideSpecified, PriceType, RecordFlag, TimeInForce,
+        AggregationSource, AggressorSide, BarAggregation, BookAction, GreeksConvention,
+        LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSideSpecified, PriceType,
+        RecordFlag, TimeInForce,
     },
     events::{OrderAccepted, OrderCanceled, OrderExpired, OrderUpdated},
     identifiers::{
@@ -47,20 +48,29 @@ use super::{
         DeribitTickerMsg, DeribitTradeMsg, DeribitUserTradeMsg,
     },
 };
-use crate::http::models::DeribitPosition;
+use crate::{common::parse::build_public_trade_id, http::models::DeribitPosition};
 
-fn next_8_utc(from_ns: UnixNanos) -> UnixNanos {
+fn next_8_utc(from_ns: UnixNanos) -> anyhow::Result<UnixNanos> {
     let from_secs = from_ns.as_u64() / 1_000_000_000;
-    let dt = Utc.timestamp_opt(from_secs as i64, 0).unwrap();
+    let dt = Utc
+        .timestamp_opt(from_secs as i64, 0)
+        .single()
+        .context("failed to convert timestamp to UTC datetime")?;
     let next_8 = if dt.hour() < 8 {
-        dt.date_naive().and_hms_opt(8, 0, 0).unwrap().and_utc()
+        dt.date_naive()
+            .and_hms_opt(8, 0, 0)
+            .context("failed to construct 08:00 UTC time")?
+            .and_utc()
     } else {
         (dt.date_naive() + Duration::days(1))
             .and_hms_opt(8, 0, 0)
-            .unwrap()
+            .context("failed to construct next-day 08:00 UTC time")?
             .and_utc()
     };
-    UnixNanos::from(next_8.timestamp_nanos_opt().unwrap() as u64)
+    let nanos = next_8
+        .timestamp_nanos_opt()
+        .context("GTD expiry timestamp out of nanosecond range")?;
+    Ok(UnixNanos::from(nanos as u64))
 }
 
 /// Parses a Deribit trade message into a Nautilus `TradeTick`.
@@ -86,7 +96,12 @@ pub fn parse_trade_msg(
         _ => AggressorSide::NoAggressor,
     };
 
-    let trade_id = TradeId::new(&msg.trade_id);
+    let trade_id = build_public_trade_id(
+        &msg.trade_id,
+        msg.block_rfq_id,
+        msg.block_trade_id.as_deref(),
+        msg.combo_id.as_deref(),
+    );
     let ts_event = UnixNanos::new(msg.timestamp * NANOSECONDS_IN_MILLISECOND);
 
     TradeTick::new_checked(
@@ -546,6 +561,7 @@ pub fn parse_ticker_to_funding_rate(
     Some(FundingRateUpdate::new(
         instrument_id,
         rate,
+        None, // Deribit exchanges funding every few seconds, instead of in set intervals like other exchanges
         None, // next_funding_ns not available in ticker
         ts_event,
         ts_init,
@@ -567,6 +583,7 @@ pub fn parse_ticker_to_option_greeks(
 
     Some(OptionGreeks {
         instrument_id,
+        convention: GreeksConvention::BlackScholes,
         greeks: deribit_greeks.to_greek_values(),
         mark_iv: msg.mark_iv.and_then(|v| v.to_f64()),
         bid_iv: msg.bid_iv.and_then(|v| v.to_f64()),
@@ -594,6 +611,7 @@ pub fn parse_perpetual_to_funding_rate(
     FundingRateUpdate::new(
         instrument_id,
         msg.interest,
+        None, // Deribit exchanges funding every few seconds, instead of in set intervals like other exchanges
         None, // next_funding_ns not available in perpetual channel
         ts_event,
         ts_init,
@@ -618,16 +636,17 @@ pub fn resolution_to_bar_type(
         "10" => (10, BarAggregation::Minute),
         "15" => (15, BarAggregation::Minute),
         "30" => (30, BarAggregation::Minute),
-        "60" => (60, BarAggregation::Minute),
-        "120" => (120, BarAggregation::Minute),
-        "180" => (180, BarAggregation::Minute),
-        "360" => (360, BarAggregation::Minute),
-        "720" => (720, BarAggregation::Minute),
+        "60" => (1, BarAggregation::Hour),
+        "120" => (2, BarAggregation::Hour),
+        "180" => (3, BarAggregation::Hour),
+        "360" => (6, BarAggregation::Hour),
+        "720" => (12, BarAggregation::Hour),
         "1D" => (1, BarAggregation::Day),
         _ => anyhow::bail!("Unsupported Deribit resolution: {resolution}"),
     };
 
-    let spec = BarSpecification::new(step, aggregation, PriceType::Last);
+    let spec = BarSpecification::new_checked(step, aggregation, PriceType::Last)
+        .context("invalid Deribit bar resolution")?;
     Ok(BarType::new(
         instrument_id,
         spec,
@@ -712,7 +731,10 @@ pub fn parse_user_order_msg(
         "stop_market" => OrderType::StopMarket,
         "take_limit" => OrderType::LimitIfTouched,
         "take_market" => OrderType::MarketIfTouched,
-        _ => OrderType::Limit, // Default to Limit for unknown types
+        other => {
+            log::warn!("Unknown Deribit order_type '{other}', defaulting to Limit");
+            OrderType::Limit
+        }
     };
 
     // Deribit supports: good_til_cancelled, good_til_day, fill_or_kill, immediate_or_cancel
@@ -740,7 +762,10 @@ pub fn parse_user_order_msg(
         "rejected" => OrderStatus::Rejected,
         "cancelled" => OrderStatus::Canceled,
         "untriggered" => OrderStatus::Accepted, // Pending trigger
-        _ => OrderStatus::Accepted,
+        other => {
+            log::warn!("Unknown Deribit order_state '{other}', defaulting to Accepted");
+            OrderStatus::Accepted
+        }
     };
 
     let price_precision = instrument.price_precision();
@@ -785,7 +810,7 @@ pub fn parse_user_order_msg(
     }
 
     if time_in_force == TimeInForce::Gtd {
-        let expire_time = next_8_utc(ts_accepted);
+        let expire_time = next_8_utc(ts_accepted)?;
         report = report.with_expire_time(expire_time);
     }
 
@@ -836,6 +861,27 @@ pub fn parse_user_trade_msg(
     let instrument_id = instrument.id();
     let venue_order_id = VenueOrderId::new(&msg.order_id);
     let trade_id = TradeId::new(&msg.trade_id);
+
+    // Deribit marks liquidation-triggered trades with "M" (maker liquidated),
+    // "T" (taker liquidated), or "MT" (both). Absent means a normal trade.
+    if let Some(liq) = msg.liquidation.as_deref().filter(|s| !s.is_empty()) {
+        let who = match liq {
+            "M" => "maker",
+            "T" => "taker",
+            "MT" => "both",
+            _ => liq,
+        };
+        log::warn!(
+            "Liquidation trade: {} trade_id={} order_id={} liquidation_side={} direction={} amount={} price={}",
+            instrument_id,
+            msg.trade_id,
+            msg.order_id,
+            who,
+            msg.direction,
+            msg.amount,
+            msg.price,
+        );
+    }
 
     let order_side = match msg.direction.as_str() {
         "buy" => OrderSide::Buy,
@@ -1099,7 +1145,8 @@ pub fn parse_order_updated(
         Some(account_id),
         price,
         trigger_price,
-        None, // protection_price
+        None,  // protection_price
+        false, // is_quote_quantity
     )
 }
 
@@ -1142,7 +1189,10 @@ pub fn determine_order_event_type(
             // Rejections are handled separately via OrderRejected
             OrderEventType::None
         }
-        _ => OrderEventType::None,
+        other => {
+            log::warn!("Unknown Deribit order_state '{other}' in event routing, dropping");
+            OrderEventType::None
+        }
     }
 }
 
@@ -1218,6 +1268,169 @@ mod tests {
         assert_eq!(tick.size, instrument.make_qty(750.0, None));
         assert_eq!(tick.aggressor_side, AggressorSide::Seller);
         assert_eq!(tick.trade_id.to_string(), "403691825");
+    }
+
+    fn make_trade_msg(
+        instrument_name: &str,
+        trade_id: &str,
+        block_trade_id: Option<&str>,
+        block_rfq_id: Option<i64>,
+        combo_id: Option<&str>,
+    ) -> DeribitTradeMsg {
+        let raw = serde_json::json!({
+            "trade_id": trade_id,
+            "instrument_name": instrument_name,
+            "price": 92294.5,
+            "amount": 10.0,
+            "direction": "buy",
+            "timestamp": 1_765_531_356_452_u64,
+            "trade_seq": 1,
+            "tick_direction": 0,
+            "index_price": 92276.75,
+            "mark_price": 92287.11,
+            "block_trade_id": block_trade_id,
+            "block_rfq_id": block_rfq_id,
+            "combo_id": combo_id,
+        });
+        serde_json::from_value(raw).unwrap()
+    }
+
+    #[rstest]
+    fn test_parse_trade_msg_tags_block_trade() {
+        let instrument = test_perpetual_instrument();
+        let msg = make_trade_msg("BTC-PERPETUAL", "244343055", Some("12345"), None, None);
+        let tick = parse_trade_msg(&msg, &instrument, UnixNanos::default()).unwrap();
+        assert_eq!(tick.trade_id.to_string(), "BLK-244343055");
+    }
+
+    #[rstest]
+    fn test_parse_trade_msg_tags_block_rfq() {
+        let instrument = test_perpetual_instrument();
+        let msg = make_trade_msg("BTC-PERPETUAL", "244343055", None, Some(99), None);
+        let tick = parse_trade_msg(&msg, &instrument, UnixNanos::default()).unwrap();
+        assert_eq!(tick.trade_id.to_string(), "RFQ-244343055");
+    }
+
+    #[rstest]
+    fn test_parse_trade_msg_tags_combo_leg() {
+        // Per-leg trade originating from a combo: combo_id is set by Deribit
+        // even though the instrument is a plain perp / option, so downstream
+        // sees `COMBO-` and can detect combo-origin fills.
+        let instrument = test_perpetual_instrument();
+        let msg = make_trade_msg(
+            "BTC-PERPETUAL",
+            "244343055",
+            None,
+            None,
+            Some("BTC-FS-25DEC26_PERP"),
+        );
+        let tick = parse_trade_msg(&msg, &instrument, UnixNanos::default()).unwrap();
+        assert_eq!(tick.trade_id.to_string(), "COMBO-244343055");
+    }
+
+    fn load_combo_option_instrument() -> InstrumentAny {
+        let combo_json = load_test_json("http_get_instruments_option_combo.json");
+        let combo_response: DeribitJsonRpcResponse<Vec<DeribitInstrument>> =
+            serde_json::from_str(&combo_json).unwrap();
+        let combo_raw = combo_response
+            .result
+            .unwrap()
+            .into_iter()
+            .find(|i| i.instrument_name.as_str() == "BTC-CS-19MAY26-70000_75000")
+            .expect("fixture must contain BTC-CS-19MAY26-70000_75000");
+        parse_deribit_instrument_any(&combo_raw, UnixNanos::default(), UnixNanos::default())
+            .unwrap()
+            .unwrap()
+    }
+
+    fn load_combo_trade_msgs() -> Vec<DeribitTradeMsg> {
+        let json = load_test_json("ws_trades_option_combo.json");
+        let response: serde_json::Value = serde_json::from_str(&json).unwrap();
+        serde_json::from_value(response["params"]["data"].clone()).unwrap()
+    }
+
+    #[rstest]
+    fn test_parse_trades_data_combo_emits_single_tick() {
+        // Step 1 finding: combo legs already publish on their own per-leg
+        // streams. Parsing a combo trade message should produce exactly one
+        // TradeTick (for the combo), not N+1.
+        let combo_inst = load_combo_option_instrument();
+        let mut cache: AHashMap<Ustr, InstrumentAny> = AHashMap::new();
+        cache.insert(Ustr::from("BTC-CS-19MAY26-70000_75000"), combo_inst.clone());
+
+        let trades = load_combo_trade_msgs();
+        // Sanity: the combo message itself carries the legs array.
+        let legs = trades[0].legs.as_ref().expect("combo trade must have legs");
+        assert_eq!(legs.len(), 2);
+
+        let data = parse_trades_data(&trades, &cache, UnixNanos::default());
+        assert_eq!(data.len(), 1, "should emit one tick for the combo only");
+
+        let Data::Trade(tick) = &data[0] else {
+            panic!("expected Data::Trade");
+        };
+        assert_eq!(tick.instrument_id, combo_inst.id());
+        // Exact values from fixture; independent of the instrument under test
+        // so a regression in price/size precision is caught here too.
+        assert_eq!(tick.price, Price::from("0.0639"));
+        assert_eq!(tick.size, Quantity::from("0.1"));
+        assert_eq!(tick.aggressor_side, AggressorSide::Seller);
+        assert_eq!(tick.trade_id.to_string(), "244365193");
+    }
+
+    #[rstest]
+    fn test_parse_trades_data_combo_not_cached_emits_no_tick() {
+        // When the combo InstrumentAny is not in the WS handler cache,
+        // parse_trades_data must drop the message rather than panic or
+        // synthesise a tick against an unknown instrument.
+        let cache: AHashMap<Ustr, InstrumentAny> = AHashMap::new();
+        let trades = load_combo_trade_msgs();
+        let data = parse_trades_data(&trades, &cache, UnixNanos::default());
+        assert!(data.is_empty(), "uncached combo must not emit ticks");
+    }
+
+    #[rstest]
+    fn test_parse_trades_data_mixed_combo_and_per_leg() {
+        // Combo trade and a plain per-leg trade on the underlying perpetual,
+        // both cached, must each produce a tick against their own instrument.
+        let combo_inst = load_combo_option_instrument();
+        let perp_inst = test_perpetual_instrument();
+
+        let mut cache: AHashMap<Ustr, InstrumentAny> = AHashMap::new();
+        cache.insert(Ustr::from("BTC-CS-19MAY26-70000_75000"), combo_inst.clone());
+        cache.insert(Ustr::from("BTC-PERPETUAL"), perp_inst.clone());
+
+        let mut trades = load_combo_trade_msgs();
+        let perp_msgs: Vec<DeribitTradeMsg> = {
+            let json = load_test_json("ws_trades.json");
+            let response: serde_json::Value = serde_json::from_str(&json).unwrap();
+            serde_json::from_value(response["params"]["data"].clone()).unwrap()
+        };
+        trades.extend(perp_msgs);
+
+        let data = parse_trades_data(&trades, &cache, UnixNanos::default());
+        // 1 combo + 2 plain BTC-PERPETUAL trades from the existing fixture.
+        assert_eq!(data.len(), 3);
+
+        let mut combo_ticks = 0;
+        let mut perp_ticks = 0;
+
+        for item in &data {
+            let Data::Trade(tick) = item else {
+                panic!("expected Data::Trade, was {item:?}");
+            };
+
+            if tick.instrument_id == combo_inst.id() {
+                combo_ticks += 1;
+                assert_eq!(tick.trade_id.to_string(), "244365193");
+            } else if tick.instrument_id == perp_inst.id() {
+                perp_ticks += 1;
+            } else {
+                panic!("unexpected instrument_id: {}", tick.instrument_id);
+            }
+        }
+        assert_eq!(combo_ticks, 1);
+        assert_eq!(perp_ticks, 2);
     }
 
     #[rstest]
@@ -1608,6 +1821,7 @@ mod tests {
             funding_rate.ts_event,
             UnixNanos::new(1_765_541_474_086_000_000)
         );
+        assert!(funding_rate.interval.is_none());
         assert!(funding_rate.next_funding_ns.is_none()); // Not available in ticker
     }
 
@@ -1629,8 +1843,8 @@ mod tests {
         let bar_type = resolution_to_bar_type(instrument_id, "60").unwrap();
 
         assert_eq!(bar_type.instrument_id(), instrument_id);
-        assert_eq!(bar_type.spec().step.get(), 60);
-        assert_eq!(bar_type.spec().aggregation, BarAggregation::Minute);
+        assert_eq!(bar_type.spec().step.get(), 1);
+        assert_eq!(bar_type.spec().aggregation, BarAggregation::Hour);
     }
 
     #[rstest]
@@ -1879,6 +2093,68 @@ mod tests {
         );
         assert_eq!(canceled.trader_id, trader_id);
         assert_eq!(canceled.strategy_id, strategy_id);
+    }
+
+    #[rstest]
+    fn test_parse_order_stop_market_response() {
+        // Regression for https://github.com/nautechsystems/nautilus_trader/issues/3925
+        // Deribit returns the literal string "market_price" for the price of
+        // trigger market orders; the deserializer must map this to None rather
+        // than failing with "Invalid decimal: unknown character".
+        let instrument = test_perpetual_instrument();
+        let json = load_test_json("ws_order_stop_market_response.json");
+        let response: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let order_msg: DeribitOrderMsg =
+            serde_json::from_value(response["result"]["order"].clone()).unwrap();
+
+        assert_eq!(order_msg.order_id, "USDC-104819327499");
+        assert_eq!(order_msg.order_type, "stop_market");
+        assert_eq!(order_msg.order_state, "untriggered");
+        assert_eq!(order_msg.price, None);
+        assert_eq!(order_msg.trigger_price, Some(dec!(2228.0)));
+        assert_eq!(order_msg.trigger.as_deref(), Some("mark_price"));
+        assert!(order_msg.reduce_only);
+
+        let account_id = AccountId::new("DERIBIT-001");
+        let report =
+            parse_user_order_msg(&order_msg, &instrument, account_id, UnixNanos::default())
+                .unwrap();
+
+        assert_eq!(report.order_type, OrderType::StopMarket);
+        assert_eq!(report.order_status, OrderStatus::Accepted);
+        assert!(report.price.is_none());
+        assert!(report.trigger_price.is_some());
+        assert!(report.reduce_only);
+    }
+
+    #[rstest]
+    fn test_parse_order_stop_market_response_missing_filled_amount() {
+        // Regression for https://github.com/nautechsystems/nautilus_trader/issues/3995
+        // Deribit omits `filled_amount` for untriggered trigger market orders;
+        // the deserializer must treat the missing field as zero rather than
+        // failing with "missing field `filled_amount`".
+        let instrument = test_perpetual_instrument();
+        let json = load_test_json("ws_order_stop_market_no_filled_amount.json");
+        let response: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let order_msg: DeribitOrderMsg =
+            serde_json::from_value(response["result"]["order"].clone()).unwrap();
+
+        assert_eq!(order_msg.order_id, "USDC-SLMB-19641");
+        assert_eq!(order_msg.order_type, "stop_market");
+        assert_eq!(order_msg.order_state, "untriggered");
+        assert_eq!(order_msg.filled_amount, rust_decimal::Decimal::ZERO);
+        assert_eq!(order_msg.average_price, None);
+
+        let account_id = AccountId::new("DERIBIT-001");
+        let report =
+            parse_user_order_msg(&order_msg, &instrument, account_id, UnixNanos::default())
+                .unwrap();
+
+        assert_eq!(report.order_type, OrderType::StopMarket);
+        assert_eq!(report.order_status, OrderStatus::Accepted);
+        assert_eq!(report.filled_qty.as_f64(), 0.0);
     }
 
     #[rstest]

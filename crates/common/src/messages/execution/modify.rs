@@ -38,11 +38,16 @@ pub struct ModifyOrder {
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
     pub params: Option<Params>,
+    #[builder(default)]
+    pub correlation_id: Option<UUID4>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl ModifyOrder {
     /// Creates a new [`ModifyOrder`] instance.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         trader_id: TraderId,
@@ -57,6 +62,7 @@ impl ModifyOrder {
         command_id: UUID4,
         ts_init: UnixNanos,
         params: Option<Params>,
+        correlation_id: Option<UUID4>,
     ) -> Self {
         Self {
             trader_id,
@@ -71,6 +77,8 @@ impl ModifyOrder {
             command_id,
             ts_init,
             params,
+            correlation_id,
+            causation_id: None,
         }
     }
 }

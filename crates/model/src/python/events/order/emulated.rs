@@ -27,7 +27,7 @@ use crate::{
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OrderEmulated {
-    #[allow(clippy::too_many_arguments)]
+    /// Represents an event where an order has become emulated by the Nautilus system.
     #[new]
     fn py_new(
         trader_id: TraderId,
@@ -124,6 +124,10 @@ impl OrderEmulated {
         dict.set_item("event_id", self.event_id.to_string())?;
         dict.set_item("ts_event", self.ts_event.as_u64())?;
         dict.set_item("ts_init", self.ts_init.as_u64())?;
+        match self.causation_id {
+            Some(causation_id) => dict.set_item("causation_id", causation_id.to_string())?,
+            None => dict.set_item("causation_id", py.None())?,
+        }
         Ok(dict.into())
     }
 }

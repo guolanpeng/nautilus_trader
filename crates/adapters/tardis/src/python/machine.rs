@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use ahash::AHashMap;
 use futures_util::{Stream, StreamExt, pin_mut};
@@ -42,37 +42,45 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl ReplayNormalizedRequestOptions {
     #[staticmethod]
     #[pyo3(name = "from_json")]
-    fn py_from_json(data: &[u8]) -> Self {
+    fn py_from_json(#[gen_stub(override_type(type_repr = "bytes"))] data: &[u8]) -> Self {
         serde_json::from_slice(data).expect("Failed to parse JSON")
     }
 
     #[pyo3(name = "from_json_array")]
     #[staticmethod]
-    fn py_from_json_array(data: &[u8]) -> Vec<Self> {
+    fn py_from_json_array(
+        #[gen_stub(override_type(type_repr = "bytes"))] data: &[u8],
+    ) -> Vec<Self> {
         serde_json::from_slice(data).expect("Failed to parse JSON array")
     }
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl StreamNormalizedRequestOptions {
     #[staticmethod]
     #[pyo3(name = "from_json")]
-    fn py_from_json(data: &[u8]) -> Self {
+    fn py_from_json(#[gen_stub(override_type(type_repr = "bytes"))] data: &[u8]) -> Self {
         serde_json::from_slice(data).expect("Failed to parse JSON")
     }
 
     #[pyo3(name = "from_json_array")]
     #[staticmethod]
-    fn py_from_json_array(data: &[u8]) -> Vec<Self> {
+    fn py_from_json_array(
+        #[gen_stub(override_type(type_repr = "bytes"))] data: &[u8],
+    ) -> Vec<Self> {
         serde_json::from_slice(data).expect("Failed to parse JSON array")
     }
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl TardisMachineClient {
+    /// Provides a client for connecting to a [Tardis Machine Server](https://docs.tardis.dev/api/tardis-machine).
     #[new]
     #[pyo3(signature = (base_url=None, normalize_symbols=true, book_snapshot_output="deltas"))]
     fn py_new(
@@ -92,6 +100,10 @@ impl TardisMachineClient {
         Self::new(base_url, normalize_symbols, output).map_err(to_pyruntime_err)
     }
 
+    /// Returns `true` if `close()` has been called.
+    ///
+    /// This checks that both replay and stream signals have been set,
+    /// which only occurs when `close()` is explicitly called.
     #[pyo3(name = "is_closed")]
     #[must_use]
     pub fn py_is_closed(&self) -> bool {
@@ -103,6 +115,7 @@ impl TardisMachineClient {
         self.close();
     }
 
+    /// Connects to the Tardis Machine replay WebSocket and yields parsed `Data` items.
     #[pyo3(name = "replay")]
     fn py_replay<'py>(
         &self,
@@ -114,8 +127,9 @@ impl TardisMachineClient {
         let map = if instruments.is_empty() {
             self.instruments.clone()
         } else {
-            let mut instrument_map: HashMap<TardisInstrumentKey, Arc<TardisInstrumentMiniInfo>> =
-                HashMap::new();
+            let mut instrument_map: AHashMap<TardisInstrumentKey, Arc<TardisInstrumentMiniInfo>> =
+                AHashMap::new();
+
             for inst in instruments {
                 let key = inst.as_tardis_instrument_key();
                 instrument_map.insert(key, Arc::new(inst.clone()));
@@ -204,6 +218,7 @@ impl TardisMachineClient {
         })
     }
 
+    /// Connects to the Tardis Machine stream WebSocket for a single instrument and yields parsed `Data` items.
     #[pyo3(name = "stream")]
     fn py_stream<'py>(
         &self,
@@ -212,8 +227,9 @@ impl TardisMachineClient {
         callback: Py<PyAny>,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mut instrument_map: HashMap<TardisInstrumentKey, Arc<TardisInstrumentMiniInfo>> =
-            HashMap::new();
+        let mut instrument_map: AHashMap<TardisInstrumentKey, Arc<TardisInstrumentMiniInfo>> =
+            AHashMap::new();
+
         for inst in instruments {
             let key = inst.as_tardis_instrument_key();
             instrument_map.insert(key, Arc::new(inst.clone()));
@@ -249,6 +265,7 @@ impl TardisMachineClient {
 ///
 /// Returns a `PyErr` if reading the config file or replay execution fails.
 #[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.tardis")]
 #[pyo3(name = "run_tardis_machine_replay")]
 #[pyo3(signature = (config_filepath))]
 pub fn py_run_tardis_machine_replay(
@@ -270,7 +287,7 @@ async fn handle_python_stream<S>(
     stream: S,
     callback: Py<PyAny>,
     instrument: Option<Arc<TardisInstrumentMiniInfo>>,
-    instrument_map: Option<HashMap<TardisInstrumentKey, Arc<TardisInstrumentMiniInfo>>>,
+    instrument_map: Option<AHashMap<TardisInstrumentKey, Arc<TardisInstrumentMiniInfo>>>,
     book_snapshot_output: BookSnapshotOutput,
 ) where
     S: Stream<Item = Result<WsMessage, Error>> + Unpin,

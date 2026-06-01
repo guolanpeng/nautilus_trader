@@ -15,7 +15,6 @@
 
 //! Python bindings for [`Params`] type conversion.
 
-use indexmap::IndexMap;
 use pyo3::{
     conversion::IntoPyObjectExt,
     prelude::*,
@@ -23,7 +22,10 @@ use pyo3::{
 };
 use serde_json::Value;
 
-use crate::{params::Params, python::to_pyvalue_err};
+use crate::{
+    params::Params,
+    python::{serialization::from_pyobject_pyo3, to_pyvalue_err},
+};
 
 /// Converts a Python dict to `Params` (IndexMap<String, Value>).
 ///
@@ -32,33 +34,23 @@ use crate::{params::Params, python::to_pyvalue_err};
 /// Returns a `PyErr` if:
 /// - the dict cannot be serialized to JSON
 /// - the JSON is not a valid object
-pub fn pydict_to_params(py: Python<'_>, dict: Py<PyDict>) -> PyResult<Option<Params>> {
+pub fn pydict_to_params(py: Python<'_>, dict: &Py<PyDict>) -> PyResult<Option<Params>> {
     let dict_bound = dict.bind(py);
     if dict_bound.is_empty() {
         return Ok(None);
     }
 
-    let json_str: String = PyModule::import(py, "json")?
-        .call_method("dumps", (dict,), None)?
-        .extract()?;
-    let json_value: Value = serde_json::from_str(&json_str).map_err(to_pyvalue_err)?;
-
-    if let Value::Object(map) = json_value {
-        Ok(Some(Params::from_index_map(
-            map.into_iter().collect::<IndexMap<String, Value>>(),
-        )))
-    } else {
-        Err(to_pyvalue_err("Expected a dictionary"))
-    }
+    from_pyobject_pyo3(py, dict_bound.as_any()).map(Some)
 }
 
-/// Helper function to convert a `serde_json::Value` to a Python object.
+/// Converts a `serde_json::Value` to a Python object.
 ///
 /// This is a common conversion pattern used when converting `Params` to Python dicts.
 ///
 /// # Errors
 ///
-/// Returns a `PyErr` if the value type is unsupported or conversion fails.
+/// Returns a `PyErr` if the value type is unsupported, numeric extraction fails,
+/// or conversion fails.
 pub fn value_to_pyobject(py: Python<'_>, val: &Value) -> PyResult<Py<PyAny>> {
     match val {
         Value::Null => Ok(py.None()),
@@ -66,18 +58,23 @@ pub fn value_to_pyobject(py: Python<'_>, val: &Value) -> PyResult<Py<PyAny>> {
         Value::String(s) => s.into_py_any(py),
         Value::Number(n) => {
             if n.is_i64() {
-                n.as_i64().unwrap().into_py_any(py)
+                n.as_i64()
+                    .ok_or_else(|| to_pyvalue_err("JSON number could not be read as i64"))?
+                    .into_py_any(py)
             } else if n.is_u64() {
-                n.as_u64().unwrap().into_py_any(py)
+                n.as_u64()
+                    .ok_or_else(|| to_pyvalue_err("JSON number could not be read as u64"))?
+                    .into_py_any(py)
             } else if n.is_f64() {
-                n.as_f64().unwrap().into_py_any(py)
+                n.as_f64()
+                    .ok_or_else(|| to_pyvalue_err("JSON number could not be read as f64"))?
+                    .into_py_any(py)
             } else {
                 Err(to_pyvalue_err("Unsupported JSON number type"))
             }
         }
         Value::Array(arr) => {
-            let py_list =
-                PyList::new(py, &[] as &[Py<PyAny>]).expect("Invalid `ExactSizeIterator`");
+            let py_list = PyList::new(py, &[] as &[Py<PyAny>])?;
             for item in arr {
                 let py_item = value_to_pyobject(py, item)?;
                 py_list.append(py_item)?;
@@ -107,4 +104,46 @@ pub fn params_to_pydict(py: Python<'_>, params: &Params) -> PyResult<Py<PyDict>>
         dict.set_item(key, py_value)?;
     }
     Ok(dict.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use serde_json::json;
+
+    use super::*;
+
+    #[derive(Debug, Clone, Copy)]
+    enum ExpectedNumber {
+        I64(i64),
+        U64(u64),
+        F64(f64),
+    }
+
+    #[rstest]
+    #[case(json!(-100_i64), ExpectedNumber::I64(-100))]
+    #[case(json!(42_u64), ExpectedNumber::U64(42))]
+    #[case(json!(2.5_f64), ExpectedNumber::F64(2.5))]
+    fn test_value_to_pyobject_number_branches(
+        #[case] value: Value,
+        #[case] expected: ExpectedNumber,
+    ) {
+        Python::initialize();
+        Python::attach(|py| {
+            let py_obj = value_to_pyobject(py, &value).unwrap();
+
+            match expected {
+                ExpectedNumber::I64(expected) => {
+                    assert_eq!(py_obj.extract::<i64>(py).unwrap(), expected);
+                }
+                ExpectedNumber::U64(expected) => {
+                    assert_eq!(py_obj.extract::<u64>(py).unwrap(), expected);
+                }
+                ExpectedNumber::F64(expected) => {
+                    let actual = py_obj.extract::<f64>(py).unwrap();
+                    assert!((actual - expected).abs() < f64::EPSILON);
+                }
+            }
+        });
+    }
 }

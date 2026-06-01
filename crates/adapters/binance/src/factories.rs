@@ -18,16 +18,16 @@
 use std::{cell::RefCell, rc::Rc};
 
 use nautilus_common::{
-    cache::Cache,
+    cache::CacheView,
     clients::{DataClient, ExecutionClient},
     clock::Clock,
+    factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
 };
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     enums::{AccountType, OmsType},
     identifiers::ClientId,
 };
-use nautilus_system::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 
 use crate::{
     common::{
@@ -44,6 +44,10 @@ use crate::{
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.binance")
 )]
 pub struct BinanceDataClientFactory;
 
@@ -66,7 +70,7 @@ impl DataClientFactory for BinanceDataClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        _cache: Rc<RefCell<Cache>>,
+        _cache: CacheView,
         _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn DataClient>> {
         let binance_config = config
@@ -118,6 +122,10 @@ impl DataClientFactory for BinanceDataClientFactory {
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.binance")
+)]
 pub struct BinanceExecutionClientFactory;
 
 impl BinanceExecutionClientFactory {
@@ -139,7 +147,7 @@ impl ExecutionClientFactory for BinanceExecutionClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        cache: Rc<RefCell<Cache>>,
+        cache: CacheView,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let binance_config = config
             .as_any()
@@ -215,7 +223,7 @@ impl ExecutionClientFactory for BinanceExecutionClientFactory {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_system::factories::DataClientFactory;
+    use nautilus_common::factories::DataClientFactory;
     use rstest::rstest;
 
     use super::*;
@@ -223,13 +231,13 @@ mod tests {
     #[rstest]
     fn test_binance_data_client_factory_creation() {
         let factory = BinanceDataClientFactory::new();
-        assert_eq!(factory.name(), "BINANCE");
+        assert_eq!(factory.name(), BINANCE);
         assert_eq!(factory.config_type(), "BinanceDataClientConfig");
     }
 
     #[rstest]
     fn test_binance_data_client_factory_default() {
         let factory = BinanceDataClientFactory;
-        assert_eq!(factory.name(), "BINANCE");
+        assert_eq!(factory.name(), BINANCE);
     }
 }

@@ -40,6 +40,7 @@ use crate::{
 ///
 /// Returns a `PyErr` if the class name is not recognized.
 #[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.databento")]
 pub fn get_databento_arrow_schema_map(
     py: Python<'_>,
     cls: &Bound<'_, PyType>,
@@ -64,7 +65,7 @@ pub fn get_databento_arrow_schema_map(
 ///
 /// Returns a `PyErr` if encoding fails.
 #[pyfunction(name = "databento_imbalance_to_arrow_record_batch_bytes")]
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 pub fn py_databento_imbalance_to_arrow_record_batch_bytes(
     py: Python,
     data: Vec<DatabentoImbalance>,
@@ -89,6 +90,7 @@ pub fn py_databento_imbalance_from_arrow_record_batch_bytes(
     let reader = StreamReader::try_new(cursor, None).map_err(to_pyruntime_err)?;
 
     let mut results = Vec::new();
+
     for batch_result in reader {
         let batch = batch_result.map_err(to_pyruntime_err)?;
         let metadata = batch.schema().metadata().clone();
@@ -105,7 +107,7 @@ pub fn py_databento_imbalance_from_arrow_record_batch_bytes(
 ///
 /// Returns a `PyErr` if encoding fails.
 #[pyfunction(name = "databento_statistics_to_arrow_record_batch_bytes")]
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 pub fn py_databento_statistics_to_arrow_record_batch_bytes(
     py: Python,
     data: Vec<DatabentoStatistics>,
@@ -130,6 +132,7 @@ pub fn py_databento_statistics_from_arrow_record_batch_bytes(
     let reader = StreamReader::try_new(cursor, None).map_err(to_pyruntime_err)?;
 
     let mut results = Vec::new();
+
     for batch_result in reader {
         let batch = batch_result.map_err(to_pyruntime_err)?;
         let metadata = batch.schema().metadata().clone();

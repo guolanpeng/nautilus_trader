@@ -14,6 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use alloy_primitives::{U160, U256};
+use nautilus_core::UnixNanos;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -50,10 +51,18 @@ pub struct PoolSnapshot {
     pub analytics: PoolAnalytics,
     /// Block position where this snapshot was taken.
     pub block_position: BlockPosition,
+    /// UNIX timestamp (nanoseconds) when the snapshot event occurred.
+    #[serde(default)]
+    pub ts_event: UnixNanos,
+    /// UNIX timestamp (nanoseconds) when the instance was created.
+    #[serde(default)]
+    pub ts_init: UnixNanos,
 }
 
 impl PoolSnapshot {
     /// Creates a new `PoolSnapshot` with the specified parameters.
+    #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         instrument_id: InstrumentId,
         state: PoolState,
@@ -61,6 +70,8 @@ impl PoolSnapshot {
         ticks: Vec<PoolTick>,
         analytics: PoolAnalytics,
         block_position: BlockPosition,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
     ) -> Self {
         Self {
             instrument_id,
@@ -69,6 +80,8 @@ impl PoolSnapshot {
             ticks,
             analytics,
             block_position,
+            ts_event,
+            ts_init,
         }
     }
 }
@@ -108,6 +121,7 @@ pub struct PoolState {
 
 impl PoolState {
     /// Creates a new `PoolState` with the specified parameters.
+    #[must_use]
     pub fn new(protocol_fees_token0: U256, protocol_fees_token1: U256, fee_protocol: u8) -> Self {
         Self {
             current_tick: 0,

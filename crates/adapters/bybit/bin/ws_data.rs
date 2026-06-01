@@ -23,6 +23,7 @@ use nautilus_bybit::{
     common::enums::{BybitEnvironment, BybitProductType},
     websocket::{client::BybitWebSocketClient, messages::BybitWsMessage},
 };
+use nautilus_network::websocket::TransportBackend;
 use tokio::{pin, signal};
 
 #[tokio::main]
@@ -33,6 +34,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         BybitProductType::Linear,
         BybitEnvironment::Mainnet,
         None,
+        20,
+        TransportBackend::default(),
         None,
     );
     client.connect().await?;

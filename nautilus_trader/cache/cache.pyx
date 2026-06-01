@@ -49,6 +49,7 @@ from nautilus_trader.model.data cimport BarSpecification
 from nautilus_trader.model.data cimport BarType
 from nautilus_trader.model.data cimport FundingRateUpdate
 from nautilus_trader.model.data cimport IndexPriceUpdate
+from nautilus_trader.model.data cimport InstrumentStatus
 from nautilus_trader.model.data cimport MarkPriceUpdate
 from nautilus_trader.model.data cimport QuoteTick
 from nautilus_trader.model.data cimport TradeTick
@@ -130,6 +131,7 @@ cdef class Cache(CacheFacade):
         self._mark_prices: dict[InstrumentId, deque[MarkPriceUpdate]] = {}
         self._index_prices: dict[InstrumentId, deque[IndexPriceUpdate]] = {}
         self._funding_rates: dict[InstrumentId, deque[FundingRateUpdate]] = {}
+        self._instrument_statuses: dict[InstrumentId, deque[InstrumentStatus]] = {}
         self._bars: dict[BarType, deque[Bar]] = {}
         self._bars_bid: dict[InstrumentId, Bar] = {}
         self._bars_ask: dict[InstrumentId, Bar] = {}
@@ -951,9 +953,13 @@ cdef class Cache(CacheFacade):
         else:
             # Safe to purge
             self._orders.pop(client_order_id, None)
-            self._index_venue_orders[order.instrument_id.venue].discard(client_order_id)
+            venue_orders = self._index_venue_orders.get(order.instrument_id.venue)
+            if venue_orders is not None:
+                venue_orders.discard(client_order_id)
             self._index_venue_order_ids.pop(order.venue_order_id, None)
-            self._index_instrument_orders[order.instrument_id].discard(client_order_id)
+            instrument_orders = self._index_instrument_orders.get(order.instrument_id)
+            if instrument_orders is not None:
+                instrument_orders.discard(client_order_id)
 
             if order.account_id is not None:
                 account_orders = self._index_account_orders.get(order.account_id)
@@ -963,10 +969,18 @@ cdef class Cache(CacheFacade):
                         self._index_account_orders.pop(order.account_id, None)
 
             if order.position_id is not None:
-                self._index_position_orders[order.position_id].discard(client_order_id)
+                position_orders = self._index_position_orders.get(order.position_id)
+                if position_orders is not None:
+                    position_orders.discard(client_order_id)
+                    if not position_orders:
+                        self._index_position_orders.pop(order.position_id, None)
 
             if order.exec_algorithm_id is not None:
-                self._index_exec_algorithm_orders[order.exec_algorithm_id].discard(client_order_id)
+                exec_algo_orders = self._index_exec_algorithm_orders.get(order.exec_algorithm_id)
+                if exec_algo_orders is not None:
+                    exec_algo_orders.discard(client_order_id)
+                    if not exec_algo_orders:
+                        self._index_exec_algorithm_orders.pop(order.exec_algorithm_id, None)
 
             # Clean up strategy orders reverse index
             strategy_orders = self._index_strategy_orders.get(order.strategy_id)
@@ -1040,10 +1054,24 @@ cdef class Cache(CacheFacade):
         else:
             # Safe to purge
             self._positions.pop(position_id, None)
-            self._index_venue_positions[position.instrument_id.venue].discard(position_id)
-            self._index_instrument_positions[position.instrument_id].discard(position_id)
-            self._index_strategy_positions[position.strategy_id].discard(position_id)
-            self._index_account_positions[position.account_id].discard(position_id)
+
+            venue_positions = self._index_venue_positions.get(position.instrument_id.venue)
+            if venue_positions is not None:
+                venue_positions.discard(position_id)
+
+            instrument_positions = self._index_instrument_positions.get(position.instrument_id)
+            if instrument_positions is not None:
+                instrument_positions.discard(position_id)
+
+            strategy_positions = self._index_strategy_positions.get(position.strategy_id)
+            if strategy_positions is not None:
+                strategy_positions.discard(position_id)
+
+            account_positions = self._index_account_positions.get(position.account_id)
+            if account_positions is not None:
+                account_positions.discard(position_id)
+                if not account_positions:
+                    self._index_account_positions.pop(position.account_id, None)
 
             for client_order_id in position.client_order_ids_c():
                 self._index_order_position.pop(client_order_id, None)
@@ -1072,6 +1100,97 @@ cdef class Cache(CacheFacade):
         # Delete from database if requested
         if purge_from_database and self._database is not None:
             self._database.delete_position(position_id)
+
+    cpdef void purge_instrument(self, InstrumentId instrument_id, bint purge_from_database = False):
+        """
+        Purge the instrument for the given instrument ID from the cache (if found).
+
+        All cache-owned data keyed by the instrument is removed: the instrument record,
+        any synthetic with the same id, order book and own-order-book state,
+        quote/trade histories, mark/index/funding price histories, instrument status,
+        bars for any ``BarType`` referencing the instrument, and the
+        ``_index_instrument_orders`` / ``_index_instrument_positions`` index entries.
+
+        For safety, an instrument is prevented from being purged while any associated
+        order is non-terminal (anything not in `_index_orders_closed`, including
+        initialized, submitted, accepted, emulated, released, or inflight states) or
+        any associated position is non-closed.
+
+        Active subscriptions and other live data-engine state are not touched here;
+        those belong to the data and execution engines.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument ID to purge.
+        purge_from_database : bool, default False
+            Reserved for future use. Currently a no-op because the cache database
+            adapter does not yet expose a delete-instrument method. The parameter is
+            kept for API symmetry with `purge_order` and `purge_position`.
+
+        Warnings
+        --------
+        Intended for actors and strategies that have their own lifecycle logic for
+        deciding when an instrument is no longer needed. Purging an instrument that any
+        other actor, strategy, or engine still relies on may cause incorrect behavior
+        (missing instrument lookups, lost market-data history). The caller is
+        responsible for ensuring the instrument is no longer in use before purging.
+
+        """
+        Condition.not_none(instrument_id, "instrument_id")
+
+        if instrument_id not in self._instruments and instrument_id not in self._synthetics:
+            self._log.warning(f"Instrument {instrument_id} not found when purging")
+            return
+
+        cdef set client_order_ids = self._index_instrument_orders.get(instrument_id)
+        cdef ClientOrderId client_order_id
+        if client_order_ids is not None:
+            for client_order_id in client_order_ids:
+                if client_order_id not in self._index_orders_closed:
+                    self._log.warning(
+                        f"Instrument {instrument_id} has non-terminal orders when purging, skipping purge",
+                    )
+                    return
+
+        cdef set position_ids = self._index_instrument_positions.get(instrument_id)
+        cdef PositionId position_id
+        if position_ids is not None:
+            for position_id in position_ids:
+                if position_id not in self._index_positions_closed:
+                    self._log.warning(
+                        f"Instrument {instrument_id} has non-closed positions when purging, skipping purge",
+                    )
+                    return
+
+        self._instruments.pop(instrument_id, None)
+        self._synthetics.pop(instrument_id, None)
+        self._order_books.pop(instrument_id, None)
+        self._own_order_books.pop(instrument_id, None)
+        self._quote_ticks.pop(instrument_id, None)
+        self._trade_ticks.pop(instrument_id, None)
+        self._xrate_symbols.pop(instrument_id, None)
+        self._mark_prices.pop(instrument_id, None)
+        self._index_prices.pop(instrument_id, None)
+        self._funding_rates.pop(instrument_id, None)
+        self._instrument_statuses.pop(instrument_id, None)
+        self._bars_bid.pop(instrument_id, None)
+        self._bars_ask.pop(instrument_id, None)
+        self._greeks.pop(instrument_id, None)
+
+        cdef BarType bar_type
+        cdef list stale_bar_types = [
+            bar_type for bar_type in self._bars
+            if bar_type.instrument_id == instrument_id
+        ]
+        for bar_type in stale_bar_types:
+            self._bars.pop(bar_type, None)
+
+        self._index_instrument_orders.pop(instrument_id, None)
+        self._index_instrument_positions.pop(instrument_id, None)
+        self._index_instrument_position_snapshots.pop(instrument_id, None)
+
+        self._log.info(f"Purged instrument {instrument_id}", LogColor.BLUE)
 
     cpdef void purge_account_events(
         self,
@@ -1163,21 +1282,23 @@ cdef class Cache(CacheFacade):
         Reset the cache.
 
         All stateful fields are reset to their initial value.
+
+        Instruments, currencies and synthetic instruments are retained when
+        `drop_instruments_on_reset` is `False` so that repeated backtest runs
+        can reuse the same dataset.
         """
         self._log.debug("Resetting cache")
 
         self._general.clear()
-        self._currencies.clear()
-        self._synthetics.clear()
         self._order_books.clear()
         self._own_order_books.clear()
         self._quote_ticks.clear()
         self._trade_ticks.clear()
-        self._xrate_symbols.clear()
         self._mark_xrates.clear()
         self._mark_prices.clear()
         self._index_prices.clear()
         self._funding_rates.clear()
+        self._instrument_statuses.clear()
         self._bars.clear()
         self._bars_bid.clear()
         self._bars_ask.clear()
@@ -1191,7 +1312,10 @@ cdef class Cache(CacheFacade):
         self.clear_index()
 
         if self._drop_instruments_on_reset:
+            self._currencies.clear()
             self._instruments.clear()
+            self._xrate_symbols.clear()
+            self._synthetics.clear()
 
         self._log.info(f"Reset")
 
@@ -1200,6 +1324,8 @@ cdef class Cache(CacheFacade):
         Dispose of the cache which will close any underlying database adapter.
 
         """
+        self.reset()
+
         if self._database is not None:
             self._database.close()
 
@@ -1712,6 +1838,27 @@ cdef class Cache(CacheFacade):
             self._funding_rates[funding_rate.instrument_id] = funding_rates
 
         funding_rates.appendleft(funding_rate)
+
+    cpdef void add_instrument_status(self, InstrumentStatus status):
+        """
+        Add the given instrument status update to the cache.
+
+        Parameters
+        ----------
+        status : InstrumentStatus
+            The instrument status update to add.
+
+        """
+        Condition.not_none(status, "status")
+
+        statuses = self._instrument_statuses.get(status.instrument_id)
+
+        if not statuses:
+            # The instrument_id was not registered
+            statuses = deque(maxlen=self.tick_capacity)
+            self._instrument_statuses[status.instrument_id] = statuses
+
+        statuses.appendleft(status)
 
     cpdef void add_bar(self, Bar bar):
         """
@@ -2795,6 +2942,24 @@ cdef class Cache(CacheFacade):
 
         return list(self._funding_rates.get(instrument_id, []))
 
+    cpdef list instrument_statuses(self, InstrumentId instrument_id):
+        """
+        Return instrument status updates for the given instrument ID.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument ID for the statuses to get.
+
+        Returns
+        -------
+        list[InstrumentStatus]
+
+        """
+        Condition.not_none(instrument_id, "instrument_id")
+
+        return list(self._instrument_statuses.get(instrument_id, []))
+
     cpdef list bars(self, BarType bar_type):
         """
         Return bars for the given bar type.
@@ -3205,6 +3370,41 @@ cdef class Cache(CacheFacade):
         except IndexError:
             return None
 
+    cpdef InstrumentStatus instrument_status(self, InstrumentId instrument_id, int index = 0):
+        """
+        Return the instrument status for the given instrument ID at the given index (if found).
+
+        Last instrument status if no index specified.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument ID for the status to get.
+        index : int, optional
+            The index for the status to get.
+
+        Returns
+        -------
+        InstrumentStatus or ``None``
+            If no statuses or no status at the index then returns ``None``.
+
+        Notes
+        -----
+        Reverse indexed (most recent status at index 0).
+
+        """
+        Condition.not_none(instrument_id, "instrument_id")
+
+        statuses = self._instrument_statuses.get(instrument_id)
+
+        if not statuses:
+            return None
+
+        try:
+            return statuses[index]
+        except IndexError:
+            return None
+
     cpdef Bar bar(self, BarType bar_type, int index = 0):
         """
         Return the bar for the given bar type at the given index (if found).
@@ -3353,6 +3553,24 @@ cdef class Cache(CacheFacade):
 
         return len(self._funding_rates.get(instrument_id, []))
 
+    cpdef int instrument_status_count(self, InstrumentId instrument_id):
+        """
+        The count of instrument status updates for the given instrument ID.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument ID for the statuses.
+
+        Returns
+        -------
+        int
+
+        """
+        Condition.not_none(instrument_id, "instrument_id")
+
+        return len(self._instrument_statuses.get(instrument_id, []))
+
     cpdef int bar_count(self, BarType bar_type):
         """
         The count of bars for the given bar type.
@@ -3483,6 +3701,25 @@ cdef class Cache(CacheFacade):
 
         return self.funding_rate_count(instrument_id) > 0
 
+    cpdef bint has_instrument_statuses(self, InstrumentId instrument_id):
+        """
+        Return a value indicating whether the cache has instrument status updates
+        for the given instrument ID.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument ID for the statuses.
+
+        Returns
+        -------
+        bool
+
+        """
+        Condition.not_none(instrument_id, "instrument_id")
+
+        return self.instrument_status_count(instrument_id) > 0
+
     cpdef bint has_bars(self, BarType bar_type):
         """
         Return a value indicating whether the cache has bars for the given bar
@@ -3548,13 +3785,15 @@ cdef class Cache(CacheFacade):
 
         cdef tuple quotes = self._build_quote_table(venue)
         try:
-            return nautilus_pyo3.get_exchange_rate(
+            # `get_exchange_rate` returns a `Decimal`; the Cython path uses floats, so cast here
+            xrate = nautilus_pyo3.get_exchange_rate(
                 from_currency=from_currency.code,
                 to_currency=to_currency.code,
                 price_type=nautilus_pyo3.PriceType.from_int(price_type),
                 quotes_bid=quotes[0],  # Bid
                 quotes_ask=quotes[1],  # Ask
             )
+            return float(xrate) if xrate is not None else None
         except ValueError as e:
             self._log.error(f"Cannot calculate exchange rate: {e!r}")
 

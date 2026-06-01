@@ -76,7 +76,9 @@ from nautilus_trader.model.data import OrderBookDeltas
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import AccountType
+from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.enums import BookType
+from nautilus_trader.model.enums import ContinuousFutureAdjustmentType
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.events import OrderAccepted
@@ -86,6 +88,7 @@ from nautilus_trader.model.events import PositionEvent
 from nautilus_trader.model.events import PositionOpened
 from nautilus_trader.model.greeks_data import GreeksData
 from nautilus_trader.model.identifiers import ClientId
+from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.identifiers import new_generic_spread_id
@@ -93,6 +96,7 @@ from nautilus_trader.model.instruments import CryptoPerpetual
 from nautilus_trader.model.instruments import FuturesContract
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.instruments.betting import BettingInstrument
+from nautilus_trader.model.objects import Currency
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.tick_scheme import TieredTickScheme
 from nautilus_trader.model.tick_scheme import register_tick_scheme
@@ -106,6 +110,36 @@ from nautilus_trader.test_kit.providers import TestDataProvider
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.trading import Strategy
 from tests.integration_tests.adapters.betfair.test_kit import BetfairDataProvider
+
+
+def _canonical_summary_lines(summary: dict[str, str]) -> list[str]:
+    return [f"{key}={summary[key]}" for key in sorted(summary)]
+
+
+_BACKTEST_PARITY_TS_START = 1_577_836_800_000_000_000
+_BACKTEST_PARITY_BID_PRICES = ("0.70000", "0.70000", "0.70010", "0.70020", "0.70020")
+_BACKTEST_PARITY_SUMMARY_LINES = [
+    "account.SIM.balance.USD.free=1000017.20 USD",
+    "account.SIM.balance.USD.locked=0.00 USD",
+    "account.SIM.balance.USD.total=1000017.20 USD",
+    "account.SIM.base_currency=USD",
+    "account.SIM.event_count=3",
+    "account.SIM.id=SIM-001",
+    "account.SIM.type=MARGIN",
+    "iterations=5",
+    "orders.closed=2",
+    "orders.emulated=0",
+    "orders.inflight=0",
+    "orders.open=0",
+    "orders.total=2",
+    "positions.closed=1",
+    "positions.open=0",
+    "positions.snapshots=0",
+    "positions.total=1",
+    "positions.total_with_snapshots=1",
+    "total_events=4",
+    "venues.total=1",
+]
 
 
 class TestBacktestAcceptanceTestsUSDJPY:
@@ -959,6 +993,101 @@ class StratTest(Strategy):
             )
 
 
+class BacktestParitySmokeConfig(StrategyConfig):  # type: ignore [misc]
+    instrument_id: InstrumentId
+
+
+class BacktestParitySmoke(Strategy):
+    def __init__(self, config: BacktestParitySmokeConfig) -> None:
+        super().__init__(config)
+        self._tick_count = 0
+
+    def on_start(self) -> None:
+        self.subscribe_quote_ticks(self.config.instrument_id)
+
+    def on_quote_tick(self, tick: QuoteTick) -> None:
+        self._tick_count += 1
+        if self._tick_count == 2:
+            order = self.order_factory.market(
+                instrument_id=self.config.instrument_id,
+                order_side=OrderSide.BUY,
+                quantity=Quantity.from_int(100_000),
+            )
+            self.submit_order(order)
+        elif self._tick_count == 4:
+            order = self.order_factory.market(
+                instrument_id=self.config.instrument_id,
+                order_side=OrderSide.SELL,
+                quantity=Quantity.from_int(100_000),
+            )
+            self.submit_order(order)
+
+
+def test_backtest_result_summary_parity_smoke() -> None:
+    config = BacktestEngineConfig(
+        trader_id=TraderId("BACKTESTER-001"),
+        logging=LoggingConfig(bypass_logging=True),
+        run_analysis=False,
+    )
+    engine = BacktestEngine(config=config)
+    venue = Venue("SIM")
+
+    engine.add_venue(
+        venue=venue,
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        base_currency=USD,
+        starting_balances=[Money(1_000_000, USD)],
+    )
+
+    instrument = TestInstrumentProvider.default_fx_ccy("AUD/USD", venue=venue)
+    engine.add_instrument(instrument)
+    engine.add_data(_backtest_parity_quotes(instrument))
+    engine.add_strategy(
+        BacktestParitySmoke(BacktestParitySmokeConfig(instrument_id=instrument.id)),
+    )
+
+    engine.run()
+    result = engine.get_result()
+    account = engine.portfolio.account(venue)
+
+    assert account is not None
+    assert account.balance_total(USD) == Money(1_000_017.20, USD)
+    assert account.balance_free(USD) == Money(1_000_017.20, USD)
+    assert account.balance_locked(USD) == Money(0, USD)
+    assert result.total_orders == 2
+    assert engine.cache.orders_total_count() == 2
+    assert engine.cache.orders_open_count() == 0
+    assert engine.cache.orders_closed_count() == 2
+    assert result.total_positions == 1
+    assert engine.cache.positions_total_count() == 1
+    assert engine.cache.positions_open_count() == 0
+    assert engine.cache.positions_closed_count() == 1
+    assert len(engine.cache.position_snapshots()) == 0
+    assert _canonical_summary_lines(result.summary) == _BACKTEST_PARITY_SUMMARY_LINES
+
+    engine.dispose()
+
+
+def _backtest_parity_quotes(instrument: Instrument) -> list[QuoteTick]:
+    quotes: list[QuoteTick] = []
+
+    for idx, bid_price in enumerate(_BACKTEST_PARITY_BID_PRICES):
+        ts = _BACKTEST_PARITY_TS_START + idx * 60_000_000_000
+        quotes.append(
+            QuoteTick(
+                instrument_id=instrument.id,
+                bid_price=Price.from_str(bid_price),
+                ask_price=Price.from_str(bid_price),
+                bid_size=Quantity.from_int(1_000_000),
+                ask_size=Quantity.from_int(1_000_000),
+                ts_event=ts,
+                ts_init=ts,
+            ),
+        )
+    return quotes
+
+
 def test_correct_account_balance_from_issue_2632() -> None:
     """
     Test correct account ending balance per GitHub issue #2632.
@@ -1058,6 +1187,59 @@ def test_correct_account_balance_from_issue_2632() -> None:
     assert account.balance_total(USDT) == Money(1_000_245.87500000, USDT)
     assert account.balance_free(USDT) == Money(1_000_245.87500000, USDT)
     assert account.balance_locked(USDT) == Money(0, USDT)
+
+    result = engine.get_result()
+    snapshot_positions = len(engine.cache.position_snapshots())
+    assert result.summary["iterations"] == str(engine.iteration)
+    assert result.summary["total_events"] == str(engine.kernel.exec_engine.event_count)
+    assert result.summary["orders.total"] == str(engine.cache.orders_total_count())
+    assert result.summary["orders.open"] == str(engine.cache.orders_open_count())
+    assert result.summary["orders.closed"] == str(engine.cache.orders_closed_count())
+    assert result.summary["orders.emulated"] == str(engine.cache.orders_emulated_count())
+    assert result.summary["orders.inflight"] == str(engine.cache.orders_inflight_count())
+    assert result.summary["positions.total"] == str(engine.cache.positions_total_count())
+    assert result.summary["positions.open"] == str(engine.cache.positions_open_count())
+    assert result.summary["positions.closed"] == str(engine.cache.positions_closed_count())
+    assert result.summary["positions.snapshots"] == str(snapshot_positions)
+    assert result.summary["positions.total_with_snapshots"] == str(
+        engine.cache.positions_total_count() + snapshot_positions,
+    )
+    assert result.summary["venues.total"] == "1"
+    assert result.summary["account.BINANCE.id"] == str(account.id)
+    assert result.summary["account.BINANCE.type"] == "MARGIN"
+    assert result.summary["account.BINANCE.base_currency"] == "USDT"
+    assert result.summary["account.BINANCE.event_count"] == str(account.event_count)
+    assert result.summary["account.BINANCE.balance.USDT.total"] == str(
+        account.balance_total(USDT),
+    )
+    assert result.summary["account.BINANCE.balance.USDT.free"] == str(
+        account.balance_free(USDT),
+    )
+    assert result.summary["account.BINANCE.balance.USDT.locked"] == str(
+        account.balance_locked(USDT),
+    )
+    assert _canonical_summary_lines(result.summary) == [
+        "account.BINANCE.balance.USDT.free=1000245.87500000 USDT",
+        "account.BINANCE.balance.USDT.locked=0.00000000 USDT",
+        "account.BINANCE.balance.USDT.total=1000245.87500000 USDT",
+        "account.BINANCE.base_currency=USDT",
+        "account.BINANCE.event_count=3",
+        "account.BINANCE.id=BINANCE-001",
+        "account.BINANCE.type=MARGIN",
+        "iterations=120",
+        "orders.closed=2",
+        "orders.emulated=0",
+        "orders.inflight=0",
+        "orders.open=0",
+        "orders.total=2",
+        "positions.closed=1",
+        "positions.open=0",
+        "positions.snapshots=0",
+        "positions.total=1",
+        "positions.total_with_snapshots=1",
+        "total_events=4",
+        "venues.total=1",
+    ]
 
 
 class TestBacktestPnLAlignmentAcceptance:
@@ -1262,6 +1444,16 @@ class TestBacktestPnLAlignmentAcceptance:
         # In NETTING mode, we expect snapshots for closed position cycles
         assert len(snapshots) >= 2, (
             f"Should have at least 2 snapshots in NETTING mode, was {len(snapshots)}"
+        )
+        result = engine.get_result()
+        positions_total = engine.cache.positions_total_count()
+        total_positions_with_snapshots = positions_total + len(snapshots)
+        assert total_positions_with_snapshots > positions_total
+        assert result.total_positions == total_positions_with_snapshots
+        assert result.summary["positions.total"] == str(positions_total)
+        assert result.summary["positions.snapshots"] == str(len(snapshots))
+        assert result.summary["positions.total_with_snapshots"] == str(
+            total_positions_with_snapshots,
         )
         assert len(positions_report) >= 3, (
             f"Should have at least 3 position entries, was {len(positions_report)}"
@@ -1529,6 +1721,7 @@ class TestBacktestPnLAlignmentAcceptance:
         from decimal import Decimal
 
         position_report_sum = Decimal(0)
+
         if not positions_report.empty:
             for pnl_str in positions_report["realized_pnl"]:
                 pnl_money = Money.from_str(pnl_str)
@@ -1625,6 +1818,7 @@ class TestBacktestCommandSettling:
 
         timestamps = pd.date_range(start="2020-01-01", periods=3, freq="1min")
         quotes = []
+
         for i, ts in enumerate(timestamps):
             bid = 0.70000 + (i * 0.00001)
             quote = QuoteTick(
@@ -1736,6 +1930,7 @@ class TestBacktestCommandSettling:
 
         timestamps = pd.date_range(start="2020-01-01", periods=3, freq="1min")
         quotes = []
+
         for i, ts in enumerate(timestamps):
             bid = 0.70000 + (i * 0.00001)
             quote = QuoteTick(
@@ -1840,6 +2035,7 @@ class TestBacktestCommandSettling:
         # Data spans timer time so the timer fires between data points
         timestamps = pd.date_range(start="2020-01-01", periods=3, freq="1min")
         quotes = []
+
         for ts in timestamps:
             quote = QuoteTick(
                 instrument_id=instrument.id,
@@ -1863,6 +2059,7 @@ class TestBacktestCommandSettling:
         assert len(strategy.orders_submitted) == 2
 
         timer_ts = pd.Timestamp("2020-01-01 00:00:30", tz="UTC").value
+
         for order in strategy.orders_submitted:
             cached = engine.cache.order(order.client_order_id)
             assert cached.is_closed
@@ -1879,6 +2076,7 @@ class TestBacktestNodeWithBacktestDataIterator:
         catalog_data_path = (
             PACKAGE_ROOT / "tests" / "test_data" / "databento" / "options_catalog" / "data"
         )
+
         if catalog_data_path.exists():
             shutil.rmtree(catalog_data_path)
 
@@ -1908,17 +2106,19 @@ class TestBacktestNodeWithBacktestDataIterator:
 
         # Assert
         expected_order_filled_messages = [
-            "Order filled: ESM4 P5230.XCME, qty=10, price=97.25, trade_id=XCME-1-001",
-            "Order filled: ESM4 P5250.XCME, qty=10, price=108.50, trade_id=XCME-2-001",
-            "Order filled: ESM4.XCME, qty=1, price=5199.75, trade_id=XCME-3-002",
+            "Order filled: ESM4 P5230.XCME, qty=10, price=97.25, trade_id=T-d47be5ca9f6901ab-001",
+            "Order filled: ESM4 P5250.XCME, qty=10, price=108.50, trade_id=T-7f8e274f85bbdd3e-001",
+            "Order filled: ESM4.XCME, qty=1, price=5199.75, trade_id=T-75d12aa71a6bb07d-004",
             "Order filled: ((1))ESM4 P5230___(1)ESM4 P5250.XCME, qty=5, price=10.75, "
-            "trade_id=XCME-5-001",
-            "Order filled: ESM4 P5230.XCME, qty=5, price=97.62, trade_id=XCME-5-001-0",
-            "Order filled: ESM4 P5250.XCME, qty=5, price=108.38, trade_id=XCME-5-001-1",
-            "Order filled: ((1))ESM4___(1)NQM4.XCME, qty=2, price=12930.50, trade_id=XCME-6-001",
-            "Order filled: ((1))ESM4___(1)NQM4.XCME, qty=3, price=12930.75, trade_id=XCME-6-002",
-            "Order filled: ESM4.XCME, qty=2, price=5199.62, trade_id=XCME-6-002-0",
-            "Order filled: NQM4.XCME, qty=2, price=18130.12, trade_id=XCME-6-002-1",
+            "trade_id=T-75c4107db8ae4ad7-001",
+            "Order filled: ESM4 P5230.XCME, qty=5, price=97.62, trade_id=T-75c4107db8ae4ad7-001-0",
+            "Order filled: ESM4 P5250.XCME, qty=5, price=108.38, trade_id=T-75c4107db8ae4ad7-001-1",
+            "Order filled: ((1))ESM4___(1)NQM4.XCME, qty=2, price=12930.50, "
+            "trade_id=T-8ba53c03fcdf19ba-001",
+            "Order filled: ((1))ESM4___(1)NQM4.XCME, qty=3, price=12930.75, "
+            "trade_id=T-8ba53c03fcdf19ba-002",
+            "Order filled: ESM4.XCME, qty=2, price=5199.62, trade_id=T-8ba53c03fcdf19ba-002-0",
+            "Order filled: NQM4.XCME, qty=2, price=18130.12, trade_id=T-8ba53c03fcdf19ba-002-1",
         ]
         assert order_filled_messages == expected_order_filled_messages
 
@@ -1942,8 +2142,8 @@ class TestBacktestNodeWithBacktestDataIterator:
         expected_spread_bar_messages = [
             "Historical Bar: ((1))ESM4___(1)NQM4.XCME-2-MINUTE-ASK-INTERNAL,12928.25,12928.25,12927.25,12927.25,4,1715248560000000000, ts=2024-05-09T09:56:00.000000000Z",
             "Historical Bar: ((1))ESM4___(1)NQM4.XCME-2-MINUTE-ASK-INTERNAL,12927.50,12928.00,12927.50,12928.00,3,1715248680000000000, ts=2024-05-09T09:58:00.000000000Z",
-            "Bar: ((1))ESM4___(1)NQM4.XCME-2-MINUTE-ASK-INTERNAL,12930.25,12930.25,12930.25,12930.25,1,1715248800000000000, ts=2024-05-09T10:00:00.000000000Z",
-            "Bar: ((1))ESM4___(1)NQM4.XCME-2-MINUTE-ASK-INTERNAL,12930.50,12931.75,12930.25,12931.75,10,1715248920000000000, ts=2024-05-09T10:02:00.000000000Z",
+            "Bar: ((1))ESM4___(1)NQM4.XCME-2-MINUTE-ASK-INTERNAL,12930.25,12930.50,12930.25,12930.50,3,1715248800000000000, ts=2024-05-09T10:00:00.000000000Z",
+            "Bar: ((1))ESM4___(1)NQM4.XCME-2-MINUTE-ASK-INTERNAL,12930.25,12931.75,12930.25,12931.75,8,1715248920000000000, ts=2024-05-09T10:02:00.000000000Z",
             "Bar: ((1))ESM4___(1)NQM4.XCME-2-MINUTE-ASK-INTERNAL,12933.00,12933.00,12932.50,12932.50,4,1715249040000000000, ts=2024-05-09T10:04:00.000000000Z",
         ]
         assert spread_bar_messages == expected_spread_bar_messages
@@ -2091,6 +2291,7 @@ def run_backtest(test_callback=None, with_data=True, log_path=None):
 
     # Create and write custom data to catalog (every minute between 10:00 and 10:05)
     custom_data_list = []
+
     for minute in range(6):  # 0, 1, 2, 3, 4, 5 (10:00 to 10:05)
         timestamp_str = f"2024-05-09T10:0{minute}:00"
         ts_nanos = dt_to_unix_nanos(time_object_to_dt(timestamp_str))
@@ -2245,6 +2446,7 @@ def run_backtest(test_callback=None, with_data=True, log_path=None):
             start=backtest_start_time,
             end=end_time,
             raise_exception=True,
+            dispose_on_completion=False,
         ),
     ]
 
@@ -2331,8 +2533,7 @@ class OptionStrategy(Strategy):
         self.request_quote_ticks(
             self.config.spread_id2,
             start=time_object_to_dt(self.config.start_time),
-            # Note: we need to request up to 10:00 so the spread quote at 9:59 is produced
-            end=self.clock.utc_now() - pd.Timedelta(minutes=0),
+            end=self.clock.utc_now() - pd.Timedelta(minutes=1),
             params=self.default_data_params,
         )
 
@@ -2340,8 +2541,7 @@ class OptionStrategy(Strategy):
         self.request_aggregated_bars(
             [self.bar_type_3],
             start=time_object_to_dt(self.config.start_time),
-            # Note: we need to request up to 10:00 so the spread quote at 9:59 is produced
-            end=self.clock.utc_now() - pd.Timedelta(minutes=0),
+            end=self.clock.utc_now() - pd.Timedelta(minutes=1),
             update_subscriptions=True,
             params=self.default_data_params,
         )
@@ -2487,3 +2687,257 @@ class OptionStrategy(Strategy):
         self.unsubscribe_data(DataType(GreeksData), instrument_id=self.config.option_id2)
         self.unsubscribe_quote_ticks(self.config.spread_id, params=self.default_data_params)
         self.unsubscribe_quote_ticks(self.config.spread_id2, params=self.default_data_params)
+
+
+class ContFutTransitionStrategyConfig(StrategyConfig, frozen=True):
+    target_bar_type: BarType
+    transitions: list
+    request_start_iso: str
+    backtest_start_iso: str
+
+
+class ContFutTransitionStrategy(Strategy):
+    """
+    Request adjusted continuous-future bars for the history preceding the backtest
+    start, then subscribe for the post-start live segment.
+
+    The roll adjustment is identical across both phases so the resulting series is
+    seamless.
+
+    """
+
+    def __init__(self, config: ContFutTransitionStrategyConfig):
+        super().__init__(config=config)
+        self.historical_bars: list = []
+        self.live_bars: list = []
+
+    def on_start(self):
+        params = {
+            "continuous_future_transitions": list(self.config.transitions),
+            "continuous_future_adjustment_mode": ContinuousFutureAdjustmentType.BACKWARD_SPREAD,
+        }
+        # Composite target bar types go through `request_aggregated_bars`; the list is
+        # the chain of `bar_types` the continuous future engine will set up (here just
+        # the single composite target).
+        self.request_aggregated_bars(
+            [self.config.target_bar_type],
+            start=time_object_to_dt(self.config.request_start_iso),
+            end=time_object_to_dt(self.config.backtest_start_iso) - pd.Timedelta(nanoseconds=1),
+            params=params,
+        )
+        self.subscribe_bars(self.config.target_bar_type, params=params)
+
+    def on_historical_data(self, data):
+        if isinstance(data, Bar):
+            self.historical_bars.append(data)
+
+    def on_bar(self, bar):
+        self.live_bars.append(bar)
+
+    def on_stop(self):
+        self.unsubscribe_bars(
+            self.config.target_bar_type,
+            params={"continuous_future_transitions": list(self.config.transitions)},
+        )
+
+
+class TestBacktestContinuousFuture:
+    """
+    Verifies the transition from a historical ``request_bars`` to a live
+    ``subscribe_bars`` for a continuous future.
+
+    Layout:
+        - ESH26 raw 1-min bars 09:00..09:04
+        - transition @ 09:05 (pre=104, post=110)
+        - ESM26 raw 1-min bars 09:05..09:09
+        - transition @ 09:10 (pre=114, post=120)
+        - ESU26 raw 1-min bars 09:10..09:14
+        - backtest runs 09:10..09:15
+
+    Backward-adjusted offsets:
+        - ESH26: (110-104) + (120-114) = +12  → adjusted 112..116
+        - ESM26: (120-114)             = +6   → adjusted 116..120
+        - ESU26: 0                            → unadjusted 120..124
+
+    The full continuous series is a monotone increasing 112..124; the historical
+    phase emits 112..120 (the first 10 adjusted bars) and the live phase emits
+    the tail starting at 120.
+
+    """
+
+    def _futures_contract(self, symbol: str, expiration_ns: int) -> FuturesContract:
+        return FuturesContract(
+            instrument_id=InstrumentId.from_str(f"{symbol}.XCME"),
+            raw_symbol=Symbol(symbol),
+            asset_class=AssetClass.INDEX,
+            currency=Currency.from_str("USD"),
+            price_precision=2,
+            price_increment=Price.from_str("0.25"),
+            multiplier=Quantity.from_int(50),
+            lot_size=Quantity.from_int(1),
+            underlying="ES",
+            activation_ns=0,
+            expiration_ns=expiration_ns,
+            ts_event=0,
+            ts_init=0,
+        )
+
+    def _build_catalog(self, tmp_path):
+        catalog = setup_catalog(protocol="file", path=tmp_path / "contfut_catalog")
+
+        instruments = [
+            self._futures_contract("ESH26", 1773532800000000000),
+            self._futures_contract("ESM26", 1781308800000000000),
+            self._futures_contract("ESU26", 1789257600000000000),
+        ]
+        catalog.write_data(instruments)
+
+        def make_bars(symbol: str, first_minute_iso: str, close_prices: list[float]) -> list[Bar]:
+            bar_type = BarType.from_str(f"{symbol}.XCME-1-MINUTE-LAST-EXTERNAL")
+            start_ns = pd.Timestamp(first_minute_iso).value
+            minute_ns = 60 * 1_000_000_000
+            bars = []
+
+            for i, close in enumerate(close_prices):
+                ts = start_ns + i * minute_ns
+                bars.append(
+                    Bar(
+                        bar_type,
+                        Price.from_str(f"{close:.2f}"),
+                        Price.from_str(f"{close:.2f}"),
+                        Price.from_str(f"{close:.2f}"),
+                        Price.from_str(f"{close:.2f}"),
+                        Quantity.from_int(1),
+                        ts,
+                        ts,
+                    ),
+                )
+            return bars
+
+        bars = []
+        bars += make_bars("ESH26", "2026-03-16T09:00:00Z", [100, 101, 102, 103, 104])
+        bars += make_bars("ESM26", "2026-03-16T09:05:00Z", [110, 111, 112, 113, 114])
+        bars += make_bars("ESU26", "2026-03-16T09:10:00Z", [120, 121, 122, 123, 124])
+        catalog.write_data(bars)
+
+        return catalog
+
+    def test_continuous_future_transition_from_request_to_subscription(self, tmp_path):
+        catalog = self._build_catalog(tmp_path)
+
+        target_bar_type = BarType.from_str(
+            "ES.XCME-1-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL",
+        )
+        transitions = [
+            {
+                "transition_time_ns": pd.Timestamp("2026-03-16T09:05:00Z").value,
+                "pre_instrument_id": "ESH26.XCME",
+                "post_instrument_id": "ESM26.XCME",
+                "pre_price": "104.00",
+                "post_price": "110.00",
+            },
+            {
+                "transition_time_ns": pd.Timestamp("2026-03-16T09:10:00Z").value,
+                "pre_instrument_id": "ESM26.XCME",
+                "post_instrument_id": "ESU26.XCME",
+                "pre_price": "114.00",
+                "post_price": "120.00",
+            },
+        ]
+
+        strategies = [
+            ImportableStrategyConfig(
+                strategy_path=ContFutTransitionStrategy.fully_qualified_name(),
+                config_path=ContFutTransitionStrategyConfig.fully_qualified_name(),
+                config={
+                    "target_bar_type": target_bar_type,
+                    "transitions": transitions,
+                    "request_start_iso": "2026-03-16T09:00:00Z",
+                    "backtest_start_iso": "2026-03-16T09:10:00Z",
+                },
+            ),
+        ]
+
+        data = [
+            BacktestDataConfig(
+                data_cls=Bar,
+                catalog_path=str(catalog.path),
+                instrument_id=InstrumentId.from_str(f"{symbol}.XCME"),
+                bar_spec="1-MINUTE-LAST",
+            )
+            for symbol in ("ESH26", "ESM26", "ESU26")
+        ]
+
+        venues = [
+            BacktestVenueConfig(
+                name="XCME",
+                oms_type="NETTING",
+                account_type="MARGIN",
+                base_currency="USD",
+                starting_balances=["1_000_000 USD"],
+            ),
+        ]
+
+        engine_config = BacktestEngineConfig(
+            logging=LoggingConfig(bypass_logging=True),
+            strategies=strategies,
+            catalogs=[DataCatalogConfig(path=str(catalog.path))],
+        )
+
+        run_config = BacktestRunConfig(
+            engine=engine_config,
+            data=data,
+            venues=venues,
+            start="2026-03-16T09:10:00Z",
+            end="2026-03-16T09:15:00Z",
+            raise_exception=True,
+            dispose_on_completion=False,
+        )
+
+        node = BacktestNode(configs=[run_config])
+        node.build()
+        engine = node.get_engine(run_config.id)
+
+        # The continuous root instrument (e.g. ES.XCME) is synthesised automatically by
+        # the data engine from the first segment's properties on the first CF request or
+        # subscription; no manual `add_instrument` call is required.
+
+        node.run()
+        strategy = engine.trader.strategies()[0]
+
+        # Historical phase: 10 adjusted bars spanning segments 0 and 1.
+        # BACKWARD_SPREAD offsets (sum of post-pre across later rolls):
+        #   segment 0 (ESH26) = (110-104) + (120-114) = +12
+        #   segment 1 (ESM26) = (120-114) = +6
+        # ESH26 raw closes 100..104 shift by +12 → 112..116.
+        # ESM26 raw closes 110..114 shift by +6 → 116..120.
+        historical_closes = [float(b.close) for b in strategy.historical_bars]
+        assert historical_closes == [
+            112.0,
+            113.0,
+            114.0,
+            115.0,
+            116.0,
+            116.0,
+            117.0,
+            118.0,
+            119.0,
+            120.0,
+        ]
+
+        # Live phase: ESU26 raw closes 120..124 pass through unadjusted (last segment has offset 0).
+        # The engine pushes five 1-min source bars; the final extra bar at backtest end comes from
+        # the aggregator's default `build_with_no_updates=True` carrying the last close forward.
+        live_closes = [float(b.close) for b in strategy.live_bars]
+        assert live_closes[:5] == [120.0, 121.0, 122.0, 123.0, 124.0]
+
+        # Seam check: the last historical close (adjusted ESM26) joins the first live close
+        # (unadjusted ESU26) at 120.0 — both phases share the same adjusted frame.
+        assert historical_closes[-1] == live_closes[0] == 120.0
+
+        # Every bar must carry the continuous (target) standard bar type, not a segment contract.
+        expected_bar_type = target_bar_type.standard()
+        assert all(b.bar_type == expected_bar_type for b in strategy.historical_bars)
+        assert all(b.bar_type == expected_bar_type for b in strategy.live_bars)
+
+        node.dispose()

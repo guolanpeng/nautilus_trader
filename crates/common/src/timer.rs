@@ -35,9 +35,8 @@ use ustr::Ustr;
 ///
 /// Coerces zero to one to ensure a valid `NonZeroU64`.
 #[must_use]
-#[allow(clippy::missing_panics_doc)] // Value is coerced to >= 1
 pub fn create_valid_interval(interval_ns: u64) -> NonZeroU64 {
-    NonZeroU64::new(std::cmp::max(interval_ns, 1)).expect("`interval_ns` must be positive")
+    NonZeroU64::new(interval_ns).unwrap_or(NonZeroU64::MIN)
 }
 
 #[repr(C)]
@@ -45,6 +44,10 @@ pub fn create_valid_interval(interval_ns: u64) -> NonZeroU64 {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.common", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.common")
 )]
 /// Represents a time event occurring at the event timestamp.
 ///
@@ -286,9 +289,24 @@ impl TimeEventHandler {
         Self { event, callback }
     }
 
+    fn cmp_event(&self, other: &Self) -> Ordering {
+        self.event
+            .ts_event
+            .cmp(&other.event.ts_event)
+            .then_with(|| self.event.name.cmp(&other.event.name))
+            .then_with(|| self.event.ts_init.cmp(&other.event.ts_init))
+            .then_with(|| {
+                self.event
+                    .event_id
+                    .as_str()
+                    .cmp(other.event.event_id.as_str())
+            })
+    }
+
     /// Executes the handler by invoking its callback for the associated event.
     pub fn run(self) {
         let Self { event, callback } = self;
+        crate::msgbus::dispatch_tap_time_event(&event);
         callback.call(event);
     }
 }
@@ -301,7 +319,7 @@ impl PartialOrd for TimeEventHandler {
 
 impl PartialEq for TimeEventHandler {
     fn eq(&self, other: &Self) -> bool {
-        self.event.ts_event == other.event.ts_event
+        self.cmp_event(other).is_eq()
     }
 }
 
@@ -309,7 +327,7 @@ impl Eq for TimeEventHandler {}
 
 impl Ord for TimeEventHandler {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.event.ts_event.cmp(&other.event.ts_event)
+        self.cmp_event(other)
     }
 }
 
@@ -472,13 +490,24 @@ impl Iterator for TestTimer {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
+    use std::{cell::RefCell, num::NonZeroU64, rc::Rc};
 
-    use nautilus_core::UnixNanos;
+    use nautilus_core::{UUID4, UnixNanos};
     use rstest::*;
     use ustr::Ustr;
 
-    use super::{TestTimer, TimeEvent};
+    use super::{TestTimer, TimeEvent, TimeEventCallback, TimeEventHandler, create_valid_interval};
+    use crate::msgbus::{
+        BusTap, Endpoint, MStr, MessagingSwitchboard, Topic, clear_bus_tap, set_bus_tap,
+    };
+
+    #[rstest]
+    #[case(0, 1)]
+    #[case(1, 1)]
+    #[case(25, 25)]
+    fn test_create_valid_interval(#[case] interval_ns: u64, #[case] expected: u64) {
+        assert_eq!(create_valid_interval(interval_ns).get(), expected);
+    }
 
     #[rstest]
     fn test_test_timer_pop_event() {
@@ -630,6 +659,107 @@ mod tests {
         assert_eq!(events[0].ts_event, UnixNanos::from(15));
     }
 
+    #[rstest]
+    fn test_time_event_handler_ordering_uses_tie_breakers() {
+        let callback = TimeEventCallback::from(|_: TimeEvent| {});
+
+        let later_name = TimeEventHandler::new(
+            TimeEvent::new(
+                Ustr::from("TIME_BAR_ESM4-2-MINUTE-ASK-INTERNAL"),
+                UUID4::from("00000000-0000-4000-8000-000000000003"),
+                100.into(),
+                100.into(),
+            ),
+            callback.clone(),
+        );
+        let earlier_name = TimeEventHandler::new(
+            TimeEvent::new(
+                Ustr::from("SPREAD_QUOTE_ESM4"),
+                UUID4::from("00000000-0000-4000-8000-000000000002"),
+                100.into(),
+                100.into(),
+            ),
+            callback.clone(),
+        );
+        let later_init = TimeEventHandler::new(
+            TimeEvent::new(
+                Ustr::from("SPREAD_QUOTE_ESM4"),
+                UUID4::from("00000000-0000-4000-8000-000000000004"),
+                100.into(),
+                101.into(),
+            ),
+            callback.clone(),
+        );
+        let later_id = TimeEventHandler::new(
+            TimeEvent::new(
+                Ustr::from("SPREAD_QUOTE_ESM4"),
+                UUID4::from("00000000-0000-4000-8000-000000000005"),
+                100.into(),
+                100.into(),
+            ),
+            callback,
+        );
+
+        assert!(earlier_name < later_name);
+        assert!(earlier_name < later_init);
+        assert!(earlier_name < later_id);
+        assert_ne!(earlier_name, later_id);
+    }
+
+    #[derive(Default)]
+    struct RecordingTimeEventTap {
+        time_events: RefCell<Vec<(String, TimeEvent)>>,
+    }
+
+    impl RecordingTimeEventTap {
+        fn time_events(&self) -> Vec<(String, TimeEvent)> {
+            self.time_events.borrow().clone()
+        }
+    }
+
+    impl BusTap for RecordingTimeEventTap {
+        fn on_publish(&self, topic: MStr<Topic>, message: &dyn std::any::Any) {
+            if let Some(event) = message.downcast_ref::<TimeEvent>() {
+                self.time_events
+                    .borrow_mut()
+                    .push((topic.to_string(), event.clone()));
+            }
+        }
+
+        fn on_send(&self, _endpoint: MStr<Endpoint>, _message: &dyn std::any::Any) {}
+    }
+
+    #[rstest]
+    fn test_time_event_handler_run_dispatches_tap_before_callback() {
+        let event = TimeEvent::new(
+            Ustr::from("strategy.heartbeat"),
+            UUID4::from("00000000-0000-4000-8000-000000000006"),
+            UnixNanos::from(100),
+            UnixNanos::from(99),
+        );
+        let tap = Rc::new(RecordingTimeEventTap::default());
+        let callback_seen: Rc<RefCell<Vec<TimeEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let expected_topic = MessagingSwitchboard::time_event_topic().to_string();
+        let callback_expected = event.clone();
+        let callback_expected_topic = expected_topic.clone();
+        let callback_tap = Rc::clone(&tap);
+        let callback_seen_ref = Rc::clone(&callback_seen);
+        let callback: Rc<dyn Fn(TimeEvent)> = Rc::new(move |callback_event| {
+            assert_eq!(
+                callback_tap.time_events(),
+                vec![(callback_expected_topic.clone(), callback_expected.clone())],
+            );
+            callback_seen_ref.borrow_mut().push(callback_event);
+        });
+
+        set_bus_tap(tap.clone());
+        TimeEventHandler::new(event.clone(), TimeEventCallback::from(callback)).run();
+        clear_bus_tap();
+
+        assert_eq!(tap.time_events(), vec![(expected_topic, event.clone())]);
+        assert_eq!(*callback_seen.borrow(), vec![event]);
+    }
+
     ////////////////////////////////////////////////////////////////////////////////
     // Property-based testing
     ////////////////////////////////////////////////////////////////////////////////
@@ -666,7 +796,7 @@ mod tests {
         )
     }
 
-    #[allow(clippy::needless_collect)] // Collect needed for indexing and .is_empty()
+    #[expect(clippy::needless_collect)] // Collect needed for indexing and .is_empty()
     fn test_timer_with_operations(
         operations: Vec<TimerOperation>,
         (interval_ns, start_time_ns, stop_time_ns, fire_immediately): (u64, u64, Option<u64>, bool),

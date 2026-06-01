@@ -25,7 +25,7 @@ use ustr::Ustr;
 
 /// EIP-712 signature type for order signing.
 ///
-/// Serialized as a numeric value (0/1/2) on the wire.
+/// Serialized as a numeric value (0/1/2/3) on the wire.
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
@@ -37,12 +37,17 @@ use ustr::Ustr;
         from_py_object,
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.polymarket")
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum SignatureType {
     Eoa = 0,
     PolyProxy = 1,
     PolyGnosisSafe = 2,
+    Poly1271 = 3,
 }
 
 /// Outcome label for a Polymarket market token.
@@ -159,9 +164,7 @@ pub enum PolymarketEventType {
 }
 
 /// Order status on the Polymarket CLOB.
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, StrumDisplay, EnumString, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, StrumDisplay, EnumString, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 pub enum PolymarketOrderStatus {
@@ -174,6 +177,50 @@ pub enum PolymarketOrderStatus {
     Unmatched,
     Canceled,
     CanceledMarketResolved,
+}
+
+impl<'de> Deserialize<'de> for PolymarketOrderStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Slow-path table for `<VARIANT>_<reason>` inputs. Polymarket sometimes
+        // appends `_<reason>` to a status (e.g. `CANCELED_order couldn't be
+        // fully filled...`). Match the longest known variant first so
+        // `CANCELED_MARKET_RESOLVED` is not truncated to `CANCELED`.
+        const VARIANTS: &[(&str, PolymarketOrderStatus)] = &[
+            (
+                "CANCELED_MARKET_RESOLVED",
+                PolymarketOrderStatus::CanceledMarketResolved,
+            ),
+            ("INVALID", PolymarketOrderStatus::Invalid),
+            ("LIVE", PolymarketOrderStatus::Live),
+            ("DELAYED", PolymarketOrderStatus::Delayed),
+            ("MATCHED", PolymarketOrderStatus::Matched),
+            ("UNMATCHED", PolymarketOrderStatus::Unmatched),
+            ("CANCELED", PolymarketOrderStatus::Canceled),
+        ];
+
+        let s = String::deserialize(deserializer)?;
+
+        // Fast path: exact match through the strum-derived `FromStr`.
+        if let Ok(status) = <Self as std::str::FromStr>::from_str(&s) {
+            return Ok(status);
+        }
+
+        for (prefix, status) in VARIANTS {
+            if s.len() > prefix.len()
+                && s.is_char_boundary(prefix.len())
+                && &s[..prefix.len()] == *prefix
+                && s.as_bytes()[prefix.len()] == b'_'
+            {
+                return Ok(*status);
+            }
+        }
+        Err(serde::de::Error::custom(format!(
+            "Unknown PolymarketOrderStatus: {s}"
+        )))
+    }
 }
 
 /// Trade settlement status on the Polymarket exchange.
@@ -259,6 +306,16 @@ impl TryFrom<TimeInForce> for PolymarketOrderType {
     }
 }
 
+impl PolymarketOrderType {
+    pub(crate) fn from_market_time_in_force(value: TimeInForce) -> anyhow::Result<Self> {
+        match value {
+            TimeInForce::Fok => Ok(Self::FOK),
+            TimeInForce::Ioc => Ok(Self::FAK),
+            _ => anyhow::bail!("Unsupported `TimeInForce` for Polymarket market order: {value:?}"),
+        }
+    }
+}
+
 impl From<PolymarketOrderStatus> for OrderStatus {
     fn from(value: PolymarketOrderStatus) -> Self {
         match value {
@@ -266,7 +323,7 @@ impl From<PolymarketOrderStatus> for OrderStatus {
             PolymarketOrderStatus::Live => Self::Accepted,
             PolymarketOrderStatus::Delayed => Self::Accepted,
             PolymarketOrderStatus::Matched => Self::Filled,
-            // Placement failure (never became live) — treat as rejected
+            // Placement failure (never became live), treat as rejected
             PolymarketOrderStatus::Unmatched => Self::Rejected,
             PolymarketOrderStatus::Canceled => Self::Canceled,
             // Market resolved = order expired due to market settlement
@@ -292,6 +349,10 @@ mod tests {
             serde_json::to_string(&SignatureType::PolyGnosisSafe).unwrap(),
             "2"
         );
+        assert_eq!(
+            serde_json::to_string(&SignatureType::Poly1271).unwrap(),
+            "3"
+        );
     }
 
     #[rstest]
@@ -307,6 +368,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<SignatureType>("2").unwrap(),
             SignatureType::PolyGnosisSafe
+        );
+        assert_eq!(
+            serde_json::from_str::<SignatureType>("3").unwrap(),
+            SignatureType::Poly1271
         );
     }
 
@@ -344,6 +409,36 @@ mod tests {
             serde_json::from_str::<PolymarketOrderStatus>("\"CANCELED_MARKET_RESOLVED\"").unwrap(),
             PolymarketOrderStatus::CanceledMarketResolved
         );
+    }
+
+    #[rstest]
+    #[case(
+        "\"CANCELED_order couldn't be fully filled. FOK orders are fully filled or killed.\"",
+        PolymarketOrderStatus::Canceled
+    )]
+    #[case("\"CANCELED_some other reason\"", PolymarketOrderStatus::Canceled)]
+    #[case(
+        "\"CANCELED_MARKET_RESOLVED_resolved at block 12345\"",
+        PolymarketOrderStatus::CanceledMarketResolved
+    )]
+    #[case(
+        "\"UNMATCHED_insufficient liquidity\"",
+        PolymarketOrderStatus::Unmatched
+    )]
+    fn test_order_status_strips_reason_suffix(
+        #[case] raw: &str,
+        #[case] expected: PolymarketOrderStatus,
+    ) {
+        assert_eq!(
+            serde_json::from_str::<PolymarketOrderStatus>(raw).unwrap(),
+            expected,
+        );
+    }
+
+    #[rstest]
+    fn test_order_status_rejects_unknown() {
+        assert!(serde_json::from_str::<PolymarketOrderStatus>("\"UNKNOWN_STATUS\"").is_err());
+        assert!(serde_json::from_str::<PolymarketOrderStatus>("\"\"").is_err());
     }
 
     #[rstest]
@@ -407,6 +502,26 @@ mod tests {
         #[case] expected: PolymarketOrderType,
     ) {
         assert_eq!(PolymarketOrderType::try_from(tif).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case(TimeInForce::Ioc, PolymarketOrderType::FAK)]
+    #[case(TimeInForce::Fok, PolymarketOrderType::FOK)]
+    fn test_market_time_in_force_to_order_type(
+        #[case] tif: TimeInForce,
+        #[case] expected: PolymarketOrderType,
+    ) {
+        assert_eq!(
+            PolymarketOrderType::from_market_time_in_force(tif).unwrap(),
+            expected,
+        );
+    }
+
+    #[rstest]
+    #[case(TimeInForce::Gtc)]
+    #[case(TimeInForce::Gtd)]
+    fn test_market_time_in_force_to_order_type_rejects_non_market_tif(#[case] tif: TimeInForce) {
+        assert!(PolymarketOrderType::from_market_time_in_force(tif).is_err());
     }
 
     #[rstest]

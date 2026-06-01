@@ -22,20 +22,32 @@ Before running data tests:
 - Target instrument available and loadable via the instrument provider.
 - API credentials set via environment variables (`{VENUE}_API_KEY`, `{VENUE}_API_SECRET`) when
   the venue requires authentication for the data being tested.
-- If the venue offers a demo/testnet mode (e.g. `is_demo=True`), use credentials created
+- If the venue offers a demo/testnet mode, use credentials created
   for that environment. Demo and production API keys are typically separate and not
   interchangeable; using the wrong credentials produces authentication errors (e.g. HTTP 401).
 
-**Python node setup** (reference: `examples/live/{adapter}/{adapter}_data_tester.py`):
+**Python node setup**:
+
+Legacy examples still use `nautilus_trader.live.node.TradingNode`, but new Rust-backed
+PyO3 adapters should prefer `nautilus_trader.live.LiveNode`. Use `LiveNode.builder(...)`
+when you need to register adapter client factories before the node is built.
 
 ```python
-from nautilus_trader.live.node import TradingNode
-from nautilus_trader.test_kit.strategies.tester_data import DataTester, DataTesterConfig
+from nautilus_trader.common import Environment
+from nautilus_trader.live import LiveDataEngineConfig, LiveNode
+from nautilus_trader.model import TraderId
 
-node = TradingNode(config=config_node)
-tester = DataTester(config=config_tester)
-node.trader.add_actor(tester)
-# Register adapter factories, build, and run
+node = (
+    LiveNode.builder("TESTER-001", TraderId("TESTER-001"), Environment.SANDBOX)
+    .with_data_engine_config(
+        LiveDataEngineConfig(time_bars_build_with_no_updates=False)
+    )
+    .add_data_client(None, adapter_data_client_factory, data_client_config)
+    .build()
+)
+
+node.add_actor_from_config(importable_actor_config)
+# Register remaining components, then start or run
 ```
 
 **Rust node setup** (reference: `crates/adapters/{adapter}/examples/node_data_tester.rs`):
@@ -143,7 +155,7 @@ Test order book subscription modes and snapshot requests.
 | TC-D10  | Subscribe book deltas          | Stream `OrderBookDeltas` updates.                  | No book support.       |
 | TC-D11  | Subscribe book at interval     | Periodic `OrderBook` snapshots.                    | No book support.       |
 | TC-D12  | Subscribe book depth           | `OrderBookDepth10` snapshots.                      | No book depth.         |
-| TC-D13  | Request book snapshot          | One-time book snapshot request.                    | No book snapshot.      |
+| TC-D13  | Request book snapshot          | One‑time book snapshot request.                    | No book snapshot.      |
 | TC-D14  | Managed book from deltas       | Build local book from delta stream.                | No book support.       |
 | TC-D15  | Request historical book deltas | Historical book deltas request.                    | No historical deltas.  |
 
@@ -235,7 +247,7 @@ DataTesterConfig(
 | Field              | Value                                                                  |
 |--------------------|------------------------------------------------------------------------|
 | **Prerequisite**   | Adapter connected, instrument loaded.                                  |
-| **Action**         | DataTester requests a one-time order book snapshot.                    |
+| **Action**         | DataTester requests a one‑time order book snapshot.                    |
 | **Event sequence** | Book snapshot received via historical data callback.                   |
 | **Pass criteria**  | Snapshot contains bid/ask levels with valid prices and sizes.          |
 | **Skip when**      | Adapter does not support book snapshot requests.                       |
@@ -644,7 +656,7 @@ Test instrument status and close event subscriptions.
 
 **Considerations:**
 
-- Status events may only fire on state changes (e.g. trading halt → resume).
+- Status events may only fire on state changes (e.g. trading halt -> resume).
 - During normal trading hours, a `Trading` status may be received on subscribe.
 
 **Python config:**
@@ -719,6 +731,26 @@ Test option greeks and option chain subscriptions.
 
 - Greeks are only available for option instruments.
 - Values depend on the venue's pricing model and may update on every quote change.
+- Some venues (Bybit, Deribit) subscribe per instrument; OKX subscribes per instrument
+  family and filters to the requested instruments.
+- `rho` may be zero when the venue does not provide it (Bybit, OKX).
+- `underlying_price` and `open_interest` may be `None` depending on the venue channel.
+
+**Python config:**
+
+```python
+DataTesterConfig(
+    instrument_ids=[instrument_id],
+    subscribe_option_greeks=True,
+)
+```
+
+**Rust config:**
+
+```rust
+DataTesterConfig::new(client_id, vec![instrument_id])
+    .with_subscribe_option_greeks(true)
+```
 
 ### TC-D63: Subscribe option chain
 
@@ -735,6 +767,8 @@ Test option greeks and option chain subscriptions.
 - Option chain subscriptions are managed by the DataEngine, which creates per-instrument
   quote and greeks subscriptions internally.
 - ATM-relative strike ranges require a forward price bootstrap before subscriptions begin.
+- Not yet configurable via `DataTesterConfig`; requires manual actor setup with
+  `subscribe_option_chain` and an `OptionSeriesId`.
 
 ---
 
@@ -745,8 +779,8 @@ Test actor lifecycle behavior: unsubscribe handling and custom parameters.
 | TC     | Name                    | Description                                        | Skip when            |
 |--------|-------------------------|----------------------------------------------------|----------------------|
 | TC-D70 | Unsubscribe on stop     | Unsubscribe from data feeds on actor stop.         | No unsub support.    |
-| TC-D71 | Custom subscribe params | Adapter-specific subscription parameters.          | N/A.                 |
-| TC-D72 | Custom request params   | Adapter-specific request parameters.               | N/A.                 |
+| TC-D71 | Custom subscribe params | Adapter‑specific subscription parameters.          | N/A.                 |
+| TC-D72 | Custom request params   | Adapter‑specific request parameters.               | N/A.                 |
 
 ### TC-D70: Unsubscribe on stop
 
@@ -783,10 +817,10 @@ DataTesterConfig::new(client_id, vec![instrument_id])
 | Field              | Value                                                                  |
 |--------------------|------------------------------------------------------------------------|
 | **Prerequisite**   | Adapter connected, adapter accepts additional subscription parameters. |
-| **Action**         | Subscribe with `subscribe_params` dict containing adapter-specific parameters. |
+| **Action**         | Subscribe with `subscribe_params` dict containing adapter‑specific parameters. |
 | **Event sequence** | Subscription established with custom parameters applied.               |
-| **Pass criteria**  | Data flows with adapter-specific parameters in effect.                 |
-| **Skip when**      | N/A (adapter-specific).                                                |
+| **Pass criteria**  | Data flows with adapter‑specific parameters in effect.                 |
+| **Skip when**      | N/A (adapter‑specific).                                                |
 
 **Considerations:**
 
@@ -798,10 +832,10 @@ DataTesterConfig::new(client_id, vec![instrument_id])
 | Field              | Value                                                                  |
 |--------------------|------------------------------------------------------------------------|
 | **Prerequisite**   | Adapter connected, adapter accepts additional request parameters.      |
-| **Action**         | Request data with `request_params` dict containing adapter-specific parameters. |
+| **Action**         | Request data with `request_params` dict containing adapter‑specific parameters. |
 | **Event sequence** | Request fulfilled with custom parameters applied.                      |
-| **Pass criteria**  | Historical data received with adapter-specific parameters in effect.   |
-| **Skip when**      | N/A (adapter-specific).                                                |
+| **Pass criteria**  | Historical data received with adapter‑specific parameters in effect.   |
+| **Skip when**      | N/A (adapter‑specific).                                                |
 
 **Considerations:**
 
@@ -832,8 +866,9 @@ Note: Rust `DataTesterConfig::new` sets `manage_book=true`, while Python default
 | `subscribe_instrument`       | bool              | False           | 1              |
 | `subscribe_instrument_status`| bool              | False           | 7              |
 | `subscribe_instrument_close` | bool              | False           | 7              |
-| `subscribe_params`           | dict?             | None            | 8              |
-| `can_unsubscribe`            | bool              | True            | 8              |
+| `subscribe_option_greeks`    | bool              | False           | 8              |
+| `subscribe_params`           | dict?             | None            | 9              |
+| `can_unsubscribe`            | bool              | True            | 9              |
 | `request_instruments`        | bool              | False           | 1              |
 | `request_book_snapshot`      | bool              | False           | 2              |
 | `request_book_deltas`        | bool              | False           | 2              |
@@ -841,7 +876,7 @@ Note: Rust `DataTesterConfig::new` sets `manage_book=true`, while Python default
 | `request_trades`             | bool              | False           | 4              |
 | `request_bars`               | bool              | False           | 5              |
 | `request_funding_rates`      | bool              | False           | 6              |
-| `request_params`             | dict?             | None            | 8              |
+| `request_params`             | dict?             | None            | 9              |
 | `requests_start_delta`       | Timedelta?        | 1 hour          | 3, 4, 5        |
 | `book_type`                  | BookType          | L2_MBP          | 2              |
 | `book_depth`                 | PositiveInt?      | None            | 2              |

@@ -14,21 +14,19 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     fs::{File, create_dir_all},
     io::{self, BufWriter, Stderr, Stdout, Write},
     path::PathBuf,
-    sync::OnceLock,
 };
 
 use chrono::{NaiveDate, Utc};
 use log::LevelFilter;
 use nautilus_core::consts::NAUTILUS_PREFIX;
-use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 use crate::logging::logger::LogLine;
-
-static ANSI_RE: OnceLock<Regex> = OnceLock::new();
 
 pub trait LogWriter {
     /// Writes a log line.
@@ -42,32 +40,54 @@ pub trait LogWriter {
 #[derive(Debug)]
 pub struct StdoutWriter {
     pub is_colored: bool,
-    io: Stdout,
+    io: StdoutSink,
     level: LevelFilter,
+}
+
+#[derive(Debug)]
+enum StdoutSink {
+    Direct(Stdout),
+    Buffered(BufWriter<Stdout>),
 }
 
 impl StdoutWriter {
     /// Creates a new [`StdoutWriter`] instance.
     #[must_use]
-    pub fn new(level: LevelFilter, is_colored: bool) -> Self {
+    pub fn new(level: LevelFilter, is_colored: bool, buffered: bool) -> Self {
+        let io = if buffered {
+            StdoutSink::Buffered(BufWriter::new(io::stdout()))
+        } else {
+            StdoutSink::Direct(io::stdout())
+        };
+
         Self {
-            io: io::stdout(),
-            level,
             is_colored,
+            io,
+            level,
         }
     }
 }
 
 impl LogWriter for StdoutWriter {
     fn write(&mut self, line: &str) {
-        match self.io.write_all(line.as_bytes()) {
+        let result = match &mut self.io {
+            StdoutSink::Direct(io) => io.write_all(line.as_bytes()),
+            StdoutSink::Buffered(io) => io.write_all(line.as_bytes()),
+        };
+
+        match result {
             Ok(()) => {}
             Err(e) => eprintln!("Error writing to stdout: {e:?}"),
         }
     }
 
     fn flush(&mut self) {
-        match self.io.flush() {
+        let result = match &mut self.io {
+            StdoutSink::Direct(io) => io.flush(),
+            StdoutSink::Buffered(io) => io.flush(),
+        };
+
+        match result {
             Ok(()) => {}
             Err(e) => eprintln!("Error flushing stdout: {e:?}"),
         }
@@ -117,19 +137,35 @@ impl LogWriter for StderrWriter {
 }
 
 /// File rotation config.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FileRotateConfig {
     /// Maximum file size in bytes before rotating.
     pub max_file_size: u64,
     /// Maximum number of backup files to keep.
     pub max_backup_count: u32,
     /// Current file size tracking.
+    #[serde(skip)]
     cur_file_size: u64,
     /// Current file creation date.
+    #[serde(skip, default = "today_date")]
     cur_file_creation_date: NaiveDate,
     /// Queue of backup file paths (oldest first).
+    #[serde(skip)]
     backup_files: VecDeque<PathBuf>,
 }
+
+fn today_date() -> NaiveDate {
+    Utc::now().date_naive()
+}
+
+impl PartialEq for FileRotateConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_file_size == other.max_file_size && self.max_backup_count == other.max_backup_count
+    }
+}
+
+impl Eq for FileRotateConfig {}
 
 impl Default for FileRotateConfig {
     fn default() -> Self {
@@ -160,7 +196,12 @@ impl From<(u64, u32)> for FileRotateConfig {
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.common", from_py_object)
 )]
-#[derive(Debug, Clone, Default)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.common")
+)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FileWriterConfig {
     pub directory: Option<String>,
     pub file_name: Option<String>,
@@ -197,6 +238,7 @@ pub struct FileWriter {
     instance_id: String,
     level: LevelFilter,
     cur_file_date: NaiveDate,
+    sync_on_flush: bool,
 }
 
 impl FileWriter {
@@ -206,6 +248,8 @@ impl FileWriter {
         instance_id: String,
         file_config: FileWriterConfig,
         fileout_level: LevelFilter,
+        clear_log_file: bool,
+        sync_on_flush: bool,
     ) -> Option<Self> {
         // Set up log file
         let json_format = match file_config.file_format.as_ref().map(|s| s.to_lowercase()) {
@@ -227,6 +271,13 @@ impl FileWriter {
                     return None;
                 }
             };
+
+        if clear_log_file
+            && file_path.exists()
+            && let Err(e) = File::create(&file_path)
+        {
+            eprintln!("{NAUTILUS_PREFIX} Error clearing log file: {e}");
+        }
 
         match File::options()
             .create(true)
@@ -251,6 +302,7 @@ impl FileWriter {
                     instance_id,
                     level: fileout_level,
                     cur_file_date: Utc::now().date_naive(),
+                    sync_on_flush,
                 })
             }
             Err(e) => {
@@ -268,28 +320,24 @@ impl FileWriter {
     ) -> Result<PathBuf, io::Error> {
         let utc_now = Utc::now();
 
-        let basename = match file_config.file_name.as_ref() {
-            Some(file_name) => {
-                if file_config.file_rotate.is_some() {
-                    let utc_datetime = utc_now.format("%Y-%m-%d_%H%M%S:%3f");
-                    format!("{file_name}_{utc_datetime}")
-                } else {
-                    file_name.clone()
-                }
+        let basename = if let Some(file_name) = file_config.file_name.as_ref() {
+            if file_config.file_rotate.is_some() {
+                let utc_datetime = utc_now.format("%Y-%m-%d_%H%M%S:%3f");
+                format!("{file_name}_{utc_datetime}")
+            } else {
+                file_name.clone()
             }
-            None => {
-                // Default base name
-                let utc_component = if file_config.file_rotate.is_some() {
-                    utc_now.format("%Y-%m-%d_%H%M%S:%3f")
-                } else {
-                    utc_now.format("%Y-%m-%d")
-                };
+        } else {
+            let utc_component = if file_config.file_rotate.is_some() {
+                utc_now.format("%Y-%m-%d_%H%M%S:%3f")
+            } else {
+                utc_now.format("%Y-%m-%d")
+            };
 
-                format!("{trader_id}_{utc_component}_{instance_id}")
-            }
+            format!("{trader_id}_{utc_component}_{instance_id}")
         };
 
-        let suffix = if is_json_format { "json" } else { "log" };
+        let suffix = if is_json_format { "jsonl" } else { "log" };
         let mut file_path = PathBuf::new();
 
         if let Some(directory) = file_config.directory.as_ref() {
@@ -318,7 +366,7 @@ impl FileWriter {
     }
 
     fn rotate_file(&mut self) {
-        self.flush();
+        self.flush_and_sync_logged();
 
         let new_path = match Self::create_log_file_path(
             &self.file_config,
@@ -348,13 +396,55 @@ impl FileWriter {
                 }
 
                 self.buf = BufWriter::new(new_file);
-                self.path = new_path.clone();
+                self.path.clone_from(&new_path);
                 eprintln!(
                     "{NAUTILUS_PREFIX} Rotated log file, now logging to: {}",
                     new_path.display()
                 );
             }
             Err(e) => eprintln!("{NAUTILUS_PREFIX} Error creating log file: {e}"),
+        }
+    }
+
+    /// Flushes the userspace file buffer to the OS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying file buffer cannot be flushed.
+    pub fn flush_buffer(&mut self) -> io::Result<()> {
+        self.buf.flush()
+    }
+
+    /// Requests that flushed file data is synchronized to durable storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operating system cannot sync the file to disk.
+    pub fn sync_to_disk(&mut self) -> io::Result<()> {
+        self.buf.get_ref().sync_all()
+    }
+
+    /// Flushes buffered file data and then syncs it to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either flushing the file buffer or syncing the file to disk fails.
+    pub fn flush_and_sync(&mut self) -> io::Result<()> {
+        let flush_result = self.flush_buffer();
+        let sync_result = self.sync_to_disk();
+        flush_result.and(sync_result)
+    }
+
+    /// Flushes and syncs while preserving the existing logging-on-error behavior.
+    pub fn flush_and_sync_logged(&mut self) {
+        let flush_result = self.flush_buffer();
+        if let Err(e) = flush_result {
+            eprintln!("{NAUTILUS_PREFIX} Error flushing file: {e:?}");
+        }
+
+        let sync_result = self.sync_to_disk();
+        if let Err(e) = sync_result {
+            eprintln!("{NAUTILUS_PREFIX} Error syncing file: {e:?}");
         }
     }
 }
@@ -387,7 +477,7 @@ fn cleanup_backups(rotate_config: &mut FileRotateConfig) {
 
 impl LogWriter for FileWriter {
     fn write(&mut self, line: &str) {
-        let line = strip_ansi_codes(line);
+        let line = sanitize_file_line(line);
         let line_size = line.len() as u64;
 
         // Rotate file if needed (size-based or date-based depending on configuration)
@@ -407,14 +497,16 @@ impl LogWriter for FileWriter {
     }
 
     fn flush(&mut self) {
-        match self.buf.flush() {
+        match self.flush_buffer() {
             Ok(()) => {}
             Err(e) => eprintln!("{NAUTILUS_PREFIX} Error flushing file: {e:?}"),
         }
 
-        match self.buf.get_ref().sync_all() {
-            Ok(()) => {}
-            Err(e) => eprintln!("{NAUTILUS_PREFIX} Error syncing file: {e:?}"),
+        if self.sync_on_flush {
+            match self.sync_to_disk() {
+                Ok(()) => {}
+                Err(e) => eprintln!("{NAUTILUS_PREFIX} Error syncing file: {e:?}"),
+            }
         }
     }
 
@@ -423,23 +515,117 @@ impl LogWriter for FileWriter {
     }
 }
 
-fn strip_nonprinting_except_newline(s: &str) -> String {
+fn contains_ansi_escape(s: &str) -> bool {
+    s.as_bytes().contains(&b'\x1b')
+}
+
+fn contains_nonprinting_except_newline(s: &str) -> bool {
+    if s.is_ascii() {
+        return s.bytes().any(|b| b != b'\n' && (b < b' ' || b == b'\x7f'));
+    }
+
+    s.chars()
+        .any(|c| c != '\n' && (c.is_control() || c == '\u{7F}'))
+}
+
+fn strip_nonprinting_except_newline(s: &str) -> Cow<'_, str> {
+    if !contains_nonprinting_except_newline(s) {
+        return Cow::Borrowed(s);
+    }
+
+    Cow::Owned(strip_nonprinting_to_string(s))
+}
+
+fn strip_nonprinting_to_string(s: &str) -> String {
     s.chars()
         .filter(|&c| c == '\n' || (!c.is_control() && c != '\u{7F}'))
         .collect()
 }
 
-fn strip_ansi_codes(s: &str) -> String {
-    let re = ANSI_RE.get_or_init(|| Regex::new(r"\x1B\[[0-9;?=]*[A-Za-z]|\x1B\].*?\x07").unwrap());
-    // Strip ANSI codes first (while \x1B is still present), then remove other control chars
-    let no_ansi = re.replace_all(s, "");
-    strip_nonprinting_except_newline(&no_ansi)
+fn sanitize_file_line(s: &str) -> Cow<'_, str> {
+    if !contains_ansi_escape(s) {
+        return strip_nonprinting_except_newline(s);
+    }
+
+    Cow::Owned(strip_ansi_and_nonprinting_to_string(s))
+}
+
+fn strip_ansi_and_nonprinting_to_string(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\x1b' {
+            if let Some(end) = ansi_escape_end(bytes, i) {
+                i = end;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if bytes[i].is_ascii() {
+            if bytes[i] == b'\n' || (bytes[i] >= b' ' && bytes[i] != b'\x7f') {
+                out.push(bytes[i] as char);
+            }
+            i += 1;
+            continue;
+        }
+
+        let ch = s[i..]
+            .chars()
+            .next()
+            .expect("valid UTF-8 char boundary expected");
+
+        if ch == '\n' || (!ch.is_control() && ch != '\u{7F}') {
+            out.push(ch);
+        }
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+fn ansi_escape_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match bytes.get(start + 1).copied() {
+        Some(b'[') => csi_escape_end(bytes, start + 2),
+        Some(b']') => osc_escape_end(bytes, start + 2),
+        _ => None,
+    }
+}
+
+fn csi_escape_end(bytes: &[u8], mut i: usize) -> Option<usize> {
+    while let Some(byte) = bytes.get(i).copied() {
+        if byte.is_ascii_alphabetic() {
+            return Some(i + 1);
+        }
+
+        if !matches!(byte, b'0'..=b'9' | b';' | b'?' | b'=') {
+            return None;
+        }
+        i += 1;
+    }
+
+    None
+}
+
+fn osc_escape_end(bytes: &[u8], mut i: usize) -> Option<usize> {
+    while let Some(byte) = bytes.get(i).copied() {
+        if byte == b'\x07' {
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use log::LevelFilter;
     use rstest::rstest;
+    use smallvec::SmallVec;
     use tempfile::tempdir;
 
     use super::*;
@@ -460,6 +646,8 @@ mod tests {
             "instance-123".to_string(),
             config,
             LevelFilter::Info,
+            false,
+            true,
         )
         .unwrap();
 
@@ -495,9 +683,18 @@ mod tests {
     #[case("Before\x1B[0mAfter", "BeforeAfter")]
     #[case("\x1B]0;Title\x07Content", "Content")]
     #[case("Text\t\x1B[31mRed\x1B[0m", "TextRed")]
-    fn test_strip_ansi_codes(#[case] input: &str, #[case] expected: &str) {
-        let result = strip_ansi_codes(input);
+    #[case("Broken\x1B[31", "Broken[31")]
+    #[case("Broken\x1B]Title", "Broken]Title")]
+    fn test_sanitize_file_line(#[case] input: &str, #[case] expected: &str) {
+        let result = sanitize_file_line(input);
         assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    fn test_sanitize_file_line_borrows_clean_input() {
+        let result = sanitize_file_line("Plain text\n");
+
+        assert!(matches!(result, Cow::Borrowed(_)));
     }
 
     #[rstest]
@@ -514,6 +711,8 @@ mod tests {
             "instance-123".to_string(),
             config,
             LevelFilter::Info,
+            false,
+            true,
         );
 
         assert!(writer.is_none());
@@ -537,6 +736,8 @@ mod tests {
             "instance-123".to_string(),
             config,
             LevelFilter::Info,
+            false,
+            true,
         );
 
         assert!(writer.is_none());
@@ -558,6 +759,8 @@ mod tests {
             "instance-123".to_string(),
             config,
             LevelFilter::Info,
+            false,
+            true,
         )
         .unwrap();
 
@@ -581,16 +784,109 @@ mod tests {
             "instance-123".to_string(),
             config,
             LevelFilter::Info,
+            false,
+            true,
         )
         .unwrap();
 
         assert!(writer.json_format);
-        assert!(writer.path.extension().unwrap() == "json");
+        assert!(writer.path.extension().unwrap() == "jsonl");
+    }
+
+    #[rstest]
+    fn test_file_writer_clear_log_file_truncates_existing_file() {
+        let temp_dir = tempdir().unwrap();
+
+        let config = FileWriterConfig {
+            directory: Some(temp_dir.path().to_str().unwrap().to_string()),
+            file_name: Some("test".to_string()),
+            file_format: None,
+            file_rotate: None,
+        };
+
+        let existing_path = temp_dir.path().join("test.log");
+        std::fs::write(&existing_path, "stale contents").unwrap();
+        assert_eq!(
+            std::fs::metadata(&existing_path).unwrap().len(),
+            "stale contents".len() as u64
+        );
+
+        let writer = FileWriter::new(
+            "TRADER-001".to_string(),
+            "instance-123".to_string(),
+            config,
+            LevelFilter::Info,
+            true,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(writer.path, existing_path);
+        assert_eq!(std::fs::metadata(&existing_path).unwrap().len(), 0);
+    }
+
+    #[rstest]
+    fn test_file_writer_clear_log_file_false_preserves_existing_file() {
+        let temp_dir = tempdir().unwrap();
+
+        let config = FileWriterConfig {
+            directory: Some(temp_dir.path().to_str().unwrap().to_string()),
+            file_name: Some("test".to_string()),
+            file_format: None,
+            file_rotate: None,
+        };
+
+        let existing_path = temp_dir.path().join("test.log");
+        let existing_contents = "preserved contents";
+        std::fs::write(&existing_path, existing_contents).unwrap();
+
+        let writer = FileWriter::new(
+            "TRADER-001".to_string(),
+            "instance-123".to_string(),
+            config,
+            LevelFilter::Info,
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(writer.path, existing_path);
+        assert_eq!(
+            std::fs::read_to_string(&existing_path).unwrap(),
+            existing_contents
+        );
+    }
+
+    #[rstest]
+    fn test_file_writer_sync_on_flush_can_be_disabled() {
+        let temp_dir = tempdir().unwrap();
+
+        let config = FileWriterConfig {
+            directory: Some(temp_dir.path().to_str().unwrap().to_string()),
+            file_name: Some("test".to_string()),
+            file_format: None,
+            file_rotate: None,
+        };
+
+        let mut writer = FileWriter::new(
+            "TRADER-001".to_string(),
+            "instance-123".to_string(),
+            config,
+            LevelFilter::Info,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(!writer.sync_on_flush);
+        writer.write("hello\n");
+        writer.flush();
+        writer.flush_and_sync().unwrap();
     }
 
     #[rstest]
     fn test_stdout_writer_filters_error_level() {
-        let writer = StdoutWriter::new(LevelFilter::Info, true);
+        let writer = StdoutWriter::new(LevelFilter::Info, true, false);
 
         // Error level should NOT be enabled for stdout (goes to stderr)
         let error_line = LogLine {
@@ -599,6 +895,7 @@ mod tests {
             color: crate::enums::LogColor::Normal,
             component: ustr::Ustr::from("Test"),
             message: "error".to_string(),
+            fields: SmallVec::new(),
         };
         assert!(!writer.enabled(&error_line));
 
@@ -609,6 +906,7 @@ mod tests {
             color: crate::enums::LogColor::Normal,
             component: ustr::Ustr::from("Test"),
             message: "info".to_string(),
+            fields: SmallVec::new(),
         };
         assert!(writer.enabled(&info_line));
 
@@ -619,6 +917,7 @@ mod tests {
             color: crate::enums::LogColor::Normal,
             component: ustr::Ustr::from("Test"),
             message: "debug".to_string(),
+            fields: SmallVec::new(),
         };
         assert!(!writer.enabled(&debug_line));
     }
@@ -633,6 +932,7 @@ mod tests {
             color: crate::enums::LogColor::Normal,
             component: ustr::Ustr::from("Test"),
             message: "error".to_string(),
+            fields: SmallVec::new(),
         };
         assert!(writer.enabled(&error_line));
 
@@ -642,6 +942,7 @@ mod tests {
             color: crate::enums::LogColor::Normal,
             component: ustr::Ustr::from("Test"),
             message: "warn".to_string(),
+            fields: SmallVec::new(),
         };
         assert!(!writer.enabled(&warn_line));
     }

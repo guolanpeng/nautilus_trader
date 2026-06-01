@@ -19,7 +19,7 @@ use nautilus_model::enums::{AggressorSide, OrderSide, OrderStatus, OrderType};
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
 
-use super::consts::HYPERLIQUID_POST_ONLY_WOULD_MATCH;
+use super::{consts::HYPERLIQUID_POST_ONLY_WOULD_MATCH, parse::OUTCOME_SYMBOL_SUFFIX};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HyperliquidBarInterval {
@@ -224,6 +224,10 @@ pub enum HyperliquidOrderType {
         rename_all = "SCREAMING_SNAKE_CASE",
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.hyperliquid")
+)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum HyperliquidTpSl {
@@ -258,6 +262,10 @@ pub enum HyperliquidTpSl {
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.hyperliquid")
 )]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
@@ -331,6 +339,10 @@ impl From<OrderType> for HyperliquidConditionalOrderType {
         rename_all = "SCREAMING_SNAKE_CASE",
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.hyperliquid")
+)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum HyperliquidTrailingOffsetType {
@@ -401,6 +413,8 @@ impl From<bool> for HyperliquidLiquidityFlag {
 pub enum HyperliquidLiquidationMethod {
     Market,
     Backstop,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Hyperliquid position type/mode.
@@ -630,6 +644,9 @@ pub enum HyperliquidOrderStatus {
     /// Order rejected due to minimum trade notional.
     #[serde(rename = "minTradeNtlRejected")]
     MinTradeNtlRejected,
+    /// Order rejected due to minimum spot trade notional.
+    #[serde(rename = "minTradeSpotNtlRejected")]
+    MinTradeSpotNtlRejected,
     /// Order rejected due to perp margin.
     #[serde(rename = "perpMarginRejected")]
     PerpMarginRejected,
@@ -692,6 +709,7 @@ impl From<HyperliquidOrderStatus> for OrderStatus {
             HyperliquidOrderStatus::Rejected
             | HyperliquidOrderStatus::TickRejected
             | HyperliquidOrderStatus::MinTradeNtlRejected
+            | HyperliquidOrderStatus::MinTradeSpotNtlRejected
             | HyperliquidOrderStatus::PerpMarginRejected
             | HyperliquidOrderStatus::ReduceOnlyRejected
             | HyperliquidOrderStatus::BadAloPxRejected
@@ -760,10 +778,39 @@ pub enum HyperliquidFillDirection {
     #[serde(rename = "Short > Long")]
     #[strum(serialize = "Short > Long")]
     ShortToLong,
+    /// Auto-deleveraging counterparty fill (perp ADL event).
+    #[serde(rename = "Auto-Deleveraging")]
+    #[strum(serialize = "Auto-Deleveraging")]
+    AutoDeleveraging,
     /// Buying an asset (spot only).
     Buy,
     /// Selling an asset (spot only).
     Sell,
+    /// HIP-4 outcome settlement; venue closes side-token holdings at the
+    /// resolved value (1 quote token for the winning side, 0 for the loser).
+    #[serde(rename = "Settlement")]
+    #[strum(serialize = "Settlement")]
+    Settlement,
+    /// HIP-4 `userOutcome / splitOutcome`: minting paired Yes + No side tokens
+    /// from quote tokens. Venue emits one fill per side at the mid price.
+    #[serde(rename = "Split Outcome")]
+    #[strum(serialize = "Split Outcome")]
+    SplitOutcome,
+    /// HIP-4 `userOutcome / mergeOutcome`: burning paired Yes + No side tokens
+    /// back into quote tokens. Reverse of [`Self::SplitOutcome`].
+    #[serde(rename = "Merge Outcome")]
+    #[strum(serialize = "Merge Outcome")]
+    MergeOutcome,
+    /// HIP-4 `userOutcome / mergeQuestion`: burning one Yes share of every
+    /// outcome in a multi-outcome question for the equivalent quote tokens.
+    #[serde(rename = "Merge Question")]
+    #[strum(serialize = "Merge Question")]
+    MergeQuestion,
+    /// HIP-4 `userOutcome / negateOutcome`: swapping `No` shares of one
+    /// outcome for `Yes` shares of every other outcome in the same question.
+    #[serde(rename = "Negate Outcome")]
+    #[strum(serialize = "Negate Outcome")]
+    NegateOutcome,
 }
 
 /// Represents info request types for the Hyperliquid info endpoint.
@@ -794,6 +841,8 @@ pub enum HyperliquidInfoRequestType {
     MetaAndAssetCtxs,
     /// Get spot metadata with asset contexts.
     SpotMetaAndAssetCtxs,
+    /// Get outcome metadata.
+    OutcomeMeta,
     /// Get L2 order book for a coin.
     L2Book,
     /// Get all mid prices.
@@ -818,8 +867,6 @@ pub enum HyperliquidInfoRequestType {
     CandleSnapshot,
     /// Get candle/bar data (WS post).
     Candle,
-    /// Get recent trades.
-    RecentTrades,
     /// Get historical orders.
     HistoricalOrders,
     /// Get funding history.
@@ -846,6 +893,10 @@ pub enum HyperliquidInfoRequestType {
     ValidatorStats,
     /// Get user fee schedule and effective rates.
     UserFees,
+    /// Get the list of perp dex descriptors.
+    PerpDexs,
+    /// Get metadata for all perp dexes (standard + HIP-3).
+    AllPerpMetas,
 }
 
 impl HyperliquidInfoRequestType {
@@ -855,6 +906,7 @@ impl HyperliquidInfoRequestType {
             Self::SpotMeta => "spotMeta",
             Self::MetaAndAssetCtxs => "metaAndAssetCtxs",
             Self::SpotMetaAndAssetCtxs => "spotMetaAndAssetCtxs",
+            Self::OutcomeMeta => "outcomeMeta",
             Self::L2Book => "l2Book",
             Self::AllMids => "allMids",
             Self::UserFills => "userFills",
@@ -867,7 +919,6 @@ impl HyperliquidInfoRequestType {
             Self::ExchangeStatus => "exchangeStatus",
             Self::CandleSnapshot => "candleSnapshot",
             Self::Candle => "candle",
-            Self::RecentTrades => "recentTrades",
             Self::HistoricalOrders => "historicalOrders",
             Self::FundingHistory => "fundingHistory",
             Self::UserFunding => "userFunding",
@@ -881,6 +932,8 @@ impl HyperliquidInfoRequestType {
             Self::DelegatorRewards => "delegatorRewards",
             Self::ValidatorStats => "validatorStats",
             Self::UserFees => "userFees",
+            Self::PerpDexs => "perpDexs",
+            Self::AllPerpMetas => "allPerpMetas",
         }
     }
 }
@@ -920,6 +973,10 @@ pub enum HyperliquidLeverageType {
         rename_all = "SCREAMING_SNAKE_CASE",
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.hyperliquid")
+)]
 #[serde(rename_all = "UPPERCASE")]
 #[strum(serialize_all = "UPPERCASE")]
 pub enum HyperliquidProductType {
@@ -927,23 +984,84 @@ pub enum HyperliquidProductType {
     Perp,
     /// Spot markets.
     Spot,
+    /// HIP-4 binary outcome side tokens.
+    Outcome,
 }
 
 impl HyperliquidProductType {
     /// Extract product type from an instrument symbol.
     ///
+    /// Accepts both Nautilus instrument symbols (`{BASE}-USD-PERP`,
+    /// `{BASE}-{QUOTE}-SPOT`, `{N}-{YES|NO}-OUTCOME`) and venue wire coin
+    /// names (`#<encoding>` / `+<encoding>` for HIP-4 outcomes). Callers in
+    /// the adapter pass both forms.
+    ///
     /// # Errors
     ///
-    /// Returns error if symbol doesn't match expected format.
+    /// Returns error if symbol doesn't match any expected format.
     pub fn from_symbol(symbol: &str) -> anyhow::Result<Self> {
         if symbol.ends_with("-PERP") {
             Ok(Self::Perp)
         } else if symbol.ends_with("-SPOT") {
             Ok(Self::Spot)
+        } else if symbol.ends_with(OUTCOME_SYMBOL_SUFFIX) || is_outcome_wire_symbol(symbol) {
+            Ok(Self::Outcome)
         } else {
             anyhow::bail!("Invalid Hyperliquid symbol format: {symbol}")
         }
     }
+}
+
+// Outcomes use the `#<encoding>` spot-coin form or the `+<encoding>` token
+// form, where the encoding is `10 * outcome + side` and must parse as `u32`.
+fn is_outcome_wire_symbol(symbol: &str) -> bool {
+    let Some(rest) = symbol
+        .strip_prefix('#')
+        .or_else(|| symbol.strip_prefix('+'))
+    else {
+        return false;
+    };
+    !rest.is_empty() && rest.parse::<u32>().is_ok()
+}
+
+/// Hyperliquid API environment.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(ascii_case_insensitive, serialize_all = "lowercase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.hyperliquid",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.hyperliquid")
+)]
+pub enum HyperliquidEnvironment {
+    /// Mainnet trading environment.
+    #[default]
+    Mainnet,
+    /// Testnet environment.
+    Testnet,
 }
 
 #[cfg(test)]
@@ -1015,6 +1133,47 @@ mod tests {
             assert_eq!(
                 serde_json::from_str::<HyperliquidTimeInForce>(expected_json).unwrap(),
                 tif
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_info_request_type_outcome_meta_as_str() {
+        assert_eq!(
+            HyperliquidInfoRequestType::OutcomeMeta.as_str(),
+            "outcomeMeta"
+        );
+    }
+
+    #[rstest]
+    fn test_fill_direction_serde() {
+        let cases = [
+            (HyperliquidFillDirection::OpenLong, "\"Open Long\""),
+            (HyperliquidFillDirection::CloseShort, "\"Close Short\""),
+            (HyperliquidFillDirection::LongToShort, "\"Long > Short\""),
+            (
+                HyperliquidFillDirection::AutoDeleveraging,
+                "\"Auto-Deleveraging\"",
+            ),
+            (HyperliquidFillDirection::Buy, "\"Buy\""),
+            (HyperliquidFillDirection::Settlement, "\"Settlement\""),
+            (HyperliquidFillDirection::SplitOutcome, "\"Split Outcome\""),
+            (HyperliquidFillDirection::MergeOutcome, "\"Merge Outcome\""),
+            (
+                HyperliquidFillDirection::MergeQuestion,
+                "\"Merge Question\"",
+            ),
+            (
+                HyperliquidFillDirection::NegateOutcome,
+                "\"Negate Outcome\"",
+            ),
+        ];
+
+        for (variant, expected) in cases {
+            assert_eq!(serde_json::to_string(&variant).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_str::<HyperliquidFillDirection>(expected).unwrap(),
+                variant
             );
         }
     }
@@ -1520,5 +1679,41 @@ mod tests {
             let back_to_cond = HyperliquidConditionalOrderType::from(order_type);
             assert_eq!(cond_type, back_to_cond, "Roundtrip conversion failed");
         }
+    }
+
+    #[rstest]
+    #[case("BTC-USD-PERP", HyperliquidProductType::Perp)]
+    #[case("HYPE-USDC-SPOT", HyperliquidProductType::Spot)]
+    #[case("25-YES-OUTCOME", HyperliquidProductType::Outcome)]
+    #[case("25-NO-OUTCOME", HyperliquidProductType::Outcome)]
+    #[case("0-YES-OUTCOME", HyperliquidProductType::Outcome)]
+    #[case("#10", HyperliquidProductType::Outcome)]
+    #[case("+31", HyperliquidProductType::Outcome)]
+    #[case("#0", HyperliquidProductType::Outcome)]
+    fn test_product_type_from_symbol(
+        #[case] symbol: &str,
+        #[case] expected: HyperliquidProductType,
+    ) {
+        assert_eq!(
+            HyperliquidProductType::from_symbol(symbol).unwrap(),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case("")]
+    #[case("BTC")]
+    #[case("#")]
+    #[case("+")]
+    #[case("#abc")]
+    #[case("+12.5")]
+    #[case("@1")]
+    #[case("#-1")]
+    #[case("+-1")]
+    #[case("25-YES")]
+    #[case("OUTCOME")]
+    #[case("25-YES-outcome")]
+    fn test_product_type_from_symbol_rejects_invalid(#[case] symbol: &str) {
+        assert!(HyperliquidProductType::from_symbol(symbol).is_err());
     }
 }

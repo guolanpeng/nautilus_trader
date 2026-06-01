@@ -20,10 +20,13 @@ use std::{
     str::FromStr,
 };
 
-use alloy_signer_local::PrivateKeySigner;
+use alloy::signers::local::PrivateKeySigner;
 use aws_lc_rs::hmac;
 use base64::{Engine, engine::general_purpose::URL_SAFE};
-use nautilus_core::env::{get_or_env_var, get_or_env_var_opt};
+use nautilus_core::{
+    env::{get_or_env_var, get_or_env_var_opt},
+    hex,
+};
 use ustr::Ustr;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -151,6 +154,14 @@ impl Credential {
         &self.passphrase
     }
 
+    /// Returns the raw API secret as a base64-encoded string.
+    ///
+    /// Used for WebSocket user channel authentication which expects the raw
+    /// secret (not an HMAC signature).
+    pub fn api_secret(&self) -> String {
+        URL_SAFE.encode(&*self.secret_bytes)
+    }
+
     /// Signs a request with HMAC-SHA256 and returns the base64-encoded signature.
     ///
     /// Message format: `{timestamp}{method}{request_path}{body}`
@@ -272,6 +283,13 @@ impl Secrets {
         let signer = PrivateKeySigner::from_str(key_hex)
             .map_err(|e| Error::bad_request(format!("Failed to derive address: {e}")))?;
         let address = format!("{:#x}", signer.address());
+
+        log::info!(
+            "Polymarket credentials resolved: address={}, funder={:?}, api_key={}...)",
+            address,
+            funder.as_deref().map(|s| &s[..10.min(s.len())]),
+            &credential.api_key()[..8]
+        );
 
         Ok(Self {
             private_key,

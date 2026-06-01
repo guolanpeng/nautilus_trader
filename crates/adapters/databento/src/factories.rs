@@ -17,16 +17,20 @@
 
 use std::{any::Any, cell::RefCell, fmt::Debug, path::PathBuf, rc::Rc};
 
-use nautilus_common::{cache::Cache, clients::DataClient, clock::Clock};
+use nautilus_common::{
+    cache::CacheView,
+    clients::DataClient,
+    clock::Clock,
+    factories::{ClientConfig, DataClientFactory},
+};
 use nautilus_core::{
-    string::REDACTED,
+    string::secret::REDACTED,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::identifiers::ClientId;
-use nautilus_system::factories::{ClientConfig, DataClientFactory};
 
 use crate::{
-    common::Credential,
+    common::{Credential, DATABENTO},
     data::{DatabentoDataClient, DatabentoDataClientConfig},
     historical::DatabentoHistoricalClient,
 };
@@ -39,6 +43,10 @@ use crate::{
         module = "nautilus_trader.core.nautilus_pyo3.databento",
         from_py_object
     )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.databento")
 )]
 pub struct DatabentoLiveClientConfig {
     /// Databento API credential.
@@ -107,6 +115,10 @@ impl ClientConfig for DatabentoLiveClientConfig {
         from_py_object
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.databento")
+)]
 pub struct DatabentoDataClientFactory;
 
 impl DatabentoDataClientFactory {
@@ -164,7 +176,7 @@ impl DataClientFactory for DatabentoDataClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        _cache: Rc<RefCell<Cache>>,
+        _cache: CacheView,
         _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn DataClient>> {
         let databento_config = config
@@ -189,7 +201,7 @@ impl DataClientFactory for DatabentoDataClientFactory {
     }
 
     fn name(&self) -> &'static str {
-        "DATABENTO"
+        DATABENTO
     }
 
     fn config_type(&self) -> &'static str {
@@ -213,7 +225,12 @@ impl DatabentoHistoricalClientFactory {
         use_exchange_as_venue: bool,
         clock: &'static AtomicTime,
     ) -> anyhow::Result<DatabentoHistoricalClient> {
-        DatabentoHistoricalClient::new(api_key, publishers_filepath, clock, use_exchange_as_venue)
+        DatabentoHistoricalClient::new(
+            Credential::new(api_key),
+            publishers_filepath,
+            clock,
+            use_exchange_as_venue,
+        )
     }
 }
 
@@ -327,7 +344,7 @@ mod tests {
 
     #[rstest]
     fn test_historical_client_factory() {
-        let api_key = "db-test0000000000000000000000000".to_string();
+        let api_key = "test-000000000000000000000000000".to_string();
         let publishers_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("publishers.json");
         let clock = get_atomic_clock_realtime();
 

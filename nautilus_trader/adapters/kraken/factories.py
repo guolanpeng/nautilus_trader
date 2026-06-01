@@ -37,7 +37,6 @@ def get_cached_kraken_spot_http_client(
     api_key: str | None = None,
     api_secret: str | None = None,
     base_url: str | None = None,
-    demo: bool = False,
     timeout_secs: int | None = None,
     max_retries: int | None = None,
     retry_delay_ms: int | None = None,
@@ -63,8 +62,6 @@ def get_cached_kraken_spot_http_client(
         The Kraken API secret for the client.
     base_url : str, optional
         The base URL for the Kraken Spot API.
-    demo : bool, default False
-        Unused for Spot (Kraken Spot has no demo environment).
     timeout_secs : int, optional
         The timeout in seconds for HTTP requests.
     max_retries : int, optional
@@ -83,18 +80,25 @@ def get_cached_kraken_spot_http_client(
     nautilus_pyo3.KrakenSpotHttpClient
 
     """
-    return nautilus_pyo3.KrakenSpotHttpClient(
-        api_key=api_key,
-        api_secret=api_secret,
-        base_url=base_url,
-        demo=demo,
-        timeout_secs=timeout_secs,
-        max_retries=max_retries,
-        retry_delay_ms=retry_delay_ms,
-        retry_delay_max_ms=retry_delay_max_ms,
-        proxy_url=proxy_url,
-        max_requests_per_second=max_requests_per_second,
-    )
+    kwargs: dict = {
+        "api_key": api_key,
+        "api_secret": api_secret,
+        "base_url": base_url,
+        "proxy_url": proxy_url,
+    }
+
+    if timeout_secs is not None:
+        kwargs["timeout_secs"] = timeout_secs
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
+    if retry_delay_ms is not None:
+        kwargs["retry_delay_ms"] = retry_delay_ms
+    if retry_delay_max_ms is not None:
+        kwargs["retry_delay_max_ms"] = retry_delay_max_ms
+    if max_requests_per_second is not None:
+        kwargs["max_requests_per_second"] = max_requests_per_second
+
+    return nautilus_pyo3.KrakenSpotHttpClient(**kwargs)
 
 
 @lru_cache(1)
@@ -148,18 +152,26 @@ def get_cached_kraken_futures_http_client(
     nautilus_pyo3.KrakenFuturesHttpClient
 
     """
-    return nautilus_pyo3.KrakenFuturesHttpClient(
-        api_key=api_key,
-        api_secret=api_secret,
-        base_url=base_url,
-        demo=demo,
-        timeout_secs=timeout_secs,
-        max_retries=max_retries,
-        retry_delay_ms=retry_delay_ms,
-        retry_delay_max_ms=retry_delay_max_ms,
-        proxy_url=proxy_url,
-        max_requests_per_second=max_requests_per_second,
-    )
+    kwargs: dict = {
+        "api_key": api_key,
+        "api_secret": api_secret,
+        "base_url": base_url,
+        "demo": demo,
+        "proxy_url": proxy_url,
+    }
+
+    if timeout_secs is not None:
+        kwargs["timeout_secs"] = timeout_secs
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
+    if retry_delay_ms is not None:
+        kwargs["retry_delay_ms"] = retry_delay_ms
+    if retry_delay_max_ms is not None:
+        kwargs["retry_delay_max_ms"] = retry_delay_max_ms
+    if max_requests_per_second is not None:
+        kwargs["max_requests_per_second"] = max_requests_per_second
+
+    return nautilus_pyo3.KrakenFuturesHttpClient(**kwargs)
 
 
 @lru_cache(1)
@@ -235,9 +247,12 @@ class KrakenLiveDataClientFactory(LiveDataClientFactory):
         KrakenDataClient
 
         """
-        environment = config.environment or KrakenEnvironment.MAINNET
+        environment = config.environment or KrakenEnvironment.LIVE
         product_types = list(config.product_types or (KrakenProductType.SPOT,))
         is_demo = environment == KrakenEnvironment.DEMO
+
+        if is_demo and KrakenProductType.SPOT in product_types:
+            raise ValueError("Kraken Spot does not support the demo environment")
 
         # Get cached HTTP clients for each requested product type
         http_client_spot: nautilus_pyo3.KrakenSpotHttpClient | None = None
@@ -248,12 +263,11 @@ class KrakenLiveDataClientFactory(LiveDataClientFactory):
                 api_key=config.api_key,
                 api_secret=config.api_secret,
                 base_url=config.base_url_http_spot,
-                demo=is_demo,
                 timeout_secs=config.http_timeout_secs,
                 max_retries=config.max_retries,
                 retry_delay_ms=config.retry_delay_initial_ms,
                 retry_delay_max_ms=config.retry_delay_max_ms,
-                proxy_url=config.http_proxy_url,
+                proxy_url=config.proxy_url,
                 max_requests_per_second=config.max_requests_per_second,
             )
 
@@ -267,7 +281,7 @@ class KrakenLiveDataClientFactory(LiveDataClientFactory):
                 max_retries=config.max_retries,
                 retry_delay_ms=config.retry_delay_initial_ms,
                 retry_delay_max_ms=config.retry_delay_max_ms,
-                proxy_url=config.http_proxy_url,
+                proxy_url=config.proxy_url,
                 max_requests_per_second=config.max_requests_per_second,
             )
 
@@ -328,9 +342,12 @@ class KrakenLiveExecClientFactory(LiveExecClientFactory):
         KrakenExecutionClient
 
         """
-        environment = config.environment or KrakenEnvironment.MAINNET
+        environment = config.environment or KrakenEnvironment.LIVE
         product_types = list(config.product_types or (KrakenProductType.SPOT,))
         is_demo = environment == KrakenEnvironment.DEMO
+
+        if is_demo and KrakenProductType.SPOT in product_types:
+            raise ValueError("Kraken Spot does not support the demo environment")
 
         # Get cached HTTP clients for each requested product type
         http_client_spot: nautilus_pyo3.KrakenSpotHttpClient | None = None
@@ -341,12 +358,11 @@ class KrakenLiveExecClientFactory(LiveExecClientFactory):
                 api_key=config.api_key,
                 api_secret=config.api_secret,
                 base_url=config.base_url_http_spot,
-                demo=is_demo,
                 timeout_secs=config.http_timeout_secs,
                 max_retries=config.max_retries,
                 retry_delay_ms=config.retry_delay_initial_ms,
                 retry_delay_max_ms=config.retry_delay_max_ms,
-                proxy_url=config.http_proxy_url,
+                proxy_url=config.proxy_url,
                 max_requests_per_second=config.max_requests_per_second,
             )
 
@@ -360,7 +376,7 @@ class KrakenLiveExecClientFactory(LiveExecClientFactory):
                 max_retries=config.max_retries,
                 retry_delay_ms=config.retry_delay_initial_ms,
                 retry_delay_max_ms=config.retry_delay_max_ms,
-                proxy_url=config.http_proxy_url,
+                proxy_url=config.proxy_url,
                 max_requests_per_second=config.max_requests_per_second,
             )
 

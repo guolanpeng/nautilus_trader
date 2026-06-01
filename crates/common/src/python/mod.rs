@@ -15,12 +15,22 @@
 
 //! Python bindings from [PyO3](https://pyo3.rs).
 
+#![expect(
+    clippy::missing_errors_doc,
+    reason = "errors documented on underlying Rust methods"
+)]
+#![allow(
+    clippy::unused_self,
+    reason = "PyO3 stub methods take &self for Python API parity even when the body is empty"
+)]
+
 pub mod actor;
 pub mod cache;
 pub mod clock;
 pub mod custom;
 pub mod enums;
 pub mod fifo;
+pub mod greeks;
 pub mod listener;
 pub mod logging;
 pub mod msgbus;
@@ -41,17 +51,20 @@ use pyo3::prelude::*;
 pub fn common(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::custom::CustomData>()?;
     m.add_class::<crate::signal::Signal>()?;
+    m.add_class::<crate::timer::TimeEvent>()?;
     m.add_class::<crate::cache::CacheConfig>()?;
     m.add_class::<crate::python::actor::PyDataActor>()?;
     m.add_class::<crate::python::cache::PyCache>()?;
     m.add_class::<crate::python::fifo::PyFifoCache>()?;
     m.add_class::<crate::python::clock::PyClock>()?;
+    m.add_class::<crate::python::greeks::PyGreeksCalculator>()?;
     m.add_class::<crate::python::logging::PyLogger>()?;
     m.add_class::<crate::actor::data_actor::DataActorConfig>()?;
     m.add_class::<crate::actor::data_actor::ImportableActorConfig>()?;
     m.add_class::<crate::msgbus::BusMessage>()?;
     m.add_class::<crate::msgbus::database::DatabaseConfig>()?;
     m.add_class::<crate::msgbus::database::MessageBusConfig>()?;
+    m.add_class::<crate::python::msgbus::PyMessageBus>()?;
     m.add_class::<crate::enums::ComponentState>()?;
     m.add_class::<crate::enums::ComponentTrigger>()?;
     m.add_class::<crate::enums::Environment>()?;
@@ -63,6 +76,7 @@ pub fn common(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::logging::writer::FileWriterConfig>()?;
     m.add_function(wrap_pyfunction!(logging::py_init_logging, m)?)?;
     m.add_function(wrap_pyfunction!(logging::py_logger_flush, m)?)?;
+    m.add_function(wrap_pyfunction!(logging::py_logging_sync_to_disk, m)?)?;
     m.add_function(wrap_pyfunction!(logging::py_logger_log, m)?)?;
     m.add_function(wrap_pyfunction!(logging::py_log_header, m)?)?;
     m.add_function(wrap_pyfunction!(logging::py_log_sysinfo, m)?)?;

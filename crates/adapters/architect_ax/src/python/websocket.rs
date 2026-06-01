@@ -20,31 +20,37 @@
 //! components that emit venue-specific types; these wrappers parse them into Nautilus
 //! domain objects before passing them to Python callbacks.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::Debug,
+    sync::{Arc, Mutex},
+};
 
-use ahash::AHashMap;
-use dashmap::DashMap;
+use ahash::{AHashMap, AHashSet};
 use futures_util::StreamExt;
 use nautilus_common::live::get_runtime;
 use nautilus_core::{
-    UUID4, UnixNanos,
+    AtomicMap, UUID4, UnixNanos,
     python::{call_python_threadsafe, to_pyruntime_err},
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
-    data::{BarType, Data, OrderBookDeltas_API},
-    enums::{OrderSide, OrderType, TimeInForce},
+    data::{BarType, Data, InstrumentStatus, MarkPriceUpdate, OrderBookDeltas_API},
+    enums::{MarketStatusAction, OrderSide, OrderType, TimeInForce},
     events::OrderCancelRejected,
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     python::{data::data_to_pycapsule, instruments::pyobject_to_instrument_any},
     types::{Price, Quantity},
 };
+use nautilus_network::websocket::TransportBackend;
 use pyo3::{IntoPyObjectExt, prelude::*};
 use ustr::Ustr;
 
 use crate::{
-    common::enums::{AxCandleWidth, AxMarketDataLevel},
+    common::{
+        enums::{AxCandleWidth, AxInstrumentState, AxMarketDataLevel},
+        parse::ax_timestamp_stn_to_unix_nanos,
+    },
     execution::{
         cleanup_terminal_order_tracking, create_order_accepted, create_order_canceled,
         create_order_expired, create_order_filled, create_order_rejected,
@@ -70,9 +76,10 @@ use crate::{
     name = "AxMdWebSocketClient",
     module = "nautilus_trader.core.nautilus_pyo3.architect"
 )]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.architect_ax")]
 pub struct PyAxMdWebSocketClient {
     inner: AxMdWebSocketClient,
-    instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
+    instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
 }
 
 impl Debug for PyAxMdWebSocketClient {
@@ -84,23 +91,35 @@ impl Debug for PyAxMdWebSocketClient {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyAxMdWebSocketClient {
     #[new]
-    #[pyo3(signature = (url, auth_token, heartbeat=None))]
-    fn py_new(url: String, auth_token: String, heartbeat: Option<u64>) -> Self {
+    #[pyo3(signature = (url, auth_token, heartbeat=30, proxy_url=None))]
+    fn py_new(url: String, auth_token: String, heartbeat: u64, proxy_url: Option<String>) -> Self {
         Self {
-            inner: AxMdWebSocketClient::new(url, auth_token, heartbeat),
-            instruments_cache: Arc::new(DashMap::new()),
+            inner: AxMdWebSocketClient::new(
+                url,
+                auth_token,
+                heartbeat,
+                TransportBackend::default(),
+                proxy_url,
+            ),
+            instruments_cache: Arc::new(AtomicMap::new()),
         }
     }
 
     #[staticmethod]
     #[pyo3(name = "without_auth")]
-    #[pyo3(signature = (url, heartbeat=None))]
-    fn py_without_auth(url: String, heartbeat: Option<u64>) -> Self {
+    #[pyo3(signature = (url, heartbeat=30, proxy_url=None))]
+    fn py_without_auth(url: String, heartbeat: u64, proxy_url: Option<String>) -> Self {
         Self {
-            inner: AxMdWebSocketClient::without_auth(url, heartbeat),
-            instruments_cache: Arc::new(DashMap::new()),
+            inner: AxMdWebSocketClient::without_auth(
+                url,
+                heartbeat,
+                TransportBackend::default(),
+                proxy_url,
+            ),
+            instruments_cache: Arc::new(AtomicMap::new()),
         }
     }
 
@@ -143,7 +162,7 @@ impl PyAxMdWebSocketClient {
     }
 
     #[pyo3(name = "connect")]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_connect<'py>(
         &mut self,
         py: Python<'py>,
@@ -155,6 +174,7 @@ impl PyAxMdWebSocketClient {
         let clock = get_atomic_clock_realtime();
         let instruments = Arc::clone(&self.instruments_cache);
         let symbol_data_types = self.inner.symbol_data_types();
+        let status_invalidations = self.inner.status_invalidations();
         let mut client = self.inner.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -168,9 +188,12 @@ impl PyAxMdWebSocketClient {
 
                 let mut book_sequences: AHashMap<Ustr, u64> = AHashMap::new();
                 let mut candle_cache: AHashMap<(Ustr, AxCandleWidth), AxMdCandle> = AHashMap::new();
+                let mut instrument_states: AHashMap<Ustr, AxInstrumentState> = AHashMap::new();
 
                 while let Some(msg) = stream.next().await {
                     let ts_init = clock.get_time_ns();
+
+                    drain_status_invalidations(&status_invalidations, &mut instrument_states);
 
                     match msg {
                         AxDataWsMessage::MdMessage(md_msg) => {
@@ -180,6 +203,7 @@ impl PyAxMdWebSocketClient {
                                 &symbol_data_types,
                                 &mut book_sequences,
                                 &mut candle_cache,
+                                &mut instrument_states,
                                 ts_init,
                                 &call_soon,
                                 &callback,
@@ -187,6 +211,7 @@ impl PyAxMdWebSocketClient {
                         }
                         AxDataWsMessage::Reconnected => {
                             candle_cache.clear();
+                            instrument_states.clear();
                             log::info!("AX WebSocket reconnected");
                         }
                         AxDataWsMessage::CandleUnsubscribed { symbol, width } => {
@@ -247,6 +272,40 @@ impl PyAxMdWebSocketClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client
                 .subscribe_trades(&symbol)
+                .await
+                .map_err(to_pyruntime_err)
+        })
+    }
+
+    #[pyo3(name = "subscribe_mark_prices")]
+    fn py_subscribe_mark_prices<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        let symbol = instrument_id.symbol.to_string();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .subscribe_mark_prices(&symbol)
+                .await
+                .map_err(to_pyruntime_err)
+        })
+    }
+
+    #[pyo3(name = "subscribe_instrument_status")]
+    fn py_subscribe_instrument_status<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        let symbol = instrument_id.symbol.to_string();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .subscribe_instrument_status(&symbol)
                 .await
                 .map_err(to_pyruntime_err)
         })
@@ -339,6 +398,40 @@ impl PyAxMdWebSocketClient {
         })
     }
 
+    #[pyo3(name = "unsubscribe_mark_prices")]
+    fn py_unsubscribe_mark_prices<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        let symbol = instrument_id.symbol.to_string();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_mark_prices(&symbol)
+                .await
+                .map_err(to_pyruntime_err)
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_instrument_status")]
+    fn py_unsubscribe_instrument_status<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.inner.clone();
+        let symbol = instrument_id.symbol.to_string();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_instrument_status(&symbol)
+                .await
+                .map_err(to_pyruntime_err)
+        })
+    }
+
     #[pyo3(name = "disconnect")]
     fn py_disconnect<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
@@ -366,6 +459,7 @@ impl PyAxMdWebSocketClient {
     name = "AxOrdersWebSocketClient",
     module = "nautilus_trader.core.nautilus_pyo3.architect"
 )]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.architect_ax")]
 pub struct PyAxOrdersWebSocketClient {
     inner: AxOrdersWebSocketClient,
 }
@@ -379,17 +473,26 @@ impl Debug for PyAxOrdersWebSocketClient {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyAxOrdersWebSocketClient {
     #[new]
-    #[pyo3(signature = (url, account_id, trader_id, heartbeat=None))]
+    #[pyo3(signature = (url, account_id, trader_id, heartbeat=30, proxy_url=None))]
     fn py_new(
         url: String,
         account_id: AccountId,
         trader_id: TraderId,
-        heartbeat: Option<u64>,
+        heartbeat: u64,
+        proxy_url: Option<String>,
     ) -> Self {
         Self {
-            inner: AxOrdersWebSocketClient::new(url, account_id, trader_id, heartbeat),
+            inner: AxOrdersWebSocketClient::new(
+                url,
+                account_id,
+                trader_id,
+                heartbeat,
+                TransportBackend::default(),
+                proxy_url,
+            ),
         }
     }
 
@@ -443,7 +546,7 @@ impl PyAxOrdersWebSocketClient {
     }
 
     #[pyo3(name = "connect")]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_connect<'py>(
         &mut self,
         py: Python<'py>,
@@ -534,7 +637,7 @@ impl PyAxOrdersWebSocketClient {
         trigger_price=None,
         post_only=false,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_submit_order<'py>(
         &self,
         py: Python<'py>,
@@ -623,20 +726,24 @@ impl PyAxOrdersWebSocketClient {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn handle_md_message(
     message: AxMdMessage,
-    instruments: &Arc<DashMap<Ustr, InstrumentAny>>,
-    symbol_data_types: &Arc<DashMap<String, SymbolDataTypes>>,
+    instruments: &Arc<AtomicMap<Ustr, InstrumentAny>>,
+    symbol_data_types: &Arc<AtomicMap<String, SymbolDataTypes>>,
     book_sequences: &mut AHashMap<Ustr, u64>,
     candle_cache: &mut AHashMap<(Ustr, AxCandleWidth), AxMdCandle>,
+    instrument_states: &mut AHashMap<Ustr, AxInstrumentState>,
     ts_init: UnixNanos,
     call_soon: &Py<PyAny>,
     callback: &Py<PyAny>,
 ) {
+    let instruments_snap = instruments.load();
+    let sdt_snap = symbol_data_types.load();
+
     match message {
         AxMdMessage::BookL1(book) => {
-            let l1_subscribed = symbol_data_types
+            let l1_subscribed = sdt_snap
                 .get(book.s.as_str())
                 .is_some_and(|e| e.quotes || e.book_level == Some(AxMarketDataLevel::Level1));
 
@@ -644,12 +751,12 @@ fn handle_md_message(
                 return;
             }
 
-            let Some(instrument) = instruments.get(&book.s) else {
+            let Some(instrument) = instruments_snap.get(&book.s) else {
                 log::warn!("Instrument cache miss for L1 book symbol={}", book.s);
                 return;
             };
 
-            match parse_book_l1_quote(&book, &instrument, ts_init) {
+            match parse_book_l1_quote(&book, instrument, ts_init) {
                 Ok(quote) => {
                     send_data_to_python(Data::Quote(quote), call_soon, callback);
                 }
@@ -657,7 +764,7 @@ fn handle_md_message(
             }
         }
         AxMdMessage::BookL2(book) => {
-            let Some(instrument) = instruments.get(&book.s) else {
+            let Some(instrument) = instruments_snap.get(&book.s) else {
                 log::warn!("Instrument cache miss for L2 book symbol={}", book.s);
                 return;
             };
@@ -667,7 +774,7 @@ fn handle_md_message(
                 .and_modify(|s| *s += 1)
                 .or_insert(1);
 
-            match parse_book_l2_deltas(&book, &instrument, *sequence, ts_init) {
+            match parse_book_l2_deltas(&book, instrument, *sequence, ts_init) {
                 Ok(deltas) => {
                     send_data_to_python(
                         Data::Deltas(OrderBookDeltas_API::new(deltas)),
@@ -679,7 +786,7 @@ fn handle_md_message(
             }
         }
         AxMdMessage::BookL3(book) => {
-            let Some(instrument) = instruments.get(&book.s) else {
+            let Some(instrument) = instruments_snap.get(&book.s) else {
                 log::warn!("Instrument cache miss for L3 book symbol={}", book.s);
                 return;
             };
@@ -689,7 +796,7 @@ fn handle_md_message(
                 .and_modify(|s| *s += 1)
                 .or_insert(1);
 
-            match parse_book_l3_deltas(&book, &instrument, *sequence, ts_init) {
+            match parse_book_l3_deltas(&book, instrument, *sequence, ts_init) {
                 Ok(deltas) => {
                     send_data_to_python(
                         Data::Deltas(OrderBookDeltas_API::new(deltas)),
@@ -701,20 +808,18 @@ fn handle_md_message(
             }
         }
         AxMdMessage::Trade(trade) => {
-            let trades_subscribed = symbol_data_types
-                .get(trade.s.as_str())
-                .is_some_and(|e| e.trades);
+            let trades_subscribed = sdt_snap.get(trade.s.as_str()).is_some_and(|e| e.trades);
 
             if !trades_subscribed {
                 return;
             }
 
-            let Some(instrument) = instruments.get(&trade.s) else {
+            let Some(instrument) = instruments_snap.get(&trade.s) else {
                 log::warn!("Instrument cache miss for trade symbol={}", trade.s);
                 return;
             };
 
-            match parse_trade_tick(&trade, &instrument, ts_init) {
+            match parse_trade_tick(&trade, instrument, ts_init) {
                 Ok(tick) => {
                     send_data_to_python(Data::Trade(tick), call_soon, callback);
                 }
@@ -737,12 +842,12 @@ fn handle_md_message(
             candle_cache.insert(cache_key, candle);
 
             if let Some(closed) = closed_candle {
-                let Some(instrument) = instruments.get(&closed.symbol) else {
+                let Some(instrument) = instruments_snap.get(&closed.symbol) else {
                     log::warn!("Instrument cache miss for candle symbol={}", closed.symbol);
                     return;
                 };
 
-                match parse_candle_bar(&closed, &instrument, ts_init) {
+                match parse_candle_bar(&closed, instrument, ts_init) {
                     Ok(bar) => {
                         send_data_to_python(Data::Bar(bar), call_soon, callback);
                     }
@@ -750,7 +855,57 @@ fn handle_md_message(
                 }
             }
         }
-        AxMdMessage::Ticker(_) => {}
+        AxMdMessage::Ticker(ticker) => {
+            let Some(instrument) = instruments_snap.get(&ticker.s) else {
+                log::debug!("No instrument cached for ticker symbol '{}'", ticker.s);
+                return;
+            };
+
+            let instrument_id = instrument.id();
+            let price_precision = instrument.price_precision();
+            let ts_event = ax_timestamp_stn_to_unix_nanos(ticker.ts, ticker.tn).unwrap_or(ts_init);
+
+            let mark_prices_subscribed = sdt_snap
+                .get(ticker.s.as_str())
+                .is_some_and(|e| e.mark_prices);
+            if mark_prices_subscribed && let Some(mark_price) = ticker.m {
+                match Price::from_decimal_dp(mark_price, price_precision) {
+                    Ok(price) => {
+                        let update = MarkPriceUpdate::new(instrument_id, price, ts_event, ts_init);
+                        send_data_to_python(Data::MarkPriceUpdate(update), call_soon, callback);
+                    }
+                    Err(e) => {
+                        log::error!("Failed to parse mark price for {}: {e}", ticker.s);
+                    }
+                }
+            }
+
+            if let Some(state) = ticker.i {
+                let status_subscribed = sdt_snap
+                    .get(ticker.s.as_str())
+                    .is_some_and(|e| e.instrument_status);
+                if status_subscribed {
+                    let prev = instrument_states.insert(ticker.s, state);
+                    if prev != Some(state) {
+                        let action = MarketStatusAction::from(state);
+                        let status = InstrumentStatus::new(
+                            instrument_id,
+                            action,
+                            ts_event,
+                            ts_init,
+                            None,
+                            None,
+                            Some(state == AxInstrumentState::Open),
+                            None,
+                            None,
+                        );
+                        call_python_with_event(call_soon, callback, move |py| {
+                            status.into_py_any(py)
+                        });
+                    }
+                }
+            }
+        }
         AxMdMessage::Heartbeat(_) => {}
         AxMdMessage::SubscriptionResponse(_) => {}
         AxMdMessage::Error(err) => {
@@ -770,27 +925,31 @@ fn handle_order_event(
     match event {
         AxWsOrderEvent::Heartbeat => {}
         AxWsOrderEvent::Acknowledged(msg) => {
-            if let Some(event) = create_order_accepted(&msg.o, msg.ts, caches, account_id, clock) {
+            if let Some(event) =
+                create_order_accepted(&msg.o, msg.ts, msg.tn, caches, account_id, clock)
+            {
                 call_python_with_event(call_soon, callback, move |py| event.into_py_any(py));
             }
         }
         AxWsOrderEvent::PartiallyFilled(msg) => {
             if let Some(event) =
-                create_order_filled(&msg.o, &msg.xs, msg.ts, caches, account_id, clock)
+                create_order_filled(&msg.o, &msg.xs, msg.ts, msg.tn, caches, account_id, clock)
             {
                 call_python_with_event(call_soon, callback, move |py| event.into_py_any(py));
             }
         }
         AxWsOrderEvent::Filled(msg) => {
             if let Some(event) =
-                create_order_filled(&msg.o, &msg.xs, msg.ts, caches, account_id, clock)
+                create_order_filled(&msg.o, &msg.xs, msg.ts, msg.tn, caches, account_id, clock)
             {
                 cleanup_terminal_order_tracking(&msg.o, caches);
                 call_python_with_event(call_soon, callback, move |py| event.into_py_any(py));
             }
         }
         AxWsOrderEvent::Canceled(msg) => {
-            if let Some(event) = create_order_canceled(&msg.o, msg.ts, caches, account_id, clock) {
+            if let Some(event) =
+                create_order_canceled(&msg.o, msg.ts, msg.tn, caches, account_id, clock)
+            {
                 cleanup_terminal_order_tracking(&msg.o, caches);
                 call_python_with_event(call_soon, callback, move |py| event.into_py_any(py));
             }
@@ -804,25 +963,31 @@ fn handle_order_event(
                 .unwrap_or("UNKNOWN");
 
             if let Some(event) =
-                create_order_rejected(&msg.o, reason, msg.ts, caches, account_id, clock)
+                create_order_rejected(&msg.o, reason, msg.ts, msg.tn, caches, account_id, clock)
             {
                 cleanup_terminal_order_tracking(&msg.o, caches);
                 call_python_with_event(call_soon, callback, move |py| event.into_py_any(py));
             }
         }
         AxWsOrderEvent::Expired(msg) => {
-            if let Some(event) = create_order_expired(&msg.o, msg.ts, caches, account_id, clock) {
+            if let Some(event) =
+                create_order_expired(&msg.o, msg.ts, msg.tn, caches, account_id, clock)
+            {
                 cleanup_terminal_order_tracking(&msg.o, caches);
                 call_python_with_event(call_soon, callback, move |py| event.into_py_any(py));
             }
         }
         AxWsOrderEvent::Replaced(msg) => {
-            if let Some(event) = create_order_accepted(&msg.o, msg.ts, caches, account_id, clock) {
+            if let Some(event) =
+                create_order_accepted(&msg.o, msg.ts, msg.tn, caches, account_id, clock)
+            {
                 call_python_with_event(call_soon, callback, move |py| event.into_py_any(py));
             }
         }
         AxWsOrderEvent::DoneForDay(msg) => {
-            if let Some(event) = create_order_expired(&msg.o, msg.ts, caches, account_id, clock) {
+            if let Some(event) =
+                create_order_expired(&msg.o, msg.ts, msg.tn, caches, account_id, clock)
+            {
                 cleanup_terminal_order_tracking(&msg.o, caches);
                 call_python_with_event(call_soon, callback, move |py| event.into_py_any(py));
             }
@@ -852,6 +1017,17 @@ fn handle_order_event(
                     msg.oid
                 );
             }
+        }
+    }
+}
+
+fn drain_status_invalidations(
+    invalidations: &Arc<Mutex<AHashSet<Ustr>>>,
+    instrument_states: &mut AHashMap<Ustr, AxInstrumentState>,
+) {
+    if let Ok(mut set) = invalidations.lock() {
+        for symbol in set.drain() {
+            instrument_states.remove(&symbol);
         }
     }
 }

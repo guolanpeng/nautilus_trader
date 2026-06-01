@@ -19,8 +19,8 @@
 //!
 //! - `<symbol>@trade` - Trade stream
 //! - `<symbol>@bestBidAsk` - Best bid/ask stream (with auto-culling)
-//! - `<symbol>@depth` - Diff depth stream (50ms updates)
-//! - `<symbol>@depth20` - Partial book depth (top 20 levels, 50ms updates)
+//! - `<symbol>@depth` - Diff depth stream (1000ms default, 100ms with `@100ms` suffix)
+//! - `<symbol>@depth20` - Partial book depth, top 20 levels (1000ms default, 100ms with `@100ms` suffix)
 //!
 //! ## Connection URL Patterns
 //!
@@ -29,6 +29,9 @@
 
 /// Maximum number of streams per connection.
 pub const MAX_STREAMS_PER_CONNECTION: usize = 1024;
+
+/// Maximum number of connections per pool.
+pub const MAX_CONNECTIONS: usize = 20;
 
 /// Stream type for subscription management.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

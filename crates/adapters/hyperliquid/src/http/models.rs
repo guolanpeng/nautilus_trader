@@ -29,8 +29,10 @@ use crate::common::enums::{
 /// Response from candleSnapshot endpoint (returns array directly).
 pub type HyperliquidCandleSnapshot = Vec<HyperliquidCandle>;
 
+const CLOID_MARKER_PREFIX_BYTES: [u8; 2] = [0x6e, 0x42];
+
 /// A 128-bit client order ID represented as a hex string with `0x` prefix.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Cloid(pub [u8; 16]);
 
 impl Cloid {
@@ -50,6 +52,7 @@ impl Cloid {
         }
 
         let mut bytes = [0u8; 16];
+
         for i in 0..16 {
             let byte_str = &without_prefix[i * 2..i * 2 + 2];
             bytes[i] = u8::from_str_radix(byte_str, 16)
@@ -59,16 +62,31 @@ impl Cloid {
         Ok(Self(bytes))
     }
 
-    /// Creates a `Cloid` from a Nautilus `ClientOrderId` by hashing it.
-    ///
-    /// Uses keccak256 hash and takes the first 16 bytes to create a deterministic
-    /// 128-bit CLOID from any client order ID format.
+    /// Creates a deterministic `Cloid` from a Nautilus `ClientOrderId`.
     #[must_use]
     pub fn from_client_order_id(client_order_id: ClientOrderId) -> Self {
         let hash = keccak256(client_order_id.as_str().as_bytes());
         let mut bytes = [0u8; 16];
         bytes.copy_from_slice(&hash[..16]);
+        bytes[..CLOID_MARKER_PREFIX_BYTES.len()].copy_from_slice(&CLOID_MARKER_PREFIX_BYTES);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
         Self(bytes)
+    }
+
+    /// Creates a legacy deterministic `Cloid` from a Nautilus `ClientOrderId`.
+    #[must_use]
+    pub fn from_legacy_client_order_id(client_order_id: ClientOrderId) -> Self {
+        let hash = keccak256(client_order_id.as_str().as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&hash[..16]);
+        Self(bytes)
+    }
+
+    /// Returns whether the CLOID matches the UUIDv4 version and variant bits.
+    #[must_use]
+    pub fn is_uuid_v4(&self) -> bool {
+        self.0[6] >> 4 == 4 && matches!(self.0[8] >> 4, 8..=11)
     }
 
     /// Converts the CLOID to a hex string with `0x` prefix.
@@ -147,10 +165,10 @@ pub struct PerpMeta {
 }
 
 /// A single perpetual asset from the universe.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PerpAsset {
-    /// Asset name (e.g., "BTC").
+    /// Asset name (e.g., "BTC", "xyz:TSLA" for HIP-3).
     pub name: String,
     /// Number of decimal places for size.
     pub sz_decimals: u32,
@@ -163,6 +181,12 @@ pub struct PerpAsset {
     /// Whether this asset is delisted/inactive.
     #[serde(default)]
     pub is_delisted: Option<bool>,
+    /// HIP-3 growth mode status (e.g., "enabled").
+    #[serde(default)]
+    pub growth_mode: Option<String>,
+    /// Margin mode (e.g., "strictIsolated").
+    #[serde(default)]
+    pub margin_mode: Option<String>,
 }
 
 /// Margin table with leverage tiers.
@@ -184,6 +208,15 @@ pub struct MarginTier {
     pub lower_bound: String,
     /// Maximum leverage for this tier.
     pub max_leverage: u32,
+}
+
+/// Descriptor for a builder-deployed perp dex from `POST /info` with
+/// `{ "type": "perpDexs" }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerpDex {
+    /// Dex identifier used by WebSocket `dex` metadata and subscription routing.
+    pub name: String,
 }
 
 /// Complete spot metadata response from `POST /info` with `{ "type": "spotMeta" }`.
@@ -245,6 +278,78 @@ pub struct SpotPair {
     pub index: u32,
     /// Whether this is the canonical pair.
     pub is_canonical: bool,
+}
+
+/// Complete outcome metadata response from `POST /info` with `{ "type": "outcomeMeta" }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeMeta {
+    /// Outcome markets available.
+    pub outcomes: Vec<OutcomeMarket>,
+    /// Multi-outcome `priceBucket` questions that reference outcomes by
+    /// `named_outcomes` / `fallback_outcome`. Empty when the venue exposes
+    /// only standalone binary outcomes.
+    #[serde(default)]
+    pub questions: Vec<OutcomeQuestion>,
+}
+
+impl OutcomeMeta {
+    /// Returns the question that references the given outcome via
+    /// `fallback_outcome` or `named_outcomes`, if any.
+    #[must_use]
+    pub fn parent_question(&self, outcome_index: u32) -> Option<&OutcomeQuestion> {
+        self.questions.iter().find(|q| {
+            q.fallback_outcome == Some(outcome_index) || q.named_outcomes.contains(&outcome_index)
+        })
+    }
+}
+
+/// A single outcome market from the outcome metadata response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeMarket {
+    /// Outcome identifier used with side to derive HIP-4 asset IDs.
+    pub outcome: u32,
+    /// Outcome market name.
+    pub name: String,
+    /// Venue-provided market description.
+    pub description: String,
+    /// Side specifications for the binary outcome.
+    #[serde(default)]
+    pub side_specs: Vec<OutcomeSideSpec>,
+}
+
+/// A single side specification for an outcome market.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeSideSpec {
+    /// Side name (for example, "Yes" or "No").
+    pub name: String,
+}
+
+/// A multi-outcome `priceBucket` question referenced by one or more outcomes.
+///
+/// Questions group a fallback outcome plus a sequence of named outcomes whose
+/// `description` field holds an `index:N` pointer back into `named_outcomes`.
+/// Settlement is signalled when `settled_named_outcomes` becomes non-empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeQuestion {
+    /// Question identifier.
+    pub question: u32,
+    /// Question name.
+    pub name: String,
+    /// Venue-provided question description (carries `class`, `expiry`, etc).
+    pub description: String,
+    /// Fallback outcome triggered when no named outcome resolves.
+    #[serde(default)]
+    pub fallback_outcome: Option<u32>,
+    /// Named outcome indices in the order their `index:N` descriptions reference.
+    #[serde(default)]
+    pub named_outcomes: Vec<u32>,
+    /// Outcomes that have settled. Non-empty implies the question has resolved.
+    #[serde(default)]
+    pub settled_named_outcomes: Vec<u32>,
 }
 
 /// Optional perpetuals metadata with asset contexts from `{ "type": "metaAndAssetCtxs" }`.
@@ -360,6 +465,21 @@ pub struct HyperliquidCandle {
     pub num_trades: Option<u64>,
 }
 
+/// Represents a single funding history entry from the `fundingHistory` info endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HyperliquidFundingHistoryEntry {
+    /// Coin symbol (raw Hyperliquid name, e.g. `"BTC"`).
+    pub coin: Ustr,
+    /// Funding rate applied at the interval end, as a decimal string.
+    #[serde(rename = "fundingRate")]
+    pub funding_rate: String,
+    /// Premium at the time of funding, as a decimal string.
+    #[serde(default)]
+    pub premium: Option<String>,
+    /// Timestamp in milliseconds marking the end of the funding interval.
+    pub time: u64,
+}
+
 /// Represents an individual fill from user fills.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HyperliquidFill {
@@ -394,11 +514,26 @@ pub struct HyperliquidFill {
     pub fee_token: Ustr,
 }
 
-/// Represents order status response from `POST /info`.
+/// Represents order status response from `POST /info` with `type: "orderStatus"`.
+///
+/// The API returns `{"status": "order", "order": {...}}` when the order is known,
+/// or `{"status": "unknownOid"}` when the oid is not found.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HyperliquidOrderStatus {
-    #[serde(default)]
-    pub statuses: Vec<HyperliquidOrderStatusEntry>,
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum HyperliquidOrderStatus {
+    Order { order: HyperliquidOrderStatusEntry },
+    UnknownOid,
+}
+
+impl HyperliquidOrderStatus {
+    /// Consumes the response and returns the inner entry if the order was found.
+    #[must_use]
+    pub fn into_order(self) -> Option<HyperliquidOrderStatusEntry> {
+        match self {
+            Self::Order { order } => Some(order),
+            Self::UnknownOid => None,
+        }
+    }
 }
 
 /// Represents an individual order status entry.
@@ -432,6 +567,9 @@ pub struct HyperliquidOrderInfo {
     /// Original order size.
     #[serde(rename = "origSz")]
     pub orig_sz: String,
+    /// Optional client order ID (hex representation of the venue CLOID).
+    #[serde(default)]
+    pub cloid: Option<String>,
 }
 
 /// ECC signature components for Hyperliquid exchange requests.
@@ -446,7 +584,21 @@ pub struct HyperliquidSignature {
 }
 
 impl HyperliquidSignature {
-    /// Parse a hex signature string (0x + 64 hex r + 64 hex s + 2 hex v) into components.
+    /// Creates a new [`HyperliquidSignature`] from pre-formatted components.
+    #[must_use]
+    pub fn new(r: String, s: String, v: u64) -> Self {
+        Self { r, s, v }
+    }
+
+    /// Formats as Ethereum hex signature: `0x` + r(64) + s(64) + v(2).
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        let r = self.r.strip_prefix("0x").unwrap_or(&self.r);
+        let s = self.s.strip_prefix("0x").unwrap_or(&self.s);
+        format!("0x{r}{s}{:02x}", self.v)
+    }
+
+    /// Parses a hex signature string (0x + 64 hex r + 64 hex s + 2 hex v) into components.
     pub fn from_hex(sig_hex: &str) -> Result<Self, String> {
         let sig_hex = sig_hex.strip_prefix("0x").unwrap_or(sig_hex);
 
@@ -490,31 +642,33 @@ impl<T> HyperliquidExchangeRequest<T>
 where
     T: Serialize,
 {
-    /// Create a new exchange request with the given action.
-    pub fn new(action: T, nonce: u64, signature: &str) -> Result<Self, String> {
-        Ok(Self {
+    /// Creates a new exchange request with the given action.
+    #[must_use]
+    pub fn new(action: T, nonce: u64, signature: HyperliquidSignature) -> Self {
+        Self {
             action,
             nonce,
-            signature: HyperliquidSignature::from_hex(signature)?,
+            signature,
             vault_address: None,
             expires_after: None,
-        })
+        }
     }
 
-    /// Create a new exchange request with vault address for sub-account trading.
+    /// Creates a new exchange request with vault address for sub-account trading.
+    #[must_use]
     pub fn with_vault(
         action: T,
         nonce: u64,
-        signature: &str,
+        signature: HyperliquidSignature,
         vault_address: String,
-    ) -> Result<Self, String> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             action,
             nonce,
-            signature: HyperliquidSignature::from_hex(signature)?,
+            signature,
             vault_address: Some(vault_address),
             expires_after: None,
-        })
+        }
     }
 
     /// Convert to JSON value for signing purposes.
@@ -553,6 +707,8 @@ pub const RESPONSE_STATUS_OK: &str = "ok";
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
+    use serde_json::json;
 
     use super::*;
 
@@ -565,6 +721,89 @@ mod tests {
         assert_eq!(meta.universe.len(), 1);
         assert_eq!(meta.universe[0].name, "BTC");
         assert_eq!(meta.universe[0].sz_decimals, 5);
+    }
+
+    #[rstest]
+    fn test_funding_history_entry_with_premium() {
+        let json = r#"{
+            "coin": "BTC",
+            "fundingRate": "0.0000125",
+            "premium": "0.00029005",
+            "time": 1769908800000
+        }"#;
+
+        let entry: HyperliquidFundingHistoryEntry = serde_json::from_str(json).unwrap();
+
+        assert_eq!(entry.coin.as_str(), "BTC");
+        assert_eq!(entry.funding_rate, "0.0000125");
+        assert_eq!(entry.premium.as_deref(), Some("0.00029005"));
+        assert_eq!(entry.time, 1769908800000);
+    }
+
+    #[rstest]
+    fn test_funding_history_entry_without_premium() {
+        // `premium` is optional in the venue response; it must deserialize
+        // to `None` when absent rather than fail.
+        let json = r#"{
+            "coin": "BTC",
+            "fundingRate": "0.0000033",
+            "time": 1769916000000
+        }"#;
+
+        let entry: HyperliquidFundingHistoryEntry = serde_json::from_str(json).unwrap();
+
+        assert!(entry.premium.is_none());
+        assert_eq!(entry.funding_rate, "0.0000033");
+    }
+
+    #[rstest]
+    fn test_perp_asset_hip3_fields() {
+        let json = r#"{
+            "name": "xyz:TSLA",
+            "szDecimals": 3,
+            "maxLeverage": 10,
+            "onlyIsolated": true,
+            "growthMode": "enabled",
+            "marginMode": "strictIsolated"
+        }"#;
+
+        let asset: PerpAsset = serde_json::from_str(json).unwrap();
+
+        assert_eq!(asset.name, "xyz:TSLA");
+        assert_eq!(asset.sz_decimals, 3);
+        assert_eq!(asset.max_leverage, Some(10));
+        assert_eq!(asset.only_isolated, Some(true));
+        assert_eq!(asset.growth_mode.as_deref(), Some("enabled"));
+        assert_eq!(asset.margin_mode.as_deref(), Some("strictIsolated"));
+    }
+
+    #[rstest]
+    fn test_perp_asset_hip3_fields_absent() {
+        let json = r#"{"name": "BTC", "szDecimals": 5}"#;
+
+        let asset: PerpAsset = serde_json::from_str(json).unwrap();
+
+        assert_eq!(asset.growth_mode, None);
+        assert_eq!(asset.margin_mode, None);
+    }
+
+    #[rstest]
+    fn test_outcome_meta_defaults_missing_side_specs() {
+        let json = r#"{
+            "outcomes": [
+                {
+                    "outcome": 123,
+                    "name": "Recurring",
+                    "description": "class:priceBinary|underlying:HYPE|expiry:20260310-1100|targetPrice:34.5|period:3m"
+                }
+            ]
+        }"#;
+
+        let meta: OutcomeMeta = serde_json::from_str(json).unwrap();
+
+        assert_eq!(meta.outcomes.len(), 1);
+        assert_eq!(meta.outcomes[0].outcome, 123);
+        assert!(meta.outcomes[0].side_specs.is_empty());
     }
 
     #[rstest]
@@ -584,6 +823,60 @@ mod tests {
 
         let response: HyperliquidExchangeResponse = serde_json::from_str(json).unwrap();
         assert!(response.is_ok());
+    }
+
+    #[rstest]
+    fn test_spot_clearinghouse_state_deserialization() {
+        let json = r#"{
+            "balances": [
+                {"coin": "USDC", "token": 0, "total": "14.625485", "hold": "0.0", "entryNtl": "0.0"},
+                {"coin": "PURR", "token": 1, "total": "2000", "hold": "100", "entryNtl": "1234.56"}
+            ]
+        }"#;
+
+        let state: SpotClearinghouseState = serde_json::from_str(json).unwrap();
+
+        assert_eq!(state.balances.len(), 2);
+        let usdc = &state.balances[0];
+        assert_eq!(usdc.coin.as_str(), "USDC");
+        assert_eq!(usdc.token, Some(0));
+        assert_eq!(usdc.total.to_string(), "14.625485");
+        assert_eq!(usdc.hold, rust_decimal::Decimal::ZERO);
+        assert_eq!(usdc.free().to_string(), "14.625485");
+        assert_eq!(usdc.avg_entry_px(), None);
+
+        let purr = &state.balances[1];
+        assert_eq!(purr.coin.as_str(), "PURR");
+        assert_eq!(purr.token, Some(1));
+        assert_eq!(purr.free().to_string(), "1900");
+        assert_eq!(
+            purr.avg_entry_px().unwrap(),
+            rust_decimal_macros::dec!(0.61728)
+        );
+    }
+
+    #[rstest]
+    fn test_spot_balance_outcome_side_token_lacks_token_field() {
+        // HIP-4 outcome side tokens come back without `token` from the venue
+        let json = r#"{"coin": "+250", "total": "0.0", "hold": "0.0", "entryNtl": "0.0"}"#;
+        let balance: SpotBalance = serde_json::from_str(json).unwrap();
+        assert_eq!(balance.coin.as_str(), "+250");
+        assert_eq!(balance.token, None);
+    }
+
+    #[rstest]
+    fn test_spot_clearinghouse_state_empty() {
+        let json = r#"{"balances": []}"#;
+        let state: SpotClearinghouseState = serde_json::from_str(json).unwrap();
+        assert!(state.balances.is_empty());
+    }
+
+    #[rstest]
+    fn test_spot_balance_handles_missing_entry_ntl() {
+        let json = r#"{"coin": "HYPE", "token": 150, "total": "5", "hold": "0"}"#;
+        let balance: SpotBalance = serde_json::from_str(json).unwrap();
+        assert_eq!(balance.entry_ntl, None);
+        assert_eq!(balance.avg_entry_px(), None);
     }
 
     #[rstest]
@@ -625,6 +918,136 @@ mod tests {
         assert!(
             decoded.get("grouping").is_some(),
             "Should have grouping field"
+        );
+    }
+
+    #[rstest]
+    fn test_user_outcome_split_serialization() {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::SplitOutcome(HyperliquidExecSplitOutcomeParams {
+                outcome: 1,
+                amount: dec!(123.0),
+            }),
+        };
+
+        let value: serde_json::Value = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "userOutcome",
+                "splitOutcome": { "outcome": 1, "amount": "123.0" }
+            })
+        );
+    }
+
+    #[rstest]
+    fn test_user_outcome_split_msgpack_roundtrip() {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::SplitOutcome(HyperliquidExecSplitOutcomeParams {
+                outcome: 4,
+                amount: dec!(10),
+            }),
+        };
+
+        let bytes = rmp_serde::to_vec_named(&action).unwrap();
+        let decoded: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(
+            decoded,
+            json!({
+                "type": "userOutcome",
+                "splitOutcome": { "outcome": 4, "amount": "10" }
+            })
+        );
+    }
+
+    #[rstest]
+    fn test_user_outcome_merge_outcome_serialization() {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::MergeOutcome(HyperliquidExecMergeOutcomeParams {
+                outcome: 1,
+                amount: Some(dec!(5.0)),
+            }),
+        };
+        let value: serde_json::Value = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "userOutcome",
+                "mergeOutcome": { "outcome": 1, "amount": "5.0" }
+            })
+        );
+    }
+
+    #[rstest]
+    fn test_user_outcome_merge_outcome_null_amount_means_max() {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::MergeOutcome(HyperliquidExecMergeOutcomeParams {
+                outcome: 7,
+                amount: None,
+            }),
+        };
+        let value: serde_json::Value = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "userOutcome",
+                "mergeOutcome": { "outcome": 7, "amount": null }
+            })
+        );
+    }
+
+    #[rstest]
+    fn test_user_outcome_merge_question_serialization() {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::MergeQuestion(HyperliquidExecMergeQuestionParams {
+                question: 9,
+                amount: Some(dec!(2.0)),
+            }),
+        };
+        let value: serde_json::Value = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "userOutcome",
+                "mergeQuestion": { "question": 9, "amount": "2.0" }
+            })
+        );
+    }
+
+    #[rstest]
+    fn test_user_outcome_merge_question_null_amount_means_max() {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::MergeQuestion(HyperliquidExecMergeQuestionParams {
+                question: 9,
+                amount: None,
+            }),
+        };
+        let value: serde_json::Value = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "userOutcome",
+                "mergeQuestion": { "question": 9, "amount": null }
+            })
+        );
+    }
+
+    #[rstest]
+    fn test_user_outcome_negate_outcome_serialization() {
+        let action = HyperliquidExecAction::UserOutcome {
+            op: HyperliquidExecUserOutcomeOp::NegateOutcome(HyperliquidExecNegateOutcomeParams {
+                question: 9,
+                outcome: 52,
+                amount: dec!(1.5),
+            }),
+        };
+        let value: serde_json::Value = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "userOutcome",
+                "negateOutcome": { "question": 9, "outcome": 52, "amount": "1.5" }
+            })
         );
     }
 }
@@ -796,6 +1219,101 @@ pub struct HyperliquidExecModifyOrderRequest {
     pub order: HyperliquidExecPlaceOrderRequest,
 }
 
+/// Parameters for the HIP-4 `splitOutcome` operation inside a `userOutcome` action.
+///
+/// Debits `amount` quote tokens from the user's spot balance and credits both
+/// the Yes and No side tokens of the referenced outcome.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyperliquidExecSplitOutcomeParams {
+    /// Outcome index (matches `outcomeMeta.outcomes[i].outcome`).
+    pub outcome: u32,
+    /// Quote-token amount to split, serialized as a decimal string (e.g. `"123.0"`).
+    #[serde(
+        serialize_with = "crate::common::parse::serialize_decimal_as_str",
+        deserialize_with = "crate::common::parse::deserialize_decimal_from_str"
+    )]
+    pub amount: Decimal,
+}
+
+/// Parameters for the HIP-4 `mergeOutcome` operation inside a `userOutcome` action.
+///
+/// Burns `amount` matched Yes + No side tokens of `outcome` for `amount` quote
+/// tokens back. `amount = None` serializes as `null`, which the venue treats as
+/// the maximum mergeable balance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyperliquidExecMergeOutcomeParams {
+    /// Outcome index whose Yes + No pair is being merged.
+    pub outcome: u32,
+    /// Side-token amount to merge, or `None` to merge the maximum available.
+    #[serde(
+        default,
+        serialize_with = "crate::common::parse::serialize_optional_decimal_as_str",
+        deserialize_with = "crate::common::parse::deserialize_optional_decimal_from_str"
+    )]
+    pub amount: Option<Decimal>,
+}
+
+/// Parameters for the HIP-4 `mergeQuestion` operation inside a `userOutcome` action.
+///
+/// Burns `amount` Yes shares of every outcome associated with `question` for
+/// `amount` quote tokens back. `amount = None` serializes as `null`, meaning
+/// the maximum mergeable balance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyperliquidExecMergeQuestionParams {
+    /// Question identifier whose named outcomes are being merged.
+    pub question: u32,
+    /// Yes-share amount to merge per outcome, or `None` for the max.
+    #[serde(
+        default,
+        serialize_with = "crate::common::parse::serialize_optional_decimal_as_str",
+        deserialize_with = "crate::common::parse::deserialize_optional_decimal_from_str"
+    )]
+    pub amount: Option<Decimal>,
+}
+
+/// Parameters for the HIP-4 `negateOutcome` operation inside a `userOutcome` action.
+///
+/// Converts `amount` `No` shares of `outcome` (within `question`) into `amount`
+/// `Yes` shares of every other outcome in the same question.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyperliquidExecNegateOutcomeParams {
+    /// Question identifier the outcome belongs to.
+    pub question: u32,
+    /// Outcome index whose `No` shares are being negated.
+    pub outcome: u32,
+    /// Side-token amount to negate, serialized as a decimal string.
+    #[serde(
+        serialize_with = "crate::common::parse::serialize_decimal_as_str",
+        deserialize_with = "crate::common::parse::deserialize_decimal_from_str"
+    )]
+    pub amount: Decimal,
+}
+
+/// Operations carried by the [`HyperliquidExecAction::UserOutcome`] action.
+///
+/// Each variant serializes as a single-keyed object (for example,
+/// `{ "splitOutcome": { ... } }`) and is flattened into the outer action
+/// envelope alongside `"type": "userOutcome"` to match the Hyperliquid wire
+/// format.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum HyperliquidExecUserOutcomeOp {
+    /// Split `amount` quote tokens into `amount` Yes plus `amount` No shares.
+    #[serde(rename = "splitOutcome")]
+    SplitOutcome(HyperliquidExecSplitOutcomeParams),
+    /// Merge `amount` Yes + No side-token pairs of `outcome` back into quote
+    /// tokens (reverse of [`Self::SplitOutcome`]).
+    #[serde(rename = "mergeOutcome")]
+    MergeOutcome(HyperliquidExecMergeOutcomeParams),
+    /// Merge `amount` Yes shares of every outcome in `question` into quote
+    /// tokens (multi-outcome reverse of `splitOutcome`).
+    #[serde(rename = "mergeQuestion")]
+    MergeQuestion(HyperliquidExecMergeQuestionParams),
+    /// Swap `amount` `No` shares of one outcome into `Yes` shares of every
+    /// other outcome in the same question.
+    #[serde(rename = "negateOutcome")]
+    NegateOutcome(HyperliquidExecNegateOutcomeParams),
+}
+
 /// TWAP (Time-Weighted Average Price) order specification for exchange endpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HyperliquidExecTwapRequest {
@@ -918,6 +1436,18 @@ pub enum HyperliquidExecAction {
             deserialize_with = "crate::common::parse::deserialize_decimal_from_str"
         )]
         amount: Decimal,
+    },
+
+    /// HIP-4 outcome-side token management (`splitOutcome` and related ops).
+    ///
+    /// The active op is carried via [`HyperliquidExecUserOutcomeOp`] and
+    /// flattened into this action envelope, producing wire payloads such as
+    /// `{ "type": "userOutcome", "splitOutcome": { ... } }`.
+    #[serde(rename = "userOutcome")]
+    UserOutcome {
+        /// Operation to perform on the user's outcome balances.
+        #[serde(flatten)]
+        op: HyperliquidExecUserOutcomeOp,
     },
 
     /// Place a TWAP order.
@@ -1237,6 +1767,70 @@ pub struct PositionData {
         deserialize_with = "crate::common::parse::deserialize_decimal_from_str"
     )]
     pub unrealized_pnl: Decimal,
+}
+
+/// Complete spot clearinghouse state response from `POST /info`
+/// with `{ "type": "spotClearinghouseState", "user": "address" }`.
+///
+/// Provides per-token spot balances for the queried address. Under unified or
+/// portfolio margin accounts this is the source of truth for spot holdings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotClearinghouseState {
+    /// Per-token spot balances.
+    #[serde(default)]
+    pub balances: Vec<SpotBalance>,
+}
+
+/// A single token balance entry from `spotClearinghouseState.balances`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotBalance {
+    /// Token name (e.g., "USDC", "PURR").
+    pub coin: Ustr,
+    /// Token index matching `spotMeta.tokens[*].index`. Omitted by the venue
+    /// for HIP-4 outcome side tokens (`+E` coins).
+    #[serde(default)]
+    pub token: Option<u32>,
+    /// Total token balance (on-hold plus available).
+    #[serde(
+        serialize_with = "crate::common::parse::serialize_decimal_as_str",
+        deserialize_with = "crate::common::parse::deserialize_decimal_from_str"
+    )]
+    pub total: Decimal,
+    /// Portion currently reserved for resting orders.
+    #[serde(
+        serialize_with = "crate::common::parse::serialize_decimal_as_str",
+        deserialize_with = "crate::common::parse::deserialize_decimal_from_str"
+    )]
+    pub hold: Decimal,
+    /// Entry notional value (position cost basis in USDC).
+    #[serde(
+        default,
+        serialize_with = "crate::common::parse::serialize_optional_decimal_as_str",
+        deserialize_with = "crate::common::parse::deserialize_optional_decimal_from_str"
+    )]
+    pub entry_ntl: Option<Decimal>,
+}
+
+impl SpotBalance {
+    /// Returns the balance freely available to trade or withdraw (`total - hold`).
+    #[must_use]
+    pub fn free(&self) -> Decimal {
+        (self.total - self.hold).max(Decimal::ZERO)
+    }
+
+    /// Returns the average entry price derived from `entry_ntl / total`, if both are non-zero.
+    #[must_use]
+    pub fn avg_entry_px(&self) -> Option<Decimal> {
+        let entry_ntl = self.entry_ntl?;
+
+        if entry_ntl.is_zero() || self.total.is_zero() {
+            return None;
+        }
+
+        Some(entry_ntl / self.total)
+    }
 }
 
 /// Cross margin summary information.

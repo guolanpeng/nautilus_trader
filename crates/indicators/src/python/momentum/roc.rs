@@ -19,7 +19,9 @@ use pyo3::prelude::*;
 use crate::{indicator::Indicator, momentum::roc::RateOfChange};
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl RateOfChange {
+    /// Creates a new `RateOfChange` instance.
     #[new]
     #[pyo3(signature = (period, use_log=None))]
     #[must_use]
@@ -28,7 +30,7 @@ impl RateOfChange {
     }
 
     fn __repr__(&self) -> String {
-        format!("RateOfChange({},{})", self.period, self.use_log,)
+        format!("RateOfChange({},{})", self.period, self.use_log)
     }
 
     #[getter]

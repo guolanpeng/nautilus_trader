@@ -119,8 +119,8 @@ pub(super) enum BitmexWsFrame {
         /// Whether heartbeat is enabled for this connection.
         #[serde(rename = "heartbeatEnabled")]
         heartbeat_enabled: bool,
-        /// Rate limit information.
-        limit: BitmexRateLimit,
+        /// Rate limit information (absent on some endpoints).
+        limit: Option<BitmexRateLimit>,
         /// Application name (testnet only).
         #[serde(rename = "appName")]
         app_name: Option<String>,
@@ -911,6 +911,8 @@ pub struct BitmexFundingMsg {
     pub timestamp: DateTime<Utc>,
     /// The instrument symbol the funding applies to.
     pub symbol: Ustr,
+    /// The interval for this funding.
+    pub funding_interval: DateTime<Utc>,
     /// The funding rate for this interval.
     #[serde(with = "rust_decimal::serde::float")]
     pub funding_rate: Decimal,

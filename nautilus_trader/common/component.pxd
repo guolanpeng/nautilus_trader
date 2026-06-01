@@ -50,6 +50,8 @@ cdef class Clock:
     cpdef datetime local_now(self, tzinfo tz=*)
     cpdef uint64_t next_time_ns(self, str name)
     cpdef void register_default_handler(self, handler: Callable[[TimeEvent], None])
+    cpdef void cancel_default_handler(self)
+    cpdef void cancel_callbacks(self)
     cpdef void set_time_alert(
         self,
         str name,
@@ -172,6 +174,8 @@ cpdef LogGuard init_logging(
     bint print_config=*,
     uint64_t max_file_size=*,
     uint32_t max_backup_count=*,
+    bint fileout_sync_on_flush=*,
+    bint buffered_stdout=*,
 )
 
 # Global static to flag if pyo3 based logging is initialized
@@ -179,6 +183,7 @@ cdef bint LOGGING_PYO3
 cpdef bint is_logging_initialized()
 cpdef void set_logging_pyo3(bint value)
 cpdef void flush_logger()
+cpdef bint sync_logger_to_disk()
 
 
 cdef class Logger:

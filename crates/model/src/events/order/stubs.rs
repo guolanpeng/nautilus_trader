@@ -20,16 +20,22 @@ use rstest::fixture;
 use ustr::Ustr;
 
 use crate::{
-    enums::{ContingencyType, LiquiditySide, OrderSide, OrderType, TimeInForce, TriggerType},
+    enums::{ContingencyType, OrderSide, OrderType, TimeInForce, TriggerType},
     events::{
         OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
         OrderExpired, OrderFilled, OrderInitialized, OrderModifyRejected, OrderPendingCancel,
         OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered,
         OrderUpdated,
+        order::spec::{
+            OrderAcceptedSpec, OrderCancelRejectedSpec, OrderDeniedSpec, OrderEmulatedSpec,
+            OrderExpiredSpec, OrderFilledSpec, OrderInitializedSpec, OrderModifyRejectedSpec,
+            OrderPendingCancelSpec, OrderPendingUpdateSpec, OrderRejectedSpec, OrderReleasedSpec,
+            OrderSubmittedSpec, OrderTriggeredSpec, OrderUpdatedSpec,
+        },
     },
     identifiers::{
-        AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TradeId, TraderId,
-        VenueOrderId, stubs as id_stubs,
+        AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TraderId, VenueOrderId,
+        stubs as id_stubs,
     },
     stubs::TestDefault,
     types::{Currency, Money, Price, Quantity},
@@ -79,27 +85,19 @@ pub fn order_filled(
     client_order_id: ClientOrderId,
     uuid4: UUID4,
 ) -> OrderFilled {
-    OrderFilled::new(
-        trader_id,
-        strategy_id_ema_cross,
-        instrument_id_btc_usdt,
-        client_order_id,
-        VenueOrderId::new("123456"),
-        AccountId::new("SIM-001"),
-        TradeId::new("1"),
-        OrderSide::Buy,
-        OrderType::Limit,
-        Quantity::from_str("0.561").unwrap(),
-        Price::from_str("22000").unwrap(),
-        Currency::from_str("USDT").unwrap(),
-        LiquiditySide::Taker,
-        uuid4,
-        UnixNanos::default(),
-        UnixNanos::default(),
-        false,
-        None,
-        Some(Money::from("12.2 USDT")),
-    )
+    OrderFilledSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id_ema_cross)
+        .instrument_id(instrument_id_btc_usdt)
+        .client_order_id(client_order_id)
+        .venue_order_id(VenueOrderId::new("123456"))
+        .order_type(OrderType::Limit)
+        .last_qty(Quantity::from_str("0.561").unwrap())
+        .last_px(Price::from_str("22000").unwrap())
+        .currency(Currency::from_str("USDT").unwrap())
+        .event_id(uuid4)
+        .commission(Money::from("12.2 USDT"))
+        .build()
 }
 
 #[fixture]
@@ -110,16 +108,14 @@ pub fn order_denied_max_submitted_rate(
     client_order_id: ClientOrderId,
     uuid4: UUID4,
 ) -> OrderDenied {
-    OrderDenied::new(
-        trader_id,
-        strategy_id_ema_cross,
-        instrument_id_btc_usdt,
-        client_order_id,
-        Ustr::from("Exceeded MAX_ORDER_SUBMIT_RATE"),
-        uuid4,
-        UnixNanos::default(),
-        UnixNanos::default(),
-    )
+    OrderDeniedSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id_ema_cross)
+        .instrument_id(instrument_id_btc_usdt)
+        .client_order_id(client_order_id)
+        .reason(Ustr::from("Exceeded MAX_ORDER_SUBMIT_RATE"))
+        .event_id(uuid4)
+        .build()
 }
 
 #[fixture]
@@ -131,19 +127,15 @@ pub fn order_rejected_insufficient_margin(
     client_order_id: ClientOrderId,
     uuid4: UUID4,
 ) -> OrderRejected {
-    OrderRejected::new(
-        trader_id,
-        strategy_id_ema_cross,
-        instrument_id_btc_usdt,
-        client_order_id,
-        account_id,
-        Ustr::from("INSUFFICIENT_MARGIN"),
-        uuid4,
-        UnixNanos::default(),
-        UnixNanos::default(),
-        false,
-        false,
-    )
+    OrderRejectedSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id_ema_cross)
+        .instrument_id(instrument_id_btc_usdt)
+        .client_order_id(client_order_id)
+        .account_id(account_id)
+        .reason(Ustr::from("INSUFFICIENT_MARGIN"))
+        .event_id(uuid4)
+        .build()
 }
 
 #[fixture]
@@ -156,41 +148,23 @@ pub fn order_initialized_buy_limit(
 ) -> OrderInitialized {
     let order_list_id = OrderListId::new("1");
     let linked_order_ids = vec![ClientOrderId::new("O-2020872378424")];
-    OrderInitialized::new(
-        trader_id,
-        strategy_id_ema_cross,
-        instrument_id_btc_usdt,
-        client_order_id,
-        OrderSide::Buy,
-        OrderType::Limit,
-        Quantity::from_str("0.561").unwrap(),
-        TimeInForce::Day,
-        true,
-        true,
-        false,
-        false,
-        uuid4,
-        UnixNanos::default(),
-        UnixNanos::default(),
-        Some(Price::from_str("22000").unwrap()),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(TriggerType::BidAsk),
-        Some(instrument_id_btc_usdt),
-        Some(ContingencyType::Oto),
-        Some(order_list_id),
-        Some(linked_order_ids),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
+    OrderInitializedSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id_ema_cross)
+        .instrument_id(instrument_id_btc_usdt)
+        .client_order_id(client_order_id)
+        .order_type(OrderType::Limit)
+        .quantity(Quantity::from_str("0.561").unwrap())
+        .post_only(true)
+        .reduce_only(true)
+        .event_id(uuid4)
+        .price(Price::from_str("22000").unwrap())
+        .emulation_trigger(TriggerType::BidAsk)
+        .trigger_instrument_id(instrument_id_btc_usdt)
+        .contingency_type(ContingencyType::Oto)
+        .order_list_id(order_list_id)
+        .linked_order_ids(linked_order_ids)
+        .build()
 }
 
 #[fixture]
@@ -202,16 +176,14 @@ pub fn order_submitted(
     account_id: AccountId,
     uuid4: UUID4,
 ) -> OrderSubmitted {
-    OrderSubmitted::new(
-        trader_id,
-        strategy_id_ema_cross,
-        instrument_id_btc_usdt,
-        client_order_id,
-        account_id,
-        uuid4,
-        UnixNanos::default(),
-        UnixNanos::default(),
-    )
+    OrderSubmittedSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id_ema_cross)
+        .instrument_id(instrument_id_btc_usdt)
+        .client_order_id(client_order_id)
+        .account_id(account_id)
+        .event_id(uuid4)
+        .build()
 }
 
 #[fixture]
@@ -224,18 +196,15 @@ pub fn order_triggered(
     account_id: AccountId,
     uuid4: UUID4,
 ) -> OrderTriggered {
-    OrderTriggered::new(
-        trader_id,
-        strategy_id_ema_cross,
-        instrument_id_btc_usdt,
-        client_order_id,
-        uuid4,
-        UnixNanos::default(),
-        UnixNanos::default(),
-        false,
-        Some(venue_order_id),
-        Some(account_id),
-    )
+    OrderTriggeredSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id_ema_cross)
+        .instrument_id(instrument_id_btc_usdt)
+        .client_order_id(client_order_id)
+        .event_id(uuid4)
+        .venue_order_id(venue_order_id)
+        .account_id(account_id)
+        .build()
 }
 
 #[fixture]
@@ -246,15 +215,13 @@ pub fn order_emulated(
     client_order_id: ClientOrderId,
     uuid4: UUID4,
 ) -> OrderEmulated {
-    OrderEmulated::new(
-        trader_id,
-        strategy_id_ema_cross,
-        instrument_id_btc_usdt,
-        client_order_id,
-        uuid4,
-        UnixNanos::default(),
-        UnixNanos::default(),
-    )
+    OrderEmulatedSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id_ema_cross)
+        .instrument_id(instrument_id_btc_usdt)
+        .client_order_id(client_order_id)
+        .event_id(uuid4)
+        .build()
 }
 
 #[fixture]
@@ -265,16 +232,14 @@ pub fn order_released(
     client_order_id: ClientOrderId,
     uuid4: UUID4,
 ) -> OrderReleased {
-    OrderReleased::new(
-        trader_id,
-        strategy_id_ema_cross,
-        instrument_id_btc_usdt,
-        client_order_id,
-        Price::from_str("22000").unwrap(),
-        uuid4,
-        UnixNanos::default(),
-        UnixNanos::default(),
-    )
+    OrderReleasedSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id_ema_cross)
+        .instrument_id(instrument_id_btc_usdt)
+        .client_order_id(client_order_id)
+        .released_price(Price::from_str("22000").unwrap())
+        .event_id(uuid4)
+        .build()
 }
 
 #[fixture]
@@ -287,22 +252,17 @@ pub fn order_updated(
     account_id: AccountId,
     uuid4: UUID4,
 ) -> OrderUpdated {
-    OrderUpdated::new(
-        trader_id,
-        strategy_id_ema_cross,
-        instrument_id_btc_usdt,
-        client_order_id,
-        Quantity::from(100),
-        uuid4,
-        UnixNanos::default(),
-        UnixNanos::default(),
-        false,
-        Some(venue_order_id),
-        Some(account_id),
-        Some(Price::from("22000")),
-        None,
-        None,
-    )
+    OrderUpdatedSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id_ema_cross)
+        .instrument_id(instrument_id_btc_usdt)
+        .client_order_id(client_order_id)
+        .quantity(Quantity::from(100))
+        .event_id(uuid4)
+        .venue_order_id(venue_order_id)
+        .account_id(account_id)
+        .price(Price::from("22000"))
+        .build()
 }
 
 #[fixture]
@@ -315,18 +275,15 @@ pub fn order_pending_update(
     venue_order_id: VenueOrderId,
     uuid4: UUID4,
 ) -> OrderPendingUpdate {
-    OrderPendingUpdate::new(
-        trader_id,
-        strategy_id_ema_cross,
-        instrument_id_btc_usdt,
-        client_order_id,
-        account_id,
-        uuid4,
-        UnixNanos::default(),
-        UnixNanos::default(),
-        false,
-        Some(venue_order_id),
-    )
+    OrderPendingUpdateSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id_ema_cross)
+        .instrument_id(instrument_id_btc_usdt)
+        .client_order_id(client_order_id)
+        .account_id(account_id)
+        .event_id(uuid4)
+        .venue_order_id(venue_order_id)
+        .build()
 }
 
 #[fixture]
@@ -339,18 +296,15 @@ pub fn order_pending_cancel(
     venue_order_id: VenueOrderId,
     uuid4: UUID4,
 ) -> OrderPendingCancel {
-    OrderPendingCancel::new(
-        trader_id,
-        strategy_id_ema_cross,
-        instrument_id_btc_usdt,
-        client_order_id,
-        account_id,
-        uuid4,
-        UnixNanos::default(),
-        UnixNanos::default(),
-        false,
-        Some(venue_order_id),
-    )
+    OrderPendingCancelSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id_ema_cross)
+        .instrument_id(instrument_id_btc_usdt)
+        .client_order_id(client_order_id)
+        .account_id(account_id)
+        .event_id(uuid4)
+        .venue_order_id(venue_order_id)
+        .build()
 }
 
 #[fixture]
@@ -363,19 +317,16 @@ pub fn order_modify_rejected(
     account_id: AccountId,
     uuid4: UUID4,
 ) -> OrderModifyRejected {
-    OrderModifyRejected::new(
-        trader_id,
-        strategy_id_ema_cross,
-        instrument_id_btc_usdt,
-        client_order_id,
-        Ustr::from("ORDER_DOES_NOT_EXIST"),
-        uuid4,
-        UnixNanos::default(),
-        UnixNanos::default(),
-        false,
-        Some(venue_order_id),
-        Some(account_id),
-    )
+    OrderModifyRejectedSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id_ema_cross)
+        .instrument_id(instrument_id_btc_usdt)
+        .client_order_id(client_order_id)
+        .reason(Ustr::from("ORDER_DOES_NOT_EXIST"))
+        .event_id(uuid4)
+        .venue_order_id(venue_order_id)
+        .account_id(account_id)
+        .build()
 }
 
 #[fixture]
@@ -388,18 +339,15 @@ pub fn order_accepted(
     venue_order_id: VenueOrderId,
     uuid4: UUID4,
 ) -> OrderAccepted {
-    OrderAccepted::new(
-        trader_id,
-        strategy_id_ema_cross,
-        instrument_id_btc_usdt,
-        client_order_id,
-        venue_order_id,
-        account_id,
-        uuid4,
-        UnixNanos::default(),
-        UnixNanos::default(),
-        false,
-    )
+    OrderAcceptedSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id_ema_cross)
+        .instrument_id(instrument_id_btc_usdt)
+        .client_order_id(client_order_id)
+        .venue_order_id(venue_order_id)
+        .account_id(account_id)
+        .event_id(uuid4)
+        .build()
 }
 
 #[fixture]
@@ -412,19 +360,16 @@ pub fn order_cancel_rejected(
     account_id: AccountId,
     uuid4: UUID4,
 ) -> OrderCancelRejected {
-    OrderCancelRejected::new(
-        trader_id,
-        strategy_id_ema_cross,
-        instrument_id_btc_usdt,
-        client_order_id,
-        Ustr::from("ORDER_DOES_NOT_EXIST"),
-        uuid4,
-        UnixNanos::default(),
-        UnixNanos::default(),
-        false,
-        Some(venue_order_id),
-        Some(account_id),
-    )
+    OrderCancelRejectedSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id_ema_cross)
+        .instrument_id(instrument_id_btc_usdt)
+        .client_order_id(client_order_id)
+        .reason(Ustr::from("ORDER_DOES_NOT_EXIST"))
+        .event_id(uuid4)
+        .venue_order_id(venue_order_id)
+        .account_id(account_id)
+        .build()
 }
 
 #[fixture]
@@ -437,18 +382,15 @@ pub fn order_expired(
     account_id: AccountId,
     uuid4: UUID4,
 ) -> OrderExpired {
-    OrderExpired::new(
-        trader_id,
-        strategy_id_ema_cross,
-        instrument_id_btc_usdt,
-        client_order_id,
-        uuid4,
-        UnixNanos::default(),
-        UnixNanos::default(),
-        false,
-        Some(venue_order_id),
-        Some(account_id),
-    )
+    OrderExpiredSpec::builder()
+        .trader_id(trader_id)
+        .strategy_id(strategy_id_ema_cross)
+        .instrument_id(instrument_id_btc_usdt)
+        .client_order_id(client_order_id)
+        .event_id(uuid4)
+        .venue_order_id(venue_order_id)
+        .account_id(account_id)
+        .build()
 }
 
 // TestDefault implementations for order events
@@ -466,7 +408,8 @@ impl TestDefault for OrderAccepted {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
+            reconciliation: false,
+            causation_id: None,
         }
     }
 }
@@ -487,9 +430,10 @@ impl TestDefault for OrderCanceled {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
+            reconciliation: false,
             venue_order_id: None,
             account_id: None,
+            causation_id: None,
         }
     }
 }
@@ -511,9 +455,10 @@ impl TestDefault for OrderCancelRejected {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
+            reconciliation: false,
             venue_order_id: None,
             account_id: None,
+            causation_id: None,
         }
     }
 }
@@ -535,6 +480,7 @@ impl TestDefault for OrderDenied {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
+            causation_id: None,
         }
     }
 }
@@ -555,6 +501,7 @@ impl TestDefault for OrderEmulated {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
+            causation_id: None,
         }
     }
 }
@@ -575,46 +522,15 @@ impl TestDefault for OrderExpired {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
+            reconciliation: false,
             venue_order_id: None,
             account_id: None,
+            causation_id: None,
         }
     }
 }
 
 impl Default for OrderExpired {
-    fn default() -> Self {
-        Self::test_default()
-    }
-}
-
-impl TestDefault for OrderFilled {
-    fn test_default() -> Self {
-        Self {
-            trader_id: TraderId::test_default(),
-            strategy_id: StrategyId::test_default(),
-            instrument_id: InstrumentId::test_default(),
-            client_order_id: ClientOrderId::test_default(),
-            venue_order_id: VenueOrderId::test_default(),
-            account_id: AccountId::test_default(),
-            trade_id: TradeId::test_default(),
-            position_id: None,
-            order_side: OrderSide::Buy,
-            order_type: OrderType::Market,
-            last_qty: Quantity::new(100_000.0, 0),
-            last_px: Price::from("1.00000"),
-            currency: Currency::USD(),
-            commission: None,
-            liquidity_side: LiquiditySide::Taker,
-            event_id: UUID4::default(),
-            ts_event: UnixNanos::default(),
-            ts_init: UnixNanos::default(),
-            reconciliation: false,
-        }
-    }
-}
-
-impl Default for OrderFilled {
     fn default() -> Self {
         Self::test_default()
     }
@@ -656,6 +572,7 @@ impl TestDefault for OrderInitialized {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
+            causation_id: None,
         }
     }
 }
@@ -677,9 +594,10 @@ impl TestDefault for OrderModifyRejected {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
+            reconciliation: false,
             venue_order_id: None,
             account_id: None,
+            causation_id: None,
         }
     }
 }
@@ -700,9 +618,10 @@ impl TestDefault for OrderPendingCancel {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
+            reconciliation: false,
             venue_order_id: None,
             account_id: AccountId::test_default(),
+            causation_id: None,
         }
     }
 }
@@ -723,9 +642,10 @@ impl TestDefault for OrderPendingUpdate {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
+            reconciliation: false,
             venue_order_id: None,
             account_id: AccountId::test_default(),
+            causation_id: None,
         }
     }
 }
@@ -748,8 +668,9 @@ impl TestDefault for OrderRejected {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
-            due_post_only: 0,
+            reconciliation: false,
+            due_post_only: false,
+            causation_id: None,
         }
     }
 }
@@ -771,6 +692,7 @@ impl TestDefault for OrderReleased {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
+            causation_id: None,
         }
     }
 }
@@ -792,6 +714,7 @@ impl TestDefault for OrderSubmitted {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
+            causation_id: None,
         }
     }
 }
@@ -812,9 +735,10 @@ impl TestDefault for OrderTriggered {
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
+            reconciliation: false,
             venue_order_id: None,
             account_id: None,
+            causation_id: None,
         }
     }
 }
@@ -838,10 +762,12 @@ impl TestDefault for OrderUpdated {
             price: None,
             trigger_price: None,
             protection_price: None,
+            is_quote_quantity: false,
             event_id: UUID4::default(),
             ts_event: UnixNanos::default(),
             ts_init: UnixNanos::default(),
-            reconciliation: 0,
+            reconciliation: false,
+            causation_id: None,
         }
     }
 }

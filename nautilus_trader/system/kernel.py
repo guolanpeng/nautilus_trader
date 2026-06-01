@@ -46,7 +46,7 @@ from nautilus_trader.common.component import register_component_clock
 from nautilus_trader.common.component import set_backtest_force_stop
 from nautilus_trader.common.component import set_logging_pyo3
 from nautilus_trader.common.config import InvalidConfiguration
-from nautilus_trader.common.config import msgspec_encoding_hook
+from nautilus_trader.common.config import pyo3_config_json
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.common.enums import LogLevel
 from nautilus_trader.common.enums import log_level_from_str
@@ -183,7 +183,7 @@ class NautilusKernel:
         if logging.clear_log_file and logging.log_directory and logging.log_file_name:
             file_path = Path(
                 logging.log_directory,
-                f"{logging.log_file_name}.{'log' if logging.log_file_format is None else 'json'}",
+                f"{logging.log_file_name}.{'log' if logging.log_file_format is None else 'jsonl'}",
             )
 
             if file_path.exists():
@@ -215,6 +215,8 @@ class NautilusKernel:
                         is_bypassed=logging.bypass_logging,
                         print_config=logging.print_config,
                         log_components_only=logging.log_components_only,
+                        fileout_sync_on_flush=logging.fileout_sync_on_flush,
+                        buffered_stdout=logging.buffered_stdout,
                     )
                     nautilus_pyo3.log_header(
                         trader_id=nautilus_pyo3.TraderId(self._trader_id.value),
@@ -246,6 +248,8 @@ class NautilusKernel:
                         log_components_only=logging.log_components_only,
                         max_file_size=logging.log_file_max_size or 0,
                         max_backup_count=logging.log_file_max_backup_count,
+                        fileout_sync_on_flush=logging.fileout_sync_on_flush,
+                        buffered_stdout=logging.buffered_stdout,
                     )
                     log_header(
                         trader_id=self._trader_id,
@@ -291,7 +295,7 @@ class NautilusKernel:
             self._msgbus_db = nautilus_pyo3.RedisMessageBusDatabase(
                 trader_id=nautilus_pyo3.TraderId(self._trader_id.value),
                 instance_id=nautilus_pyo3.UUID4.from_str(self._instance_id.value),
-                config_json=msgspec.json.encode(config.message_bus, enc_hook=msgspec_encoding_hook),
+                config_json=pyo3_config_json(config.message_bus),
             )
         else:
             raise ValueError(
@@ -509,6 +513,7 @@ class NautilusKernel:
 
         if config.catalogs:
             catalog_name_index = 0
+
             for catalog_config in config.catalogs:
                 catalog = catalog_config.as_catalog()
                 used_catalog_name = catalog_config.name
@@ -624,14 +629,16 @@ class NautilusKernel:
 
         self._log.info(f"Received {command!r}, shutting down...", LogColor.BLUE)
 
+        # Set FORCE_STOP before teardown so the backtest loop bails out even
+        # if stop() / stop_async() raises partway through
+        if self._environment == Environment.BACKTEST:
+            set_backtest_force_stop(True)
+            self._log.debug("Set backtest FORCE_STOP")
+
         if self._loop:
             self._loop.create_task(self.stop_async())
         else:
             self.stop()
-
-        if self._environment == Environment.BACKTEST:
-            set_backtest_force_stop(True)
-            self._log.debug("Set backtest FORCE_STOP")
 
     @property
     def environment(self) -> Environment:
@@ -1126,14 +1133,17 @@ class NautilusKernel:
         if not self.exec_engine.is_disposed:
             self.exec_engine.dispose()
 
-        self._cache.dispose()
-        self._msgbus.dispose()
+        if not self._emulator.is_disposed:
+            self._emulator.dispose()
 
         if not self.trader.is_disposed:
             self.trader.dispose()
 
         if self._writer:
             self._writer.close()
+
+        self._cache.dispose()
+        self._msgbus.dispose()
 
     def cancel_all_tasks(self) -> None:  # noqa: C901 (too complex)
         """
@@ -1395,6 +1405,7 @@ class NautilusKernel:
     async def _check_engines_disconnected(self) -> bool:
         seconds = self._config.timeout_disconnection
         timeout: timedelta = self._clock.utc_now() + timedelta(seconds=seconds)
+
         while True:
             await asyncio.sleep(0)
 
@@ -1417,6 +1428,7 @@ class NautilusKernel:
         # Thus any delay here will be due to blocking network I/O.
         seconds = self._config.timeout_portfolio
         timeout: timedelta = self._clock.utc_now() + timedelta(seconds=seconds)
+
         while True:
             await asyncio.sleep(0)
 

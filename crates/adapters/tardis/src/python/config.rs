@@ -19,14 +19,17 @@ use pyo3::prelude::*;
 use ustr::Ustr;
 
 use crate::{
+    common::{enums::TardisExchange, parse::bar_spec_to_tardis_trade_bar_string},
     config::TardisDataClientConfig,
-    enums::TardisExchange,
-    machine::types::{ReplayNormalizedRequestOptions, TardisInstrumentMiniInfo},
-    parse::bar_spec_to_tardis_trade_bar_string,
+    machine::types::{
+        ReplayNormalizedRequestOptions, StreamNormalizedRequestOptions, TardisInstrumentMiniInfo,
+    },
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl TardisInstrumentMiniInfo {
+    /// Instrument definition information necessary for stream parsing.
     #[new]
     fn py_new(
         instrument_id: InstrumentId,
@@ -78,38 +81,47 @@ impl TardisInstrumentMiniInfo {
     }
 }
 
-/// Converts a bar specification to a Tardis trade bar string.
+/// Converts a Nautilus `BarSpecification` to the Tardis trade bar string convention.
 ///
 /// # Errors
 ///
-/// Returns an error if the bar specification cannot be converted to a Tardis format.
+/// Returns an error if the bar aggregation kind is unsupported.
 #[pyfunction(name = "bar_spec_to_tardis_trade_bar_string")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.tardis")]
 pub fn py_bar_spec_to_tardis_trade_bar_string(bar_spec: &BarSpecification) -> PyResult<String> {
     bar_spec_to_tardis_trade_bar_string(bar_spec).map_err(to_pyvalue_err)
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl TardisDataClientConfig {
+    /// Configuration for the Tardis data client.
     #[new]
     #[pyo3(signature = (
         api_key = None,
         tardis_ws_url = None,
+        proxy_url = None,
         normalize_symbols = None,
         options = None,
+        stream_options = None,
     ))]
     fn py_new(
         api_key: Option<String>,
         tardis_ws_url: Option<String>,
+        proxy_url: Option<String>,
         normalize_symbols: Option<bool>,
         options: Option<Vec<ReplayNormalizedRequestOptions>>,
+        stream_options: Option<Vec<StreamNormalizedRequestOptions>>,
     ) -> Self {
         let defaults = Self::default();
         Self {
             api_key,
             tardis_ws_url,
+            proxy_url,
             normalize_symbols: normalize_symbols.unwrap_or(defaults.normalize_symbols),
             book_snapshot_output: defaults.book_snapshot_output,
             options: options.unwrap_or_default(),
+            stream_options: stream_options.unwrap_or_default(),
         }
     }
 

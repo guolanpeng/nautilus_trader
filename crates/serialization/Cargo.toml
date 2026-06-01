@@ -6,6 +6,8 @@ include = [
   "src/**/*",
   "schemas/**/*",
   "generated/**/*",
+  "tests/**/*",
+  "benches/**/*",
   "build.rs",
   "Cargo.toml",
   "README.md",
@@ -27,12 +29,13 @@ workspace = true
 
 [lib]
 name = "nautilus_serialization"
-crate-type = ["rlib", "staticlib", "cdylib"]
+crate-type = ["rlib"]
 
 [features]
 default = []
-arrow = ["dep:arrow"]
-capnp = ["dep:capnp"]
+arrow = ["dep:arrow", "nautilus-model/arrow"]
+capnp = ["dep:capnp", "dep:capnpc", "dep:walkdir"]
+display = ["arrow"]
 sbe = []
 extension-module = [
   "nautilus-core/extension-module",
@@ -40,8 +43,19 @@ extension-module = [
   "python",
   "pyo3/extension-module",
 ]
-python = ["nautilus-core/python", "nautilus-model/python", "pyo3"]
+python = [
+  "nautilus-core/python",
+  "nautilus-model/python",
+  "pyo3",
+  "pyo3-stub-gen",
+]
 high-precision = ["nautilus-model/high-precision"]
+
+[package.metadata.cargo-machete]
+ignored = [
+  "capnpc", # Used by build.rs when the `capnp` feature is enabled
+  "walkdir", # Used by build.rs when the `capnp` feature is enabled
+]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -64,6 +78,7 @@ uuid = { workspace = true }
 arrow = { workspace = true, optional = true }
 capnp = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -71,8 +86,8 @@ pretty_assertions = { workspace = true }
 rstest = { workspace = true }
 
 [build-dependencies]
-capnpc = { workspace = true }
-walkdir = { workspace = true }
+capnpc = { workspace = true, optional = true }
+walkdir = { workspace = true, optional = true }
 
 [[bench]]
 name = "capnp_serialization"
@@ -92,7 +107,7 @@ harness = false
 required-features = ["sbe"]
 
 [[bench]]
-name = "quote_tick_capnp_vs_sbe"
-path = "benches/quote_tick_capnp_vs_sbe.rs"
+name = "market_data_capnp_vs_sbe"
+path = "benches/market_data_capnp_vs_sbe.rs"
 harness = false
 required-features = ["capnp", "sbe"]

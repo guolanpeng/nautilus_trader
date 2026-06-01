@@ -255,7 +255,7 @@ impl BitmexWsFeedHandler {
                                 "Welcome to the BitMEX Realtime API: version={}, heartbeat={}, rate_limit={:?}",
                                 version,
                                 heartbeat_enabled,
-                                limit.remaining,
+                                limit.as_ref().and_then(|l| l.remaining),
                             );
                         }
                         BitmexWsFrame::Subscription { .. } => return Some(msg),
@@ -272,7 +272,8 @@ impl BitmexWsFeedHandler {
                 }
             }
             Message::Binary(msg) => {
-                log::debug!("Raw binary: {msg:?}");
+                log::debug!("Raw binary frame ({} bytes)", msg.len());
+                log::trace!("Raw binary: {msg:?}");
             }
             Message::Close(_) => {
                 log::debug!("Received close message, waiting for reconnection");

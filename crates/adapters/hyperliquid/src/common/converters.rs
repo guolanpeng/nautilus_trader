@@ -19,12 +19,89 @@
 //! and Hyperliquid-specific order type representations.
 
 use anyhow::Context;
-use nautilus_model::enums::{OrderType, TimeInForce};
+use nautilus_model::{
+    enums::{OrderType, TimeInForce},
+    identifiers::{InstrumentId, Symbol},
+};
 use rust_decimal::Decimal;
 
-use super::enums::{
-    HyperliquidConditionalOrderType, HyperliquidOrderType, HyperliquidTimeInForce, HyperliquidTpSl,
+use super::{
+    consts::HYPERLIQUID_VENUE,
+    enums::{
+        HyperliquidConditionalOrderType, HyperliquidOrderType, HyperliquidTimeInForce,
+        HyperliquidTpSl,
+    },
+    parse::{format_outcome_nautilus_symbol, parse_outcome_nautilus_symbol, parse_outcome_symbol},
+    types::HyperliquidAssetId,
 };
+
+/// Converts an outcome (HIP-4) asset ID to its spot coin representation.
+///
+/// # Errors
+///
+/// Returns an error if `asset_id` is not a valid outcome asset ID.
+pub fn outcome_asset_id_to_coin(asset_id: HyperliquidAssetId) -> anyhow::Result<String> {
+    let encoding = outcome_encoding(asset_id)?;
+    Ok(format!("#{encoding}"))
+}
+
+/// Converts an outcome (HIP-4) asset ID to its token name representation.
+///
+/// # Errors
+///
+/// Returns an error if `asset_id` is not a valid outcome asset ID.
+pub fn outcome_asset_id_to_token(asset_id: HyperliquidAssetId) -> anyhow::Result<String> {
+    let encoding = outcome_encoding(asset_id)?;
+    Ok(format!("+{encoding}"))
+}
+
+/// Converts an outcome (HIP-4) asset ID to its canonical Nautilus instrument ID.
+///
+/// The instrument ID uses the form `{outcome_index}-{YES|NO}-OUTCOME.HYPERLIQUID`,
+/// symmetric with `-PERP` / `-SPOT`, so the human reading the ID can see which
+/// question and side they're trading. The venue wire forms (`#<encoding>` /
+/// `+<encoding>`) are preserved on the instrument's `raw_symbol` and base
+/// alias, not on the Nautilus symbol.
+///
+/// # Errors
+///
+/// Returns an error if `asset_id` is not a valid outcome asset ID.
+pub fn outcome_asset_id_to_instrument_id(
+    asset_id: HyperliquidAssetId,
+) -> anyhow::Result<InstrumentId> {
+    let encoding = outcome_encoding(asset_id)?;
+    let outcome_index = encoding / 10;
+    let side = u8::try_from(encoding % 10).unwrap_or(0);
+    let symbol = format_outcome_nautilus_symbol(outcome_index, side);
+    Ok(InstrumentId::new(Symbol::new(symbol), *HYPERLIQUID_VENUE))
+}
+
+/// Parses an outcome (HIP-4) asset ID from a Nautilus instrument ID.
+///
+/// Accepts the Nautilus symbol form (`{N}-{YES|NO}-OUTCOME.HYPERLIQUID`) and,
+/// for compatibility with venue-wire-derived ids, also the
+/// `#<encoding>.HYPERLIQUID` and `+<encoding>.HYPERLIQUID` forms.
+///
+/// # Errors
+///
+/// Returns an error if the symbol matches none of the supported forms.
+pub fn outcome_asset_id_from_instrument_id(
+    instrument_id: InstrumentId,
+) -> anyhow::Result<HyperliquidAssetId> {
+    let symbol = instrument_id.symbol.as_str();
+
+    if let Some((outcome_index, side)) = parse_outcome_nautilus_symbol(symbol) {
+        return Ok(HyperliquidAssetId::outcome(outcome_index, side));
+    }
+
+    parse_outcome_symbol(symbol)
+}
+
+fn outcome_encoding(asset_id: HyperliquidAssetId) -> anyhow::Result<u32> {
+    asset_id
+        .outcome_encoding()
+        .with_context(|| format!("Invalid Hyperliquid outcome asset ID: {asset_id}"))
+}
 
 /// Converts a Nautilus `OrderType` to a Hyperliquid order type configuration.
 ///
@@ -230,6 +307,66 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn test_outcome_asset_id_to_wire_symbols() {
+        let asset_id = HyperliquidAssetId::outcome(1, 0);
+
+        assert_eq!(outcome_asset_id_to_coin(asset_id).unwrap(), "#10");
+        assert_eq!(outcome_asset_id_to_token(asset_id).unwrap(), "+10");
+    }
+
+    #[rstest]
+    fn test_outcome_asset_id_to_wire_symbols_rejects_non_outcome() {
+        let err = outcome_asset_id_to_coin(HyperliquidAssetId::spot(7)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid Hyperliquid outcome asset ID"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[rstest]
+    fn test_outcome_asset_id_instrument_id_roundtrip() {
+        let asset_id = HyperliquidAssetId::outcome(3, 1);
+        let instrument_id = outcome_asset_id_to_instrument_id(asset_id).unwrap();
+
+        assert_eq!(
+            instrument_id,
+            InstrumentId::from("3-NO-OUTCOME.HYPERLIQUID")
+        );
+        assert_eq!(
+            outcome_asset_id_from_instrument_id(instrument_id).unwrap(),
+            asset_id,
+        );
+    }
+
+    #[rstest]
+    fn test_outcome_asset_id_to_instrument_id_yes_side() {
+        let asset_id = HyperliquidAssetId::outcome(25, 0);
+        let instrument_id = outcome_asset_id_to_instrument_id(asset_id).unwrap();
+
+        assert_eq!(
+            instrument_id,
+            InstrumentId::from("25-YES-OUTCOME.HYPERLIQUID")
+        );
+    }
+
+    #[rstest]
+    #[case("#10.HYPERLIQUID", 1, 0)]
+    #[case("+10.HYPERLIQUID", 1, 0)]
+    #[case("1-YES-OUTCOME.HYPERLIQUID", 1, 0)]
+    #[case("1-NO-OUTCOME.HYPERLIQUID", 1, 1)]
+    fn test_outcome_asset_id_from_instrument_id_accepts_all_forms(
+        #[case] symbol: &str,
+        #[case] outcome_index: u32,
+        #[case] side: u8,
+    ) {
+        let instrument_id = InstrumentId::from(symbol);
+        let asset_id = outcome_asset_id_from_instrument_id(instrument_id).unwrap();
+
+        assert_eq!(asset_id, HyperliquidAssetId::outcome(outcome_index, side));
+    }
 
     #[rstest]
     fn test_nautilus_to_hyperliquid_limit_order() {

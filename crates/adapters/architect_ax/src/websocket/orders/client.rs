@@ -28,6 +28,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use nautilus_common::live::get_runtime;
 use nautilus_core::{
+    AtomicMap,
     consts::NAUTILUS_USER_AGENT,
     nanos::UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
@@ -42,7 +43,8 @@ use nautilus_network::{
     backoff::ExponentialBackoff,
     mode::ConnectionMode,
     websocket::{
-        AuthTracker, PingHandler, WebSocketClient, WebSocketConfig, channel_message_handler,
+        AuthTracker, PingHandler, TransportBackend, WebSocketClient, WebSocketConfig,
+        channel_message_handler,
     },
 };
 use ustr::Ustr;
@@ -56,9 +58,6 @@ use crate::{
     },
     websocket::messages::{AxOrdersWsMessage, AxWsPlaceOrder, OrderMetadata},
 };
-
-/// Default heartbeat interval in seconds.
-const DEFAULT_HEARTBEAT_SECS: u64 = 30;
 
 /// Result type for Ax orders WebSocket operations.
 pub type AxOrdersWsResult<T> = Result<T, AxOrdersWsClientError>;
@@ -130,11 +129,13 @@ pub struct AxOrdersWebSocketClient {
     signal: Arc<AtomicBool>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
     auth_tracker: AuthTracker,
-    instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
+    instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
     caches: OrdersCaches,
     request_id_counter: Arc<AtomicI64>,
     account_id: AccountId,
     trader_id: TraderId,
+    transport_backend: TransportBackend,
+    proxy_url: Option<String>,
 }
 
 impl Debug for AxOrdersWebSocketClient {
@@ -164,6 +165,8 @@ impl Clone for AxOrdersWebSocketClient {
             request_id_counter: Arc::clone(&self.request_id_counter),
             account_id: self.account_id,
             trader_id: self.trader_id,
+            transport_backend: self.transport_backend,
+            proxy_url: self.proxy_url.clone(),
         }
     }
 }
@@ -175,7 +178,9 @@ impl AxOrdersWebSocketClient {
         url: String,
         account_id: AccountId,
         trader_id: TraderId,
-        heartbeat: Option<u64>,
+        heartbeat: u64,
+        transport_backend: TransportBackend,
+        proxy_url: Option<String>,
     ) -> Self {
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
 
@@ -185,18 +190,20 @@ impl AxOrdersWebSocketClient {
         Self {
             clock: get_atomic_clock_realtime(),
             url,
-            heartbeat: heartbeat.or(Some(DEFAULT_HEARTBEAT_SECS)),
+            heartbeat: Some(heartbeat),
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
             signal: Arc::new(AtomicBool::new(false)),
             task_handle: None,
             auth_tracker: AuthTracker::default(),
-            instruments_cache: Arc::new(DashMap::new()),
+            instruments_cache: Arc::new(AtomicMap::new()),
             caches: OrdersCaches::default(),
             request_id_counter: Arc::new(AtomicI64::new(1)),
             account_id,
             trader_id,
+            transport_backend,
+            proxy_url,
         }
     }
 
@@ -243,10 +250,19 @@ impl AxOrdersWebSocketClient {
         self.instruments_cache.insert(symbol, instrument);
     }
 
+    /// Caches multiple instruments for use during message parsing.
+    pub fn cache_instruments(&self, instruments: &[InstrumentAny]) {
+        self.instruments_cache.rcu(|m| {
+            for inst in instruments {
+                m.insert(inst.symbol().inner(), inst.clone());
+            }
+        });
+    }
+
     /// Returns a cached instrument by symbol.
     #[must_use]
     pub fn get_cached_instrument(&self, symbol: &Ustr) -> Option<InstrumentAny> {
-        self.instruments_cache.get(symbol).map(|r| r.clone())
+        self.instruments_cache.get_cloned(symbol)
     }
 
     /// Returns the shared order caches.
@@ -257,7 +273,7 @@ impl AxOrdersWebSocketClient {
 
     /// Returns the instruments cache.
     #[must_use]
-    pub fn instruments_cache(&self) -> Arc<DashMap<Ustr, InstrumentAny>> {
+    pub fn instruments_cache(&self) -> Arc<AtomicMap<Ustr, InstrumentAny>> {
         Arc::clone(&self.instruments_cache)
     }
 
@@ -316,6 +332,7 @@ impl AxOrdersWebSocketClient {
             size_precision: instrument.size_precision(),
             price_precision: instrument.price_precision(),
             quote_currency: instrument.quote_currency(),
+            pending_trigger_price: None,
         };
 
         self.caches
@@ -372,6 +389,8 @@ impl AxOrdersWebSocketClient {
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: self.transport_backend,
+            proxy_url: self.proxy_url.clone(),
         };
 
         // Retry initial connection with exponential backoff
@@ -509,7 +528,7 @@ impl AxOrdersWebSocketClient {
     /// - A limit order is missing a price.
     /// - A stop-loss order is missing a trigger price.
     /// - The order command cannot be sent.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn submit_order(
         &self,
         trader_id: TraderId,
@@ -610,6 +629,7 @@ impl AxOrdersWebSocketClient {
             size_precision: instrument.size_precision(),
             price_precision: instrument.price_precision(),
             quote_currency: instrument.quote_currency(),
+            pending_trigger_price: None,
         };
         self.caches
             .orders_metadata
@@ -771,7 +791,9 @@ mod tests {
             "wss://example.com/orders/ws".to_string(),
             AccountId::from("AX-001"),
             TraderId::from("TRADER-001"),
-            Some(30),
+            30,
+            TransportBackend::default(),
+            None,
         );
         let client_order_id = ClientOrderId::from("CID-123");
 
@@ -790,7 +812,9 @@ mod tests {
             "wss://example.com/orders/ws".to_string(),
             AccountId::from("AX-001"),
             TraderId::from("TRADER-001"),
-            Some(30),
+            30,
+            TransportBackend::default(),
+            None,
         );
 
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();

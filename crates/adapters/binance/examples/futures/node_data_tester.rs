@@ -15,21 +15,24 @@
 
 //! Example demonstrating live data testing with the Binance Futures USD-M adapter.
 //!
-//! Run with: `cargo run --example binance-futures-data-tester --package nautilus-binance`
+//! Run with: `cargo run --example binance-futures-data-tester --package nautilus-binance --features examples`
 //!
 //! Uses testnet by default for safety.
 
 use std::num::NonZeroUsize;
 
 use nautilus_binance::{
-    common::enums::{BinanceEnvironment, BinanceProductType},
+    common::{
+        consts::BINANCE_CLIENT_ID,
+        enums::{BinanceEnvironment, BinanceProductType},
+    },
     config::BinanceDataClientConfig,
     factories::BinanceDataClientFactory,
 };
 use nautilus_common::enums::Environment;
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
-    identifiers::{ClientId, InstrumentId, TraderId},
+    identifiers::{InstrumentId, TraderId},
     stubs::TestDefault,
 };
 use nautilus_testkit::testers::{DataTester, DataTesterConfig};
@@ -55,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let client_factory = BinanceDataClientFactory::new();
-    let client_id = ClientId::new("BINANCE");
+    let client_id = *BINANCE_CLIENT_ID;
 
     let mut node = LiveNode::builder(trader_id, environment)?
         .with_name(node_name)
@@ -63,10 +66,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_data_client(None, Box::new(client_factory), Box::new(binance_config))?
         .build()?;
 
-    let tester_config = DataTesterConfig::new(client_id, instrument_ids)
-        .with_subscribe_book_at_interval(true)
-        .with_book_depth(NonZeroUsize::new(20))
-        .with_book_interval_ms(NonZeroUsize::new(10).unwrap());
+    let tester_config = DataTesterConfig::builder()
+        .client_id(client_id)
+        .instrument_ids(instrument_ids)
+        .subscribe_book_at_interval(true)
+        .book_depth(NonZeroUsize::new(20).unwrap())
+        .book_interval_ms(NonZeroUsize::new(10).unwrap())
+        .manage_book(true)
+        .build();
     let tester = DataTester::new(tester_config);
 
     node.add_actor(tester)?;

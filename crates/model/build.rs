@@ -30,7 +30,7 @@ use std::env;
 
 #[allow(
     clippy::expect_used,
-    reason = "Build script may panic on misconfiguration"
+    reason = "Build script may panic on misconfiguration; .expect() calls are behind #[cfg(feature = \"ffi\")]"
 )]
 #[allow(
     unused_assignments,
@@ -156,7 +156,7 @@ fn main() {
         }
 
         // Recreate the file and dump the processed contents to it
-        let mut dst = File::create(cython_path).expect("`File::create` failed");
+        let mut dst = File::create(&cython_path).expect("`File::create` failed");
         dst.write_all(data.as_bytes())
             .expect("I/O error on `dist.write`");
     }

@@ -15,8 +15,7 @@
 
 use std::fmt::{Debug, Display};
 
-use derive_builder::Builder;
-use nautilus_core::{UUID4, UnixNanos, serialization::from_bool_as_u8};
+use nautilus_core::{UUID4, UnixNanos};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
@@ -37,9 +36,8 @@ use crate::{
 /// Represents an event where an `ModifyOrder` command has been sent to the
 /// trading venue.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Builder)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
-#[cfg_attr(any(test, feature = "stubs"), builder(default))]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
@@ -66,15 +64,18 @@ pub struct OrderPendingUpdate {
     /// UNIX timestamp (nanoseconds) when the event was initialized.
     pub ts_init: UnixNanos,
     /// If the event was generated during reconciliation.
-    #[serde(deserialize_with = "from_bool_as_u8")]
-    pub reconciliation: u8, // TODO: Change to bool once Cython removed
+    pub reconciliation: bool,
     /// The venue order ID associated with the event.
     pub venue_order_id: Option<VenueOrderId>,
+    /// The causation ID associated with the event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl OrderPendingUpdate {
     /// Creates a new [`OrderPendingUpdate`] instance.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
+    #[must_use]
     pub fn new(
         trader_id: TraderId,
         strategy_id: StrategyId,
@@ -96,8 +97,9 @@ impl OrderPendingUpdate {
             event_id,
             ts_event,
             ts_init,
-            reconciliation: u8::from(reconciliation),
+            reconciliation,
             venue_order_id,
+            causation_id: None,
         }
     }
 }
@@ -325,5 +327,13 @@ mod test {
             display,
             "OrderPendingUpdate(instrument_id=BTCUSDT.COINBASE, client_order_id=O-19700101-000000-001-001-1, venue_order_id=001, account_id=SIM-001, ts_event=0)"
         );
+    }
+
+    #[rstest]
+    fn test_order_pending_update_serialization() {
+        let original = OrderPendingUpdate::default();
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: OrderPendingUpdate = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
     }
 }

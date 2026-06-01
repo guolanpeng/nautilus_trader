@@ -41,7 +41,7 @@ pub mod twap;
 
 pub use core::{ExecutionAlgorithmCore, StrategyEventHandlers};
 
-pub use config::ExecutionAlgorithmConfig;
+pub use config::{ExecutionAlgorithmConfig, ImportableExecAlgorithmConfig};
 use nautilus_common::{
     actor::{DataActor, registry::try_get_actor_unchecked},
     enums::ComponentState,
@@ -60,8 +60,8 @@ use nautilus_model::{
         OrderTriggered, OrderUpdated, PositionChanged, PositionClosed, PositionEvent,
         PositionOpened,
     },
-    identifiers::{ClientId, ExecAlgorithmId, PositionId, StrategyId},
-    orders::{LimitOrder, MarketOrder, MarketToLimitOrder, Order, OrderAny, OrderList},
+    identifiers::{AccountId, ClientId, ExecAlgorithmId, PositionId, StrategyId, TraderId},
+    orders::{LimitOrder, MarketOrder, MarketToLimitOrder, Order, OrderAny, OrderError, OrderList},
     types::{Price, Quantity},
 };
 pub use twap::{TwapAlgorithm, TwapAlgorithmConfig};
@@ -174,7 +174,7 @@ pub trait ExecutionAlgorithm: DataActor {
     ///
     /// Returns an error if cancellation fails.
     fn handle_cancel_order(&mut self, command: CancelOrder) -> anyhow::Result<()> {
-        let (mut order, is_pending_cancel) = {
+        let (order, is_pending_cancel) = {
             let cache = self.core_mut().cache();
 
             let Some(order) = cache.order(&command.client_order_id) else {
@@ -198,21 +198,28 @@ pub trait ExecutionAlgorithm: DataActor {
             return Ok(());
         }
 
-        let event = self.generate_order_canceled(&order);
+        let event = OrderEventAny::Canceled(self.generate_order_canceled(&order));
 
-        if let Err(e) = order.apply(OrderEventAny::Canceled(event)) {
-            log::warn!("InvalidStateTrigger: {e}, did not apply cancel event");
-            return Ok(());
-        }
-
-        {
+        let order = {
             let cache_rc = self.core_mut().cache_rc();
             let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&order)?;
-        }
+            match cache.update_order(&event) {
+                Ok(order) => order,
+                Err(e)
+                    if matches!(
+                        e.downcast_ref::<OrderError>(),
+                        Some(OrderError::InvalidStateTransition)
+                    ) =>
+                {
+                    log::warn!("InvalidStateTrigger: {e}, did not apply cancel event");
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+        };
 
         let topic = format!("events.order.{}", order.strategy_id());
-        msgbus::publish_order_event(topic.into(), &OrderEventAny::Canceled(event));
+        msgbus::publish_order_event(topic.into(), &event);
 
         Ok(())
     }
@@ -319,7 +326,7 @@ pub trait ExecutionAlgorithm: DataActor {
             UUID4::new(),
             ts_init,
             reduce_only,
-            false, // quote_quantity
+            primary.is_quote_quantity(),
             primary.contingency_type(),
             primary.order_list_id(),
             primary.linked_order_ids().map(|ids| ids.to_vec()),
@@ -343,7 +350,7 @@ pub trait ExecutionAlgorithm: DataActor {
     /// by the spawned quantity. If the spawned order is subsequently denied or
     /// rejected (before acceptance), the deducted quantity is automatically
     /// restored to the primary order.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn spawn_limit(
         &mut self,
         primary: &mut OrderAny,
@@ -382,7 +389,7 @@ pub trait ExecutionAlgorithm: DataActor {
             expire_time,
             post_only,
             reduce_only,
-            false, // quote_quantity
+            primary.is_quote_quantity(),
             display_qty,
             emulation_trigger,
             None, // trigger_instrument_id
@@ -411,7 +418,7 @@ pub trait ExecutionAlgorithm: DataActor {
     /// by the spawned quantity. If the spawned order is subsequently denied or
     /// rejected (before acceptance), the deducted quantity is automatically
     /// restored to the primary order.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn spawn_market_to_limit(
         &mut self,
         primary: &mut OrderAny,
@@ -447,7 +454,7 @@ pub trait ExecutionAlgorithm: DataActor {
             expire_time,
             false, // post_only
             reduce_only,
-            false, // quote_quantity
+            primary.is_quote_quantity(),
             display_qty,
             primary.contingency_type(),
             primary.order_list_id(),
@@ -504,17 +511,20 @@ pub trait ExecutionAlgorithm: DataActor {
             None, // price
             None, // trigger_price
             None, // protection_price
+            primary.is_quote_quantity(),
         );
 
-        primary
-            .apply(OrderEventAny::Updated(updated))
-            .expect("Failed to apply OrderUpdated");
+        let event = OrderEventAny::Updated(updated);
 
-        let cache_rc = core.cache_rc();
-        let mut cache = cache_rc.borrow_mut();
-        cache
-            .update_order(primary)
-            .expect("Failed to update order in cache");
+        {
+            let cache_rc = core.cache_rc();
+            let mut cache = cache_rc.borrow_mut();
+            *primary = cache
+                .update_order(&event)
+                .expect("Failed to update order in cache");
+        }
+
+        publish_order_event(&event);
     }
 
     /// Restores the primary order quantity after a spawned order is denied or rejected.
@@ -538,10 +548,10 @@ pub trait ExecutionAlgorithm: DataActor {
 
         let primary = {
             let cache = self.core_mut().cache();
-            cache.order(&exec_spawn_id).cloned()
+            cache.order(&exec_spawn_id).map(|o| o.clone())
         };
 
-        let Some(mut primary) = primary else {
+        let Some(primary) = primary else {
             log::warn!(
                 "Cannot restore primary order quantity: primary order {exec_spawn_id} not found",
             );
@@ -577,21 +587,24 @@ pub trait ExecutionAlgorithm: DataActor {
             None, // price
             None, // trigger_price
             None, // protection_price
+            primary.is_quote_quantity(),
         );
 
-        if let Err(e) = primary.apply(OrderEventAny::Updated(updated)) {
-            log::warn!("Failed to apply OrderUpdated for quantity restoration: {e}");
-            return;
-        }
+        let event = OrderEventAny::Updated(updated);
 
-        {
+        let primary = {
             let cache_rc = core.cache_rc();
             let mut cache = cache_rc.borrow_mut();
-            if let Err(e) = cache.update_order(&primary) {
-                log::warn!("Failed to update primary order in cache: {e}");
-                return;
+            match cache.update_order(&event) {
+                Ok(primary) => primary,
+                Err(e) => {
+                    log::warn!("Failed to update primary order in cache: {e}");
+                    return;
+                }
             }
-        }
+        };
+
+        publish_order_event(&event);
 
         log::info!(
             "Restored primary order {} quantity to {} after spawned order {} was denied/rejected",
@@ -614,16 +627,25 @@ pub trait ExecutionAlgorithm: DataActor {
     ) -> anyhow::Result<()> {
         let core = self.core_mut();
 
-        let trader_id = core.trader_id().expect("Trader ID not set");
+        let trader_id = registered_trader_id(core)?;
         let ts_init = core.clock().timestamp_ns();
 
         // For spawned orders, use the parent's strategy ID
         let strategy_id = order.strategy_id();
 
+        let order_exists = {
+            let cache = core.cache();
+            cache.order_exists(&order.client_order_id())
+        };
+
         {
             let cache_rc = core.cache_rc();
             let mut cache = cache_rc.borrow_mut();
             cache.add_order(order.clone(), position_id, client_id, true)?;
+        }
+
+        if !order_exists {
+            publish_order_initialized(&order);
         }
 
         let command = SubmitOrder::new(
@@ -638,6 +660,7 @@ pub trait ExecutionAlgorithm: DataActor {
             None, // params
             UUID4::new(),
             ts_init,
+            None, // correlation_id
         );
 
         if core.config.log_commands {
@@ -688,24 +711,34 @@ pub trait ExecutionAlgorithm: DataActor {
         }
 
         let core = self.core_mut();
-        let trader_id = core.trader_id().expect("Trader ID not set");
+        let trader_id = registered_trader_id(core)?;
         let strategy_id = order.strategy_id();
 
         if !order.is_active_local() {
+            required_account_id(order, "pending update")?;
             let event = self.generate_order_pending_update(order);
-            if let Err(e) = order.apply(OrderEventAny::PendingUpdate(event)) {
-                log::warn!("InvalidStateTrigger: {e}, did not apply pending update event");
-                return Ok(());
-            }
+            let event = OrderEventAny::PendingUpdate(event);
 
             {
                 let cache_rc = self.core_mut().cache_rc();
                 let mut cache = cache_rc.borrow_mut();
-                cache.update_order(order).ok();
+                match cache.update_order(&event) {
+                    Ok(updated) => *order = updated,
+                    Err(e)
+                        if matches!(
+                            e.downcast_ref::<OrderError>(),
+                            Some(OrderError::InvalidStateTransition)
+                        ) =>
+                    {
+                        log::warn!("InvalidStateTrigger: {e}, did not apply pending update event");
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                }
             }
 
             let topic = format!("events.order.{strategy_id}");
-            msgbus::publish_order_event(topic.into(), &OrderEventAny::PendingUpdate(event));
+            msgbus::publish_order_event(topic.into(), &event);
         }
 
         let ts_init = self.core_mut().clock().timestamp_ns();
@@ -721,7 +754,8 @@ pub trait ExecutionAlgorithm: DataActor {
             trigger_price,
             UUID4::new(),
             ts_init,
-            None, // params
+            None, // params,
+            None, // correlation_id
         );
 
         if self.core_mut().config.log_commands {
@@ -816,15 +850,18 @@ pub trait ExecutionAlgorithm: DataActor {
             price,
             trigger_price,
             None, // protection_price
+            order.is_quote_quantity(),
         );
 
-        order
-            .apply(OrderEventAny::Updated(updated))
-            .map_err(|e| anyhow::anyhow!("Failed to apply OrderUpdated: {e}"))?;
+        let event = OrderEventAny::Updated(updated);
 
-        let cache_rc = core.cache_rc();
-        let mut cache = cache_rc.borrow_mut();
-        cache.update_order(order)?;
+        {
+            let cache_rc = core.cache_rc();
+            let mut cache = cache_rc.borrow_mut();
+            *order = cache.update_order(&event)?;
+        }
+
+        publish_order_event(&event);
 
         Ok(())
     }
@@ -848,24 +885,34 @@ pub trait ExecutionAlgorithm: DataActor {
         }
 
         let core = self.core_mut();
-        let trader_id = core.trader_id().expect("Trader ID not set");
+        let trader_id = registered_trader_id(core)?;
         let strategy_id = order.strategy_id();
 
         if !order.is_active_local() {
+            required_account_id(order, "pending cancel")?;
             let event = self.generate_order_pending_cancel(order);
-            if let Err(e) = order.apply(OrderEventAny::PendingCancel(event)) {
-                log::warn!("InvalidStateTrigger: {e}, did not apply pending cancel event");
-                return Ok(());
-            }
+            let event = OrderEventAny::PendingCancel(event);
 
             {
                 let cache_rc = self.core_mut().cache_rc();
                 let mut cache = cache_rc.borrow_mut();
-                cache.update_order(order).ok();
+                match cache.update_order(&event) {
+                    Ok(updated) => *order = updated,
+                    Err(e)
+                        if matches!(
+                            e.downcast_ref::<OrderError>(),
+                            Some(OrderError::InvalidStateTransition)
+                        ) =>
+                    {
+                        log::warn!("InvalidStateTrigger: {e}, did not apply pending cancel event");
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                }
             }
 
             let topic = format!("events.order.{strategy_id}");
-            msgbus::publish_order_event(topic.into(), &OrderEventAny::PendingCancel(event));
+            msgbus::publish_order_event(topic.into(), &event);
         }
 
         let ts_init = self.core_mut().clock().timestamp_ns();
@@ -878,7 +925,8 @@ pub trait ExecutionAlgorithm: DataActor {
             order.venue_order_id(),
             UUID4::new(),
             ts_init,
-            None, // params
+            None, // params,
+            None, // correlation_id
         );
 
         if self.core_mut().config.log_commands {
@@ -979,7 +1027,7 @@ pub trait ExecutionAlgorithm: DataActor {
 
         let order = {
             let cache = self.core_mut().cache();
-            cache.order(&event.client_order_id()).cloned()
+            cache.order(&event.client_order_id()).map(|o| o.clone())
         };
 
         let Some(order) = order else {
@@ -1196,24 +1244,47 @@ pub trait ExecutionAlgorithm: DataActor {
     fn on_position_event(&mut self, event: PositionEvent) {}
 }
 
+fn publish_order_initialized(order: &OrderAny) {
+    let event = OrderEventAny::Initialized(order.init_event().clone());
+    publish_order_event(&event);
+}
+
+fn publish_order_event(event: &OrderEventAny) {
+    let topic = format!("events.order.{}", event.strategy_id());
+    msgbus::publish_order_event(topic.into(), event);
+}
+
+fn registered_trader_id(core: &ExecutionAlgorithmCore) -> anyhow::Result<TraderId> {
+    core.trader_id()
+        .ok_or_else(|| anyhow::anyhow!("ExecutionAlgorithm not registered: trader_id is not set"))
+}
+
+fn required_account_id(order: &OrderAny, operation: &str) -> anyhow::Result<AccountId> {
+    order.account_id().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cannot generate {operation} event for {}: account_id is not set",
+            order.client_order_id()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{
-        cell::RefCell,
-        ops::{Deref, DerefMut},
-        rc::Rc,
-    };
+    use std::{cell::RefCell, rc::Rc};
 
     use nautilus_common::{
-        actor::{DataActor, DataActorCore},
-        cache::Cache,
-        clock::TestClock,
-        component::Component,
-        enums::ComponentTrigger,
+        actor::DataActor, cache::Cache, clock::TestClock, component::Component,
+        enums::ComponentTrigger, msgbus, msgbus::TypedHandler, nautilus_actor,
     };
     use nautilus_model::{
         enums::OrderSide,
-        events::{OrderAccepted, OrderCanceled, OrderDenied, OrderRejected},
+        events::{
+            OrderAccepted, OrderCanceled, OrderDenied, OrderRejected,
+            order::spec::{
+                OrderAcceptedSpec, OrderCanceledSpec, OrderDeniedSpec, OrderFilledSpec,
+                OrderRejectedSpec,
+            },
+        },
         identifiers::{
             AccountId, ClientOrderId, ExecAlgorithmId, InstrumentId, StrategyId, TraderId,
             VenueOrderId,
@@ -1242,20 +1313,9 @@ mod tests {
         }
     }
 
-    impl Deref for TestAlgorithm {
-        type Target = DataActorCore;
-        fn deref(&self) -> &Self::Target {
-            &self.core.actor
-        }
-    }
-
-    impl DerefMut for TestAlgorithm {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.core.actor
-        }
-    }
-
     impl DataActor for TestAlgorithm {}
+
+    nautilus_actor!(TestAlgorithm);
 
     impl ExecutionAlgorithm for TestAlgorithm {
         fn core_mut(&mut self) -> &mut ExecutionAlgorithmCore {
@@ -1293,6 +1353,24 @@ mod tests {
             .unwrap();
     }
 
+    fn subscribe_order_topic(
+        strategy_id: StrategyId,
+    ) -> (TypedHandler<OrderEventAny>, Rc<RefCell<Vec<OrderEventAny>>>) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let handler = TypedHandler::from({
+            let events = events.clone();
+            move |event: &OrderEventAny| {
+                events.borrow_mut().push(event.clone());
+            }
+        });
+        msgbus::subscribe_order_events(
+            format!("events.order.{strategy_id}").into(),
+            handler.clone(),
+            None,
+        );
+        (handler, events)
+    }
+
     #[rstest]
     fn test_algorithm_creation() {
         let algo = create_test_algorithm();
@@ -1308,6 +1386,76 @@ mod tests {
 
         assert!(algo.core.trader_id().is_some());
         assert_eq!(algo.core.trader_id(), Some(TraderId::from("TRADER-001")));
+    }
+
+    #[rstest]
+    fn test_submit_order_errors_when_algorithm_not_registered() {
+        let mut algo = create_test_algorithm();
+        let order = OrderAny::Market(MarketOrder::new(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("STRAT-001"),
+            InstrumentId::from("BTC/USDT.BINANCE"),
+            ClientOrderId::from("O-UNREGISTERED-001"),
+            OrderSide::Buy,
+            Quantity::from("1.0"),
+            TimeInForce::Gtc,
+            UUID4::new(),
+            0.into(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        let err = algo
+            .submit_order(order, None, None)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "ExecutionAlgorithm not registered: trader_id is not set"
+        );
+    }
+
+    #[rstest]
+    fn test_required_account_id_errors_when_missing_for_algorithm_event() {
+        let order = OrderAny::Market(MarketOrder::new(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("STRAT-001"),
+            InstrumentId::from("BTC/USDT.BINANCE"),
+            ClientOrderId::from("O-NO-ACCOUNT-001"),
+            OrderSide::Buy,
+            Quantity::from("1.0"),
+            TimeInForce::Gtc,
+            UUID4::new(),
+            0.into(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        let err = required_account_id(&order, "pending update")
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "Cannot generate pending update event for O-NO-ACCOUNT-001: account_id is not set"
+        );
     }
 
     #[rstest]
@@ -1438,7 +1586,7 @@ mod tests {
         algo.on_order_modify_rejected(OrderModifyRejected::default());
         algo.on_order_cancel_rejected(OrderCancelRejected::default());
         algo.on_order_updated(OrderUpdated::default());
-        algo.on_algo_order_filled(OrderFilled::default());
+        algo.on_algo_order_filled(OrderFilledSpec::builder().build());
     }
 
     #[rstest]
@@ -1617,6 +1765,93 @@ mod tests {
     }
 
     #[rstest]
+    fn test_algorithm_spawn_propagates_primary_fields() {
+        let mut algo = create_test_algorithm();
+        register_algorithm(&mut algo);
+
+        let mut params = indexmap::IndexMap::new();
+        params.insert(ustr::Ustr::from("horizon_secs"), ustr::Ustr::from("30"));
+        params.insert(ustr::Ustr::from("interval_secs"), ustr::Ustr::from("10"));
+        let primary_tags = vec![ustr::Ustr::from("PRIMARY_TAG")];
+        let linked_order_ids = vec![ClientOrderId::from("LINK-1")];
+
+        let mut primary = OrderAny::Market(MarketOrder::new(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("STRAT-001"),
+            InstrumentId::from("BTC/USDT.BINANCE"),
+            ClientOrderId::from("O-001"),
+            OrderSide::Buy,
+            Quantity::from("1.0"),
+            TimeInForce::Gtc,
+            UUID4::new(),
+            0.into(),
+            false, // reduce_only
+            true,  // quote_quantity
+            None,  // contingency_type
+            None,  // order_list_id
+            Some(linked_order_ids.clone()),
+            None, // parent_order_id
+            Some(algo.id()),
+            Some(params.clone()),
+            None, // exec_spawn_id
+            Some(primary_tags.clone()),
+        ));
+
+        let spawned_market = algo.spawn_market(
+            &mut primary,
+            Quantity::from("0.25"),
+            TimeInForce::Ioc,
+            false,
+            None, // falls back to primary.tags
+            false,
+        );
+        assert!(spawned_market.is_quote_quantity);
+        assert_eq!(spawned_market.exec_algorithm_params, Some(params.clone()));
+        assert_eq!(spawned_market.tags, Some(primary_tags.clone()));
+        assert_eq!(
+            spawned_market.linked_order_ids,
+            Some(linked_order_ids.clone())
+        );
+
+        let spawned_limit = algo.spawn_limit(
+            &mut primary,
+            Quantity::from("0.25"),
+            Price::from("50000.0"),
+            TimeInForce::Gtc,
+            None,  // expire_time
+            false, // post_only
+            false, // reduce_only
+            None,  // display_qty
+            None,  // emulation_trigger
+            None,  // falls back to primary.tags
+            false,
+        );
+        assert!(spawned_limit.is_quote_quantity);
+        assert_eq!(spawned_limit.exec_algorithm_params, Some(params.clone()));
+        assert_eq!(spawned_limit.tags, Some(primary_tags.clone()));
+        assert_eq!(
+            spawned_limit.linked_order_ids,
+            Some(linked_order_ids.clone())
+        );
+
+        let spawned_mtl = algo.spawn_market_to_limit(
+            &mut primary,
+            Quantity::from("0.25"),
+            TimeInForce::Gtc,
+            None,  // expire_time
+            false, // reduce_only
+            None,  // display_qty
+            None,  // emulation_trigger
+            None,  // falls back to primary.tags
+            false,
+        );
+        assert!(spawned_mtl.is_quote_quantity);
+        assert_eq!(spawned_mtl.exec_algorithm_params, Some(params));
+        assert_eq!(spawned_mtl.tags, Some(primary_tags));
+        assert_eq!(spawned_mtl.linked_order_ids, Some(linked_order_ids));
+    }
+
+    #[rstest]
     fn test_algorithm_reduce_primary_order() {
         let mut algo = create_test_algorithm();
         register_algorithm(&mut algo);
@@ -1656,6 +1891,136 @@ mod tests {
         algo.reduce_primary_order(&mut primary, spawn_qty);
 
         assert_eq!(primary.quantity(), Quantity::from("0.7"));
+    }
+
+    #[rstest]
+    fn test_algorithm_reduce_primary_order_publishes_updated_event() {
+        let mut algo = create_test_algorithm();
+        register_algorithm(&mut algo);
+
+        let strategy_id = StrategyId::from("STRAT-ALGO-REDUCE-PUBLISH");
+        let order = OrderAny::Market(MarketOrder::new(
+            TraderId::from("TRADER-001"),
+            strategy_id,
+            InstrumentId::from("BTC/USDT.BINANCE"),
+            ClientOrderId::from("O-ALGO-REDUCE"),
+            OrderSide::Buy,
+            Quantity::from("1.0"),
+            TimeInForce::Gtc,
+            UUID4::new(),
+            0.into(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let mut primary = TestOrderStubs::make_accepted_order(&order);
+
+        {
+            let cache_rc = algo.core.cache_rc();
+            let mut cache = cache_rc.borrow_mut();
+            cache.add_order(primary.clone(), None, None, false).unwrap();
+        }
+
+        let (handler, events) = subscribe_order_topic(strategy_id);
+
+        algo.reduce_primary_order(&mut primary, Quantity::from("0.3"));
+
+        msgbus::unsubscribe_order_events(format!("events.order.{strategy_id}").into(), &handler);
+        let events = events.borrow();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            OrderEventAny::Updated(event) if event.quantity == Quantity::from("0.7")
+        ));
+    }
+
+    #[rstest]
+    fn test_algorithm_submit_order_publishes_initialized_for_new_order() {
+        let mut algo = create_test_algorithm();
+        register_algorithm(&mut algo);
+
+        let strategy_id = StrategyId::from("STRAT-ALGO-INIT-PUBLISH");
+        let order = OrderAny::Market(MarketOrder::new(
+            TraderId::from("TRADER-001"),
+            strategy_id,
+            InstrumentId::from("BTC/USDT.BINANCE"),
+            ClientOrderId::from("O-ALGO-INIT"),
+            OrderSide::Buy,
+            Quantity::from("1.0"),
+            TimeInForce::Gtc,
+            UUID4::new(),
+            0.into(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let (handler, events) = subscribe_order_topic(strategy_id);
+
+        algo.submit_order(order.clone(), None, None).unwrap();
+
+        msgbus::unsubscribe_order_events(format!("events.order.{strategy_id}").into(), &handler);
+        let events = events.borrow();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            OrderEventAny::Initialized(event) if event.client_order_id == order.client_order_id()
+        ));
+    }
+
+    #[rstest]
+    fn test_algorithm_submit_order_does_not_republish_initialized_for_existing_order() {
+        let mut algo = create_test_algorithm();
+        register_algorithm(&mut algo);
+
+        let strategy_id = StrategyId::from("STRAT-ALGO-INIT-EXISTING");
+        let order = OrderAny::Market(MarketOrder::new(
+            TraderId::from("TRADER-001"),
+            strategy_id,
+            InstrumentId::from("BTC/USDT.BINANCE"),
+            ClientOrderId::from("O-ALGO-INIT-EXISTING"),
+            OrderSide::Buy,
+            Quantity::from("1.0"),
+            TimeInForce::Gtc,
+            UUID4::new(),
+            0.into(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        {
+            let cache_rc = algo.core.cache_rc();
+            let mut cache = cache_rc.borrow_mut();
+            cache.add_order(order.clone(), None, None, true).unwrap();
+        }
+        let (handler, events) = subscribe_order_topic(strategy_id);
+
+        algo.submit_order(order, None, None).unwrap();
+
+        msgbus::unsubscribe_order_events(format!("events.order.{strategy_id}").into(), &handler);
+        assert!(events.borrow().is_empty());
     }
 
     #[rstest]
@@ -1747,9 +2112,10 @@ mod tests {
         let mut algo = create_test_algorithm();
         register_algorithm(&mut algo);
 
+        let strategy_id = StrategyId::from("STRAT-ALGO-MODIFY-IN-PLACE");
         let mut order = OrderAny::Limit(LimitOrder::new(
             TraderId::from("TRADER-001"),
-            StrategyId::from("STRAT-001"),
+            strategy_id,
             InstrumentId::from("BTC/USDT.BINANCE"),
             ClientOrderId::from("O-001"),
             OrderSide::Buy,
@@ -1782,10 +2148,20 @@ mod tests {
         }
 
         let new_qty = Quantity::from("0.5");
+        let (handler, events) = subscribe_order_topic(strategy_id);
+
         algo.modify_order_in_place(&mut order, Some(new_qty), None, None)
             .unwrap();
 
+        msgbus::unsubscribe_order_events(format!("events.order.{strategy_id}").into(), &handler);
+        let events = events.borrow();
+
         assert_eq!(order.quantity(), new_qty);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            OrderEventAny::Updated(event) if event.quantity == new_qty
+        ));
     }
 
     #[rstest]
@@ -1879,15 +2255,9 @@ mod tests {
             true,
         );
 
-        {
-            let cache_rc = algo.core.cache_rc();
-            let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&primary).unwrap();
-        }
-
         assert_eq!(primary.quantity(), Quantity::from("0.5"));
 
-        let mut spawned_order = OrderAny::Market(spawned);
+        let spawned_order = OrderAny::Market(spawned);
         {
             let cache_rc = algo.core.cache_rc();
             let mut cache = cache_rc.borrow_mut();
@@ -1896,29 +2266,28 @@ mod tests {
                 .unwrap();
         }
 
-        let denied = OrderDenied::new(
-            spawned_order.trader_id(),
-            spawned_order.strategy_id(),
-            spawned_order.instrument_id(),
-            spawned_order.client_order_id(),
-            "TEST_DENIAL".into(),
-            UUID4::new(),
-            0.into(),
-            0.into(),
-        );
+        let denied = OrderDeniedSpec::builder()
+            .trader_id(spawned_order.trader_id())
+            .strategy_id(spawned_order.strategy_id())
+            .instrument_id(spawned_order.instrument_id())
+            .client_order_id(spawned_order.client_order_id())
+            .reason("TEST_DENIAL".into())
+            .build();
 
-        spawned_order.apply(OrderEventAny::Denied(denied)).unwrap();
         {
             let cache_rc = algo.core.cache_rc();
             let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&spawned_order).unwrap();
+            cache.update_order(&OrderEventAny::Denied(denied)).unwrap();
         }
 
         algo.handle_order_event(OrderEventAny::Denied(denied));
 
         let restored_primary = {
             let cache = algo.core.cache();
-            cache.order(&ClientOrderId::from("O-001")).cloned().unwrap()
+            cache
+                .order(&ClientOrderId::from("O-001"))
+                .map(|o| o.clone())
+                .unwrap()
         };
         assert_eq!(restored_primary.quantity(), Quantity::from("1.0"));
     }
@@ -1968,15 +2337,9 @@ mod tests {
             true,
         );
 
-        {
-            let cache_rc = algo.core.cache_rc();
-            let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&primary).unwrap();
-        }
-
         assert_eq!(primary.quantity(), Quantity::from("0.5"));
 
-        let mut spawned_order = OrderAny::Market(spawned);
+        let spawned_order = OrderAny::Market(spawned);
         {
             let cache_rc = algo.core.cache_rc();
             let mut cache = cache_rc.borrow_mut();
@@ -1985,34 +2348,31 @@ mod tests {
                 .unwrap();
         }
 
-        let rejected = OrderRejected::new(
-            spawned_order.trader_id(),
-            spawned_order.strategy_id(),
-            spawned_order.instrument_id(),
-            spawned_order.client_order_id(),
-            AccountId::from("BINANCE-001"),
-            "TEST_REJECTION".into(),
-            UUID4::new(),
-            0.into(),
-            0.into(),
-            false,
-            false,
-        );
+        let rejected = OrderRejectedSpec::builder()
+            .trader_id(spawned_order.trader_id())
+            .strategy_id(spawned_order.strategy_id())
+            .instrument_id(spawned_order.instrument_id())
+            .client_order_id(spawned_order.client_order_id())
+            .account_id(AccountId::from("BINANCE-001"))
+            .reason("TEST_REJECTION".into())
+            .build();
 
-        spawned_order
-            .apply(OrderEventAny::Rejected(rejected))
-            .unwrap();
         {
             let cache_rc = algo.core.cache_rc();
             let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&spawned_order).unwrap();
+            cache
+                .update_order(&OrderEventAny::Rejected(rejected))
+                .unwrap();
         }
 
         algo.handle_order_event(OrderEventAny::Rejected(rejected));
 
         let restored_primary = {
             let cache = algo.core.cache();
-            cache.order(&ClientOrderId::from("O-001")).cloned().unwrap()
+            cache
+                .order(&ClientOrderId::from("O-001"))
+                .map(|o| o.clone())
+                .unwrap()
         };
         assert_eq!(restored_primary.quantity(), Quantity::from("1.0"));
     }
@@ -2064,7 +2424,7 @@ mod tests {
 
         assert_eq!(primary.quantity(), Quantity::from("1.0"));
 
-        let mut spawned_order = OrderAny::Market(spawned);
+        let spawned_order = OrderAny::Market(spawned);
         {
             let cache_rc = algo.core.cache_rc();
             let mut cache = cache_rc.borrow_mut();
@@ -2073,29 +2433,28 @@ mod tests {
                 .unwrap();
         }
 
-        let denied = OrderDenied::new(
-            spawned_order.trader_id(),
-            spawned_order.strategy_id(),
-            spawned_order.instrument_id(),
-            spawned_order.client_order_id(),
-            "TEST_DENIAL".into(),
-            UUID4::new(),
-            0.into(),
-            0.into(),
-        );
+        let denied = OrderDeniedSpec::builder()
+            .trader_id(spawned_order.trader_id())
+            .strategy_id(spawned_order.strategy_id())
+            .instrument_id(spawned_order.instrument_id())
+            .client_order_id(spawned_order.client_order_id())
+            .reason("TEST_DENIAL".into())
+            .build();
 
-        spawned_order.apply(OrderEventAny::Denied(denied)).unwrap();
         {
             let cache_rc = algo.core.cache_rc();
             let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&spawned_order).unwrap();
+            cache.update_order(&OrderEventAny::Denied(denied)).unwrap();
         }
 
         algo.handle_order_event(OrderEventAny::Denied(denied));
 
         let final_primary = {
             let cache = algo.core.cache();
-            cache.order(&ClientOrderId::from("O-001")).cloned().unwrap()
+            cache
+                .order(&ClientOrderId::from("O-001"))
+                .map(|o| o.clone())
+                .unwrap()
         };
         assert_eq!(final_primary.quantity(), Quantity::from("1.0"));
     }
@@ -2144,12 +2503,6 @@ mod tests {
             None,
             true,
         );
-        {
-            let cache_rc = algo.core.cache_rc();
-            let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&primary).unwrap();
-        }
-
         let spawned2 = algo.spawn_market(
             &mut primary,
             Quantity::from("0.4"),
@@ -2158,16 +2511,10 @@ mod tests {
             None,
             true,
         );
-        {
-            let cache_rc = algo.core.cache_rc();
-            let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&primary).unwrap();
-        }
-
         assert_eq!(primary.quantity(), Quantity::from("0.3"));
 
         let spawned_order1 = OrderAny::Market(spawned1);
-        let mut spawned_order2 = OrderAny::Market(spawned2);
+        let spawned_order2 = OrderAny::Market(spawned2);
         {
             let cache_rc = algo.core.cache_rc();
             let mut cache = cache_rc.borrow_mut();
@@ -2177,31 +2524,43 @@ mod tests {
                 .unwrap();
         }
 
-        let denied = OrderDenied::new(
-            spawned_order2.trader_id(),
-            spawned_order2.strategy_id(),
-            spawned_order2.instrument_id(),
-            spawned_order2.client_order_id(),
-            "TEST_DENIAL".into(),
-            UUID4::new(),
-            0.into(),
-            0.into(),
-        );
+        let denied = OrderDeniedSpec::builder()
+            .trader_id(spawned_order2.trader_id())
+            .strategy_id(spawned_order2.strategy_id())
+            .instrument_id(spawned_order2.instrument_id())
+            .client_order_id(spawned_order2.client_order_id())
+            .reason("TEST_DENIAL".into())
+            .build();
 
-        spawned_order2.apply(OrderEventAny::Denied(denied)).unwrap();
         {
             let cache_rc = algo.core.cache_rc();
             let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&spawned_order2).unwrap();
+            cache.update_order(&OrderEventAny::Denied(denied)).unwrap();
         }
+
+        let (handler, events) = subscribe_order_topic(spawned_order2.strategy_id());
 
         algo.handle_order_event(OrderEventAny::Denied(denied));
 
+        msgbus::unsubscribe_order_events(
+            format!("events.order.{}", spawned_order2.strategy_id()).into(),
+            &handler,
+        );
+        let events = events.borrow();
+
         let restored_primary = {
             let cache = algo.core.cache();
-            cache.order(&ClientOrderId::from("O-001")).cloned().unwrap()
+            cache
+                .order(&ClientOrderId::from("O-001"))
+                .map(|o| o.clone())
+                .unwrap()
         };
         assert_eq!(restored_primary.quantity(), Quantity::from("0.7"));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            OrderEventAny::Updated(event) if event.quantity == Quantity::from("0.7")
+        ));
     }
 
     #[rstest]
@@ -2249,12 +2608,6 @@ mod tests {
             true,
         );
 
-        {
-            let cache_rc = algo.core.cache_rc();
-            let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&primary).unwrap();
-        }
-
         assert_eq!(primary.quantity(), Quantity::from("0.5"));
 
         let mut spawned_order = OrderAny::Market(spawned);
@@ -2266,64 +2619,60 @@ mod tests {
                 .unwrap();
         }
 
-        let accepted = OrderAccepted::new(
-            spawned_order.trader_id(),
-            spawned_order.strategy_id(),
-            spawned_order.instrument_id(),
-            spawned_order.client_order_id(),
-            VenueOrderId::from("V-123"),
-            AccountId::from("BINANCE-001"),
-            UUID4::new(),
-            0.into(),
-            0.into(),
-            false,
-        );
+        let accepted = OrderAcceptedSpec::builder()
+            .trader_id(spawned_order.trader_id())
+            .strategy_id(spawned_order.strategy_id())
+            .instrument_id(spawned_order.instrument_id())
+            .client_order_id(spawned_order.client_order_id())
+            .venue_order_id(VenueOrderId::from("V-123"))
+            .account_id(AccountId::from("BINANCE-001"))
+            .build();
 
-        spawned_order
-            .apply(OrderEventAny::Accepted(accepted))
-            .unwrap();
         {
             let cache_rc = algo.core.cache_rc();
             let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&spawned_order).unwrap();
+            spawned_order = cache
+                .update_order(&OrderEventAny::Accepted(accepted))
+                .unwrap();
         }
 
         algo.handle_order_event(OrderEventAny::Accepted(accepted));
 
         let primary_after_accept = {
             let cache = algo.core.cache();
-            cache.order(&ClientOrderId::from("O-001")).cloned().unwrap()
+            cache
+                .order(&ClientOrderId::from("O-001"))
+                .map(|o| o.clone())
+                .unwrap()
         };
         assert_eq!(primary_after_accept.quantity(), Quantity::from("0.5"));
 
         // Cancel after acceptance - no restoration should occur
-        let canceled = OrderCanceled::new(
-            spawned_order.trader_id(),
-            spawned_order.strategy_id(),
-            spawned_order.instrument_id(),
-            spawned_order.client_order_id(),
-            UUID4::new(),
-            0.into(),
-            0.into(),
-            false,
-            Some(VenueOrderId::from("V-123")),
-            Some(AccountId::from("BINANCE-001")),
-        );
+        let canceled = OrderCanceledSpec::builder()
+            .trader_id(spawned_order.trader_id())
+            .strategy_id(spawned_order.strategy_id())
+            .instrument_id(spawned_order.instrument_id())
+            .client_order_id(spawned_order.client_order_id())
+            .venue_order_id(VenueOrderId::from("V-123"))
+            .account_id(AccountId::from("BINANCE-001"))
+            .build();
 
-        spawned_order
-            .apply(OrderEventAny::Canceled(canceled))
-            .unwrap();
         {
             let cache_rc = algo.core.cache_rc();
             let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&spawned_order).unwrap();
+            cache
+                .update_order(&OrderEventAny::Canceled(canceled))
+                .unwrap();
         }
 
         algo.handle_order_event(OrderEventAny::Canceled(canceled));
 
         let final_primary = {
             let cache = algo.core.cache();
-            cache.order(&ClientOrderId::from("O-001")).cloned().unwrap()
+            cache
+                .order(&ClientOrderId::from("O-001"))
+                .map(|o| o.clone())
+                .unwrap()
         };
         assert_eq!(final_primary.quantity(), Quantity::from("0.5"));
     }
@@ -2373,12 +2722,6 @@ mod tests {
             None,
             true,
         );
-
-        {
-            let cache_rc = algo.core.cache_rc();
-            let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&primary).unwrap();
-        }
 
         assert_eq!(primary.quantity(), Quantity::from("0.2"));
         assert_eq!(primary.leaves_qty(), Quantity::from("0.2"));

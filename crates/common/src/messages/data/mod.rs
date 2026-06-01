@@ -17,25 +17,38 @@
 
 use std::{any::Any, sync::Arc};
 
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
     data::BarType,
     identifiers::{ClientId, Venue},
 };
+use serde::{Deserialize, Serialize};
 
 pub mod request;
 pub mod response;
 pub mod subscribe;
 pub mod unsubscribe;
 
+/// Params key used to flag a book subscription as targeting a parent symbol.
+///
+/// When the boolean value is `true`, the subscription fans out across all
+/// instruments that resolve from the parent components (see
+/// [`InstrumentId::parse_parent_components`]). When absent or `false`, the
+/// subscription is routed to the concrete instrument id only.
+///
+/// [`InstrumentId::parse_parent_components`]: nautilus_model::identifiers::InstrumentId::parse_parent_components
+pub const PARAMS_IS_PARENT: &str = "is_parent";
+
 // Re-exports
 pub use request::{
-    RequestBars, RequestBookDepth, RequestBookSnapshot, RequestCustomData, RequestForwardPrices,
-    RequestFundingRates, RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades,
+    RequestBars, RequestBookDeltas, RequestBookDepth, RequestBookSnapshot, RequestCustomData,
+    RequestForwardPrices, RequestFundingRates, RequestInstrument, RequestInstruments, RequestJoin,
+    RequestQuotes, RequestTrades,
 };
 pub use response::{
-    BarsResponse, BookResponse, CustomDataResponse, ForwardPricesResponse, FundingRatesResponse,
-    InstrumentResponse, InstrumentsResponse, QuotesResponse, TradesResponse,
+    BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
+    ForwardPricesResponse, FundingRatesResponse, InstrumentResponse, InstrumentsResponse,
+    QuotesResponse, TradesResponse,
 };
 pub use subscribe::{
     SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10, SubscribeBookSnapshots,
@@ -75,7 +88,7 @@ impl DataCommand {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SubscribeCommand {
     Data(SubscribeCustomData),
     Instrument(SubscribeInstrument),
@@ -211,9 +224,30 @@ impl SubscribeCommand {
             Self::OptionChain(_) => None,
         }
     }
+
+    pub fn params(&self) -> Option<&Params> {
+        match self {
+            Self::Data(cmd) => cmd.params.as_ref(),
+            Self::Instrument(cmd) => cmd.params.as_ref(),
+            Self::Instruments(cmd) => cmd.params.as_ref(),
+            Self::BookDeltas(cmd) => cmd.params.as_ref(),
+            Self::BookDepth10(cmd) => cmd.params.as_ref(),
+            Self::BookSnapshots(cmd) => cmd.params.as_ref(),
+            Self::Quotes(cmd) => cmd.params.as_ref(),
+            Self::Trades(cmd) => cmd.params.as_ref(),
+            Self::Bars(cmd) => cmd.params.as_ref(),
+            Self::MarkPrices(cmd) => cmd.params.as_ref(),
+            Self::IndexPrices(cmd) => cmd.params.as_ref(),
+            Self::FundingRates(cmd) => cmd.params.as_ref(),
+            Self::InstrumentStatus(cmd) => cmd.params.as_ref(),
+            Self::InstrumentClose(cmd) => cmd.params.as_ref(),
+            Self::OptionGreeks(cmd) => cmd.params.as_ref(),
+            Self::OptionChain(cmd) => cmd.params.as_ref(),
+        }
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum UnsubscribeCommand {
     Data(UnsubscribeCustomData),
     Instrument(UnsubscribeInstrument),
@@ -351,6 +385,10 @@ impl UnsubscribeCommand {
     }
 }
 
+#[allow(
+    clippy::ref_option,
+    reason = "callers pass borrowed Option fields directly"
+)]
 fn check_client_id_or_venue(client_id: &Option<ClientId>, venue: &Option<Venue>) {
     assert!(
         client_id.is_some() || venue.is_some(),
@@ -358,18 +396,20 @@ fn check_client_id_or_venue(client_id: &Option<ClientId>, venue: &Option<Venue>)
     );
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RequestCommand {
     Data(RequestCustomData),
     Instrument(RequestInstrument),
     Instruments(RequestInstruments),
     BookSnapshot(RequestBookSnapshot),
+    BookDeltas(RequestBookDeltas),
     BookDepth(RequestBookDepth),
     Quotes(RequestQuotes),
     Trades(RequestTrades),
     FundingRates(RequestFundingRates),
     ForwardPrices(RequestForwardPrices),
     Bars(RequestBars),
+    Join(RequestJoin),
 }
 
 impl PartialEq for RequestCommand {
@@ -390,12 +430,14 @@ impl RequestCommand {
             Self::Instrument(cmd) => &cmd.request_id,
             Self::Instruments(cmd) => &cmd.request_id,
             Self::BookSnapshot(cmd) => &cmd.request_id,
+            Self::BookDeltas(cmd) => &cmd.request_id,
             Self::BookDepth(cmd) => &cmd.request_id,
             Self::Quotes(cmd) => &cmd.request_id,
             Self::Trades(cmd) => &cmd.request_id,
             Self::FundingRates(cmd) => &cmd.request_id,
             Self::ForwardPrices(cmd) => &cmd.request_id,
             Self::Bars(cmd) => &cmd.request_id,
+            Self::Join(cmd) => &cmd.request_id,
         }
     }
 
@@ -405,12 +447,14 @@ impl RequestCommand {
             Self::Instrument(cmd) => cmd.client_id.as_ref(),
             Self::Instruments(cmd) => cmd.client_id.as_ref(),
             Self::BookSnapshot(cmd) => cmd.client_id.as_ref(),
+            Self::BookDeltas(cmd) => cmd.client_id.as_ref(),
             Self::BookDepth(cmd) => cmd.client_id.as_ref(),
             Self::Quotes(cmd) => cmd.client_id.as_ref(),
             Self::Trades(cmd) => cmd.client_id.as_ref(),
             Self::FundingRates(cmd) => cmd.client_id.as_ref(),
             Self::ForwardPrices(cmd) => cmd.client_id.as_ref(),
             Self::Bars(cmd) => cmd.client_id.as_ref(),
+            Self::Join(_) => None,
         }
     }
 
@@ -420,6 +464,7 @@ impl RequestCommand {
             Self::Instrument(cmd) => Some(&cmd.instrument_id.venue),
             Self::Instruments(cmd) => cmd.venue.as_ref(),
             Self::BookSnapshot(cmd) => Some(&cmd.instrument_id.venue),
+            Self::BookDeltas(cmd) => Some(&cmd.instrument_id.venue),
             Self::BookDepth(cmd) => Some(&cmd.instrument_id.venue),
             Self::Quotes(cmd) => Some(&cmd.instrument_id.venue),
             Self::Trades(cmd) => Some(&cmd.instrument_id.venue),
@@ -430,6 +475,7 @@ impl RequestCommand {
                 BarType::Standard { instrument_id, .. } => Some(&instrument_id.venue),
                 BarType::Composite { instrument_id, .. } => Some(&instrument_id.venue),
             },
+            Self::Join(_) => None,
         }
     }
 
@@ -439,12 +485,14 @@ impl RequestCommand {
             Self::Instrument(cmd) => cmd.ts_init,
             Self::Instruments(cmd) => cmd.ts_init,
             Self::BookSnapshot(cmd) => cmd.ts_init,
+            Self::BookDeltas(cmd) => cmd.ts_init,
             Self::BookDepth(cmd) => cmd.ts_init,
             Self::Quotes(cmd) => cmd.ts_init,
             Self::Trades(cmd) => cmd.ts_init,
             Self::FundingRates(cmd) => cmd.ts_init,
             Self::ForwardPrices(cmd) => cmd.ts_init,
             Self::Bars(cmd) => cmd.ts_init,
+            Self::Join(cmd) => cmd.ts_init,
         }
     }
 }
@@ -455,6 +503,8 @@ pub enum DataResponse {
     Instrument(Box<InstrumentResponse>),
     Instruments(InstrumentsResponse),
     Book(BookResponse),
+    BookDeltas(BookDeltasResponse),
+    BookDepth(BookDepthResponse),
     Quotes(QuotesResponse),
     Trades(TradesResponse),
     FundingRates(FundingRatesResponse),
@@ -474,6 +524,8 @@ impl DataResponse {
             Self::Instrument(resp) => &resp.correlation_id,
             Self::Instruments(resp) => &resp.correlation_id,
             Self::Book(resp) => &resp.correlation_id,
+            Self::BookDeltas(resp) => &resp.correlation_id,
+            Self::BookDepth(resp) => &resp.correlation_id,
             Self::Quotes(resp) => &resp.correlation_id,
             Self::Trades(resp) => &resp.correlation_id,
             Self::FundingRates(resp) => &resp.correlation_id,
@@ -481,6 +533,75 @@ impl DataResponse {
             Self::Bars(resp) => &resp.correlation_id,
         }
     }
+
+    /// Returns a short variant name for compact logging.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Data(_) => "Data",
+            Self::Instrument(_) => "Instrument",
+            Self::Instruments(_) => "Instruments",
+            Self::Book(_) => "Book",
+            Self::BookDeltas(_) => "BookDeltas",
+            Self::BookDepth(_) => "BookDepth",
+            Self::Quotes(_) => "Quotes",
+            Self::Trades(_) => "Trades",
+            Self::FundingRates(_) => "FundingRates",
+            Self::ForwardPrices(_) => "ForwardPrices",
+            Self::Bars(_) => "Bars",
+        }
+    }
+
+    /// Returns the number of records carried by the response, where defined.
+    ///
+    /// Returns `None` for singular or opaque variants (`Data`, `Instrument`, `Book`)
+    /// where a record count is not meaningful.
+    #[must_use]
+    pub fn record_count(&self) -> Option<usize> {
+        match self {
+            Self::Data(_) | Self::Instrument(_) | Self::Book(_) => None,
+            Self::Instruments(resp) => Some(resp.data.len()),
+            Self::BookDeltas(resp) => Some(resp.data.len()),
+            Self::BookDepth(resp) => Some(resp.data.len()),
+            Self::Quotes(resp) => Some(resp.data.len()),
+            Self::Trades(resp) => Some(resp.data.len()),
+            Self::FundingRates(resp) => Some(resp.data.len()),
+            Self::ForwardPrices(resp) => Some(resp.data.len()),
+            Self::Bars(resp) => Some(resp.data.len()),
+        }
+    }
+
+    /// Trims vector payloads to the inclusive `[start, end]` window on `ts_init`.
+    ///
+    /// Applies to variants whose payload elements implement `HasTsInit`
+    /// (`BookDeltas`, `BookDepth`, `Quotes`, `Trades`, `FundingRates`,
+    /// `Bars`, `Instruments`). Other variants are untouched: singular payloads
+    /// (`Instrument`, `Book`),
+    /// `ForwardPrices` (no per-item `ts_init`), and the opaque custom
+    /// `Data` variant.
+    pub fn trim_to_bounds(&mut self) {
+        match self {
+            Self::Quotes(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
+            Self::Trades(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
+            Self::FundingRates(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
+            Self::Bars(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
+            Self::Instruments(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
+            Self::BookDeltas(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
+            Self::BookDepth(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
+            Self::Data(_) | Self::Instrument(_) | Self::Book(_) | Self::ForwardPrices(_) => {}
+        }
+    }
 }
 
 pub type Payload = Arc<dyn Any + Send + Sync>;
+
+/// Returns `true` when `params` carries the [`PARAMS_IS_PARENT`] flag set to `true`.
+///
+/// Absent or non-boolean values resolve to `false`, keeping the default subscription
+/// path concrete (exact topic).
+#[must_use]
+pub fn is_parent_subscription(params: Option<&Params>) -> bool {
+    params
+        .and_then(|p| p.get_bool(PARAMS_IS_PARENT))
+        .unwrap_or(false)
+}

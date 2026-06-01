@@ -240,6 +240,7 @@ class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
         order_side = OrderSide.BUY if self.S == BinanceOrderSide.BUY else OrderSide.SELL
         post_only = self.f == BinanceTimeInForce.GTX
         expire_time = unix_nanos_to_dt(millis_to_nanos(self.gtd)) if self.gtd else None
+        avg_px = Decimal(self.ap) if self.ap and Decimal(self.ap) != 0 else None
 
         return OrderStatusReport(
             account_id=account_id,
@@ -258,7 +259,7 @@ class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
             trailing_offset_type=TrailingOffsetType.BASIS_POINTS,
             quantity=Quantity.from_str(self.q),
             filled_qty=Quantity.from_str(self.z),
-            avg_px=None,
+            avg_px=avg_px,
             post_only=post_only,
             reduce_only=self.R,
             report_id=UUID4(),
@@ -324,9 +325,33 @@ class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
 
         instrument = exec_client._instrument_provider.find(instrument_id=instrument_id)
         if instrument is None:
-            raise ValueError(
-                f"Cannot process event for {instrument_id}: instrument not found in cache",
+            if Decimal(self.q) == 0:
+                exec_client._log.debug(
+                    f"Skipping zero-quantity update for {instrument_id} (not in cache)",
+                )
+                return
+
+            exec_client._log.warning(
+                f"Instrument {instrument_id} not in cache, "
+                f"sending order status report for reconciliation",
             )
+
+            report = self.parse_to_order_status_report(
+                account_id=exec_client.account_id,
+                instrument_id=instrument_id,
+                client_order_id=client_order_id,
+                venue_order_id=venue_order_id,
+                ts_event=ts_event,
+                ts_init=exec_client._clock.timestamp_ns(),
+                enum_parser=exec_client._enum_parser,
+            )
+
+            if exec_client.use_position_ids:
+                report.venue_position_id = PositionId(
+                    f"{instrument_id}-{self.ps.value}",
+                )
+            exec_client._send_order_status_report(report)
+            return
 
         price_precision = instrument.price_precision
         size_precision = instrument.size_precision
@@ -377,6 +402,7 @@ class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
                 liq_commission = Money(liq_commission_amount, liq_commission_asset)
 
             liq_venue_position_id: PositionId | None = None
+
             if exec_client.use_position_ids:
                 liq_venue_position_id = PositionId(f"{instrument_id}-{self.ps.value}")
 
@@ -446,23 +472,29 @@ class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
                 ts_event=ts_event,
             )
 
-            # Check if price changed (for price_match orders)
-            if order.has_price:
-                binance_price = Price(float(self.p), price_precision)
-                if binance_price != order.price:
-                    # Preserve trigger price for stop orders (priceMatch only affects limit price)
-                    trigger_price = order.trigger_price if order.has_trigger_price else None
-                    exec_client.generate_order_updated(
-                        strategy_id=strategy_id,
-                        instrument_id=instrument_id,
-                        client_order_id=client_order_id,
-                        venue_order_id=venue_order_id,
-                        quantity=order.quantity,
-                        price=binance_price,
-                        trigger_price=trigger_price,
-                        ts_event=ts_event,
-                        venue_order_id_modified=True,  # Setting true to avoid spurious warning log
-                    )
+            # Detect venue-side adjustments at acceptance:
+            # - quantity may be reduced for reduce-only orders that exceed the
+            #   current position size
+            # - price may be adjusted for priceMatch orders
+            binance_qty = Quantity(float(self.q), size_precision)
+            binance_price = Price(float(self.p), price_precision) if order.has_price else None
+            qty_changed = binance_qty != order.quantity
+            price_changed = binance_price is not None and binance_price != order.price
+
+            if qty_changed or price_changed:
+                # Preserve trigger price for stop orders (priceMatch only affects limit price)
+                trigger_price = order.trigger_price if order.has_trigger_price else None
+                exec_client.generate_order_updated(
+                    strategy_id=strategy_id,
+                    instrument_id=instrument_id,
+                    client_order_id=client_order_id,
+                    venue_order_id=venue_order_id,
+                    quantity=binance_qty,
+                    price=binance_price,
+                    trigger_price=trigger_price,
+                    ts_event=ts_event,
+                    venue_order_id_modified=True,  # Setting true to avoid spurious warning log
+                )
         elif self.x == BinanceExecutionType.TRADE or self.x == BinanceExecutionType.CALCULATED:
             if self.x == BinanceExecutionType.CALCULATED:
                 exec_client._log.info(
@@ -540,6 +572,7 @@ class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
                 commission = Money(commission_amount, commission_asset)
 
             venue_position_id: PositionId | None = None
+
             if exec_client.use_position_ids:
                 venue_position_id = PositionId(f"{instrument_id}-{self.ps.value}")
 
@@ -549,6 +582,28 @@ class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
                 if self.x == BinanceExecutionType.CALCULATED
                 else (LiquiditySide.MAKER if self.m else LiquiditySide.TAKER)
             )
+
+            # Reconcile any venue-side adjustment (reduce-only auto-reduction
+            # or priceMatch) before the fill: fast-fill paths can deliver TRADE
+            # without a prior NEW execution type for the same order.
+            if self.x == BinanceExecutionType.TRADE:
+                venue_qty = Quantity(float(self.q), size_precision)
+                venue_price = Price(float(self.p), price_precision) if order.has_price else None
+                qty_changed = venue_qty != order.quantity
+                price_changed = venue_price is not None and venue_price != order.price
+                if qty_changed or price_changed:
+                    trigger_price = order.trigger_price if order.has_trigger_price else None
+                    exec_client.generate_order_updated(
+                        strategy_id=strategy_id,
+                        instrument_id=instrument_id,
+                        client_order_id=client_order_id,
+                        venue_order_id=venue_order_id,
+                        quantity=venue_qty,
+                        price=venue_price,
+                        trigger_price=trigger_price,
+                        ts_event=ts_event,
+                        venue_order_id_modified=True,
+                    )
 
             exec_client.generate_order_filled(
                 strategy_id=strategy_id,
@@ -959,6 +1014,7 @@ class BinanceFuturesAlgoOrderData(msgspec.Struct, kw_only=True, frozen=True):
             return False
 
         venue_position_id: PositionId | None = None
+
         if exec_client.use_position_ids:
             venue_position_id = PositionId(f"{instrument_id}-{self.ps.value}")
 
@@ -1011,6 +1067,7 @@ class BinanceFuturesAlgoOrderData(msgspec.Struct, kw_only=True, frozen=True):
                 f"but order still open - emitting synthetic fill",
             )
             remaining_qty = order.quantity - order.filled_qty
+
             if avg_px is not None:
                 self._emit_synthetic_fill(
                     exec_client,

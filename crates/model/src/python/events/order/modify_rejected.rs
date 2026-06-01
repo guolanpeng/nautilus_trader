@@ -30,7 +30,9 @@ use crate::{
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OrderModifyRejected {
-    #[allow(clippy::too_many_arguments)]
+    /// Represents an event where a `ModifyOrder` command has been rejected by the
+    /// trading venue.
+    #[expect(clippy::too_many_arguments)]
     #[new]
     #[pyo3(signature = (trader_id, strategy_id, instrument_id, client_order_id, reason, event_id, ts_event, ts_init, reconciliation, venue_order_id=None, account_id=None))]
     fn py_new(
@@ -147,7 +149,7 @@ impl OrderModifyRejected {
     #[getter]
     #[pyo3(name = "reconciliation")]
     fn py_reconciliation(&self) -> bool {
-        self.reconciliation != 0
+        self.reconciliation
     }
 
     #[pyo3(name = "to_dict")]
@@ -175,6 +177,10 @@ impl OrderModifyRejected {
         dict.set_item("reconciliation", self.reconciliation)?;
         dict.set_item("ts_event", self.ts_event.as_u64())?;
         dict.set_item("ts_init", self.ts_init.as_u64())?;
+        match self.causation_id {
+            Some(causation_id) => dict.set_item("causation_id", causation_id.to_string())?,
+            None => dict.set_item("causation_id", py.None())?,
+        }
         Ok(dict.into())
     }
 }

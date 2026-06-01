@@ -23,7 +23,6 @@ from nautilus_trader.adapters.binance.common.enums import BinanceOrderSide
 from nautilus_trader.adapters.binance.common.enums import BinanceOrderType
 from nautilus_trader.adapters.binance.common.enums import BinanceSecurityType
 from nautilus_trader.adapters.binance.common.enums import BinanceTimeInForce
-from nautilus_trader.adapters.binance.common.schemas.account import BinanceOrder
 from nautilus_trader.adapters.binance.common.schemas.account import BinanceStatusCode
 from nautilus_trader.adapters.binance.common.symbol import BinanceSymbol
 from nautilus_trader.adapters.binance.futures.enums import BinanceFuturesMarginType
@@ -125,7 +124,7 @@ class BinanceFuturesPositionModeHttp(BinanceHttpEndpoint):
         return self._get_resp_decoder.decode(raw)
 
     async def post(self, params: PostParameters) -> BinanceStatusCode:
-        method_type = HttpMethod.GET
+        method_type = HttpMethod.POST
         raw = await self._method(method_type, params)
         return self._post_resp_decoder.decode(raw)
 
@@ -213,8 +212,12 @@ class BinanceFuturesCancelMultipleOrdersHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
+        # Per-item results are heterogeneous: successes match BinanceOrder,
+        # failures are {"code": int, "msg": str}, and msgspec does not support
+        # untagged unions of dict-like types, so decode as raw dicts and
+        # discriminate by the `code` field at the caller.
         self._delete_resp_decoder = msgspec.json.Decoder(
-            list[BinanceOrder] | dict[str, Any],
+            list[dict[str, Any]] | dict[str, Any],
             strict=False,
         )
 
@@ -239,7 +242,7 @@ class BinanceFuturesCancelMultipleOrdersHttp(BinanceHttpEndpoint):
         origClientOrderIdList: str | None = None
         recvWindow: str | None = None
 
-    async def delete(self, params: DeleteParameters) -> list[BinanceOrder]:
+    async def delete(self, params: DeleteParameters) -> list[dict[str, Any]] | dict[str, Any]:
         method_type = HttpMethod.DELETE
         raw = await self._method(method_type, params)
         return self._delete_resp_decoder.decode(raw)
@@ -623,7 +626,7 @@ class BinanceFuturesAlgoOrderHttp(BinanceHttpEndpoint):
             Price protection. Default is false.
         reduceOnly : str, optional
             Reduce only flag. Cannot be used in Hedge Mode.
-        activationPrice : str, optional
+        activatePrice : str, optional
             Activation price for TRAILING_STOP_MARKET orders.
         callbackRate : str, optional
             Callback rate for TRAILING_STOP_MARKET (0.1-10, where 1 = 1%).
@@ -651,7 +654,7 @@ class BinanceFuturesAlgoOrderHttp(BinanceHttpEndpoint):
         closePosition: str | None = None
         priceProtect: str | None = None
         reduceOnly: str | None = None
-        activationPrice: str | None = None
+        activatePrice: str | None = None
         callbackRate: str | None = None
         clientAlgoId: str | None = None
         goodTillDate: int | None = None
@@ -880,12 +883,14 @@ class BinanceFuturesAccountHttpAPI(BinanceAccountHttpAPI):
             clock=clock,
             account_type=account_type,
         )
+
         if not account_type.is_futures:
             raise RuntimeError(  # pragma: no cover (design-time error)
                 f"`BinanceAccountType` not USDT_FUTURES or COIN_FUTURES, was {account_type}",  # pragma: no cover
             )
         v2_endpoint_base = self.base_endpoint
         v3_endpoint_base = self.base_endpoint
+
         if account_type == BinanceAccountType.USDT_FUTURES:
             v2_endpoint_base = "/fapi/v2/"
             v3_endpoint_base = "/fapi/v3/"
@@ -1031,15 +1036,17 @@ class BinanceFuturesAccountHttpAPI(BinanceAccountHttpAPI):
         symbol: str,
         client_order_ids: list[str],
         recv_window: str | None = None,
-    ) -> bool:
+    ) -> list[dict[str, Any]]:
         """
         Delete multiple Futures orders.
 
-        Returns whether successful.
+        Returns the per-item response list in the same order as `client_order_ids`. Each
+        item is either a Binance order dict on success or `{"code": int, "msg": str}` on
+        failure. Callers must discriminate by the presence of `code`.
 
         """
         stringified_client_order_ids = str(client_order_ids).replace(" ", "").replace("'", '"')
-        await self._endpoint_futures_cancel_multiple_orders.delete(
+        response = await self._endpoint_futures_cancel_multiple_orders.delete(
             params=self._endpoint_futures_cancel_multiple_orders.DeleteParameters(
                 timestamp=self._timestamp(),
                 symbol=BinanceSymbol(symbol),
@@ -1047,7 +1054,11 @@ class BinanceFuturesAccountHttpAPI(BinanceAccountHttpAPI):
                 recvWindow=recv_window,
             ),
         )
-        return True
+
+        if isinstance(response, list):
+            return response
+
+        return []
 
     async def query_futures_account_info(
         self,
@@ -1140,7 +1151,7 @@ class BinanceFuturesAccountHttpAPI(BinanceAccountHttpAPI):
                 closePosition=close_position,
                 priceProtect=price_protect,
                 reduceOnly=reduce_only,
-                activationPrice=activation_price,
+                activatePrice=activation_price,
                 callbackRate=callback_rate,
                 clientAlgoId=client_algo_id,
                 goodTillDate=good_till_date,

@@ -28,16 +28,18 @@
 //!
 //! ## Supported Keys
 //!
-//! | Key                   | Type      | Description                                  |
-//! |-----------------------|-----------|----------------------------------------------|
-//! | `stdout`              | Log level | Maximum level for stdout output.             |
-//! | `fileout`             | Log level | Maximum level for file output.               |
-//! | `is_colored`          | Boolean   | Enable ANSI colors (default: true).          |
-//! | `print_config`        | Boolean   | Print config to stdout at startup.           |
-//! | `log_components_only` | Boolean   | Only log components with explicit filters.   |
-//! | `use_tracing`         | Boolean   | Enable tracing subscriber for external libs. |
-//! | `<component>`         | Log level | Component-specific log level (exact match).  |
-//! | `<module::path>`      | Log level | Module-specific log level (prefix match).    |
+//! | Key                     | Type      | Description                                  |
+//! |-------------------------|-----------|----------------------------------------------|
+//! | `stdout`                | Log level | Maximum level for stdout output.             |
+//! | `fileout`               | Log level | Maximum level for file output.               |
+//! | `is_colored`            | Boolean   | Enable ANSI colors (default: true).          |
+//! | `print_config`          | Boolean   | Print config to stdout at startup.           |
+//! | `log_components_only`   | Boolean   | Only log components with explicit filters.   |
+//! | `use_tracing`           | Boolean   | Enable tracing subscriber for external libs. |
+//! | `fileout_sync_on_flush` | Boolean   | Sync file logs on every flush (default: true). |
+//! | `buffered_stdout`       | Boolean   | Buffer stdout output (default: false).       |
+//! | `<component>`           | Log level | Component-specific log level (exact match).  |
+//! | `<module::path>`        | Log level | Module-specific log level (prefix match).    |
 //!
 //! ## Log Levels
 //!
@@ -59,53 +61,73 @@ use std::{env, str::FromStr};
 
 use ahash::AHashMap;
 use log::LevelFilter;
+use serde::{Deserialize, Serialize};
 use ustr::Ustr;
+
+use super::writer::FileWriterConfig;
 
 /// Configuration for the Nautilus logger.
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.common", from_py_object)
 )]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.common")
+)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoggerConfig {
     /// Maximum log level for stdout output.
+    #[builder(default = LevelFilter::Info)]
     pub stdout_level: LevelFilter,
     /// Maximum log level for file output (`Off` disables file logging).
+    #[builder(default = LevelFilter::Off)]
     pub fileout_level: LevelFilter,
     /// Per-component log level overrides (exact match).
+    #[builder(default)]
     pub component_level: AHashMap<Ustr, LevelFilter>,
     /// Per-module path log level overrides (prefix match).
+    #[builder(default)]
     pub module_level: AHashMap<Ustr, LevelFilter>,
     /// Log only components with explicit level filters.
+    #[builder(default)]
     pub log_components_only: bool,
     /// Use ANSI color codes in output.
+    #[builder(default = true)]
     pub is_colored: bool,
     /// Print configuration to stdout at startup.
+    #[builder(default)]
     pub print_config: bool,
     /// Initialize the tracing subscriber for external Rust crate logs.
+    #[builder(default)]
     pub use_tracing: bool,
+    /// If all logging should be bypassed.
+    #[builder(default)]
+    pub bypass_logging: bool,
+    /// File writer configuration for log file output.
+    pub file_config: Option<FileWriterConfig>,
+    /// If the log file should be cleared before use.
+    #[builder(default)]
+    pub clear_log_file: bool,
+    /// If file log flushes should also sync data to disk.
+    #[builder(default = true)]
+    pub fileout_sync_on_flush: bool,
+    /// If stdout writes should be buffered until flush or buffer capacity.
+    #[builder(default)]
+    pub buffered_stdout: bool,
 }
 
 impl Default for LoggerConfig {
-    /// Creates a new default [`LoggerConfig`] instance.
     fn default() -> Self {
-        Self {
-            stdout_level: LevelFilter::Info,
-            fileout_level: LevelFilter::Off,
-            component_level: AHashMap::new(),
-            module_level: AHashMap::new(),
-            log_components_only: false,
-            is_colored: true,
-            print_config: false,
-            use_tracing: false,
-        }
+        Self::builder().build()
     }
 }
 
 impl LoggerConfig {
     /// Creates a new [`LoggerConfig`] instance.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         stdout_level: LevelFilter,
         fileout_level: LevelFilter,
@@ -115,6 +137,9 @@ impl LoggerConfig {
         is_colored: bool,
         print_config: bool,
         use_tracing: bool,
+        bypass_logging: bool,
+        file_config: Option<FileWriterConfig>,
+        clear_log_file: bool,
     ) -> Self {
         Self {
             stdout_level,
@@ -125,6 +150,11 @@ impl LoggerConfig {
             is_colored,
             print_config,
             use_tracing,
+            bypass_logging,
+            file_config,
+            clear_log_file,
+            fileout_sync_on_flush: true,
+            buffered_stdout: false,
         }
     }
 
@@ -158,6 +188,9 @@ impl LoggerConfig {
                     "is_colored" => config.is_colored = true,
                     "print_config" => config.print_config = true,
                     "use_tracing" => config.use_tracing = true,
+                    "bypass_logging" => config.bypass_logging = true,
+                    "fileout_sync_on_flush" => config.fileout_sync_on_flush = true,
+                    "buffered_stdout" => config.buffered_stdout = true,
                     _ => anyhow::bail!("Invalid spec pair: {kv}"),
                 }
                 continue;
@@ -184,6 +217,15 @@ impl LoggerConfig {
                 }
                 "use_tracing" => {
                     config.use_tracing = parse_bool_value(v);
+                }
+                "bypass_logging" => {
+                    config.bypass_logging = parse_bool_value(v);
+                }
+                "fileout_sync_on_flush" => {
+                    config.fileout_sync_on_flush = parse_bool_value(v);
+                }
+                "buffered_stdout" => {
+                    config.buffered_stdout = parse_bool_value(v);
                 }
                 "stdout" => {
                     config.stdout_level = parse_level(v)?;
@@ -244,6 +286,11 @@ mod tests {
         assert!(!config.log_components_only);
         assert!(config.is_colored);
         assert!(!config.print_config);
+        assert!(!config.bypass_logging);
+        assert!(config.file_config.is_none());
+        assert!(!config.clear_log_file);
+        assert!(config.fileout_sync_on_flush);
+        assert!(!config.buffered_stdout);
     }
 
     #[rstest]
@@ -344,6 +391,18 @@ mod tests {
     fn test_from_spec_log_components_only_false() {
         let config = LoggerConfig::from_spec("log_components_only=false").unwrap();
         assert!(!config.log_components_only);
+    }
+
+    #[rstest]
+    fn test_from_spec_fileout_sync_on_flush_false() {
+        let config = LoggerConfig::from_spec("fileout_sync_on_flush=false").unwrap();
+        assert!(!config.fileout_sync_on_flush);
+    }
+
+    #[rstest]
+    fn test_from_spec_buffered_stdout() {
+        let config = LoggerConfig::from_spec("buffered_stdout").unwrap();
+        assert!(config.buffered_stdout);
     }
 
     #[rstest]
@@ -559,5 +618,53 @@ mod tests {
     fn test_default_module_level_is_empty() {
         let config = LoggerConfig::default();
         assert!(config.module_level.is_empty());
+    }
+
+    #[rstest]
+    fn test_from_spec_bypass_logging_bare() {
+        let config = LoggerConfig::from_spec("bypass_logging").unwrap();
+        assert!(config.bypass_logging);
+    }
+
+    #[rstest]
+    fn test_from_spec_bypass_logging_true() {
+        let config = LoggerConfig::from_spec("bypass_logging=true").unwrap();
+        assert!(config.bypass_logging);
+    }
+
+    #[rstest]
+    fn test_from_spec_bypass_logging_false() {
+        let config = LoggerConfig::from_spec("bypass_logging=false").unwrap();
+        assert!(!config.bypass_logging);
+    }
+
+    #[rstest]
+    fn test_toml_deserialize_minimal() {
+        let config: LoggerConfig = toml::from_str(
+            r#"
+stdout_level = "INFO"
+fileout_level = "DEBUG"
+is_colored = false
+
+[component_level]
+RiskEngine = "ERROR"
+
+[file_config]
+directory = "/var/log/nautilus"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.stdout_level, LevelFilter::Info);
+        assert_eq!(config.fileout_level, LevelFilter::Debug);
+        assert!(!config.is_colored);
+        assert_eq!(
+            config.component_level[&Ustr::from("RiskEngine")],
+            LevelFilter::Error
+        );
+        assert_eq!(
+            config.file_config.as_ref().unwrap().directory.as_deref(),
+            Some("/var/log/nautilus"),
+        );
     }
 }

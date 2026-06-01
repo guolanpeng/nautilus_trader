@@ -37,18 +37,21 @@ use super::{
         RaceSubscription, StreamMarketFilter, StreamMessage, stream_decode,
     },
 };
-use crate::common::{credential::BetfairCredential, enums::StatusErrorCode};
+use crate::common::{
+    consts::{STREAM_OP_MARKET_SUBSCRIPTION, STREAM_OP_ORDER_SUBSCRIPTION},
+    credential::BetfairCredential,
+    enums::StatusErrorCode,
+};
 
 /// Betfair Exchange Stream API client using raw TLS (CRLF-delimited JSON).
 ///
 /// On connect, authenticates immediately. On reconnection, replays authentication
 /// and any active subscriptions with the latest `clk` token for delta resumption.
 ///
-/// Auth bytes are prepended to every subscription send to guarantee auth-first
-/// ordering even when bytes land in the reconnect buffer. The auth bytes are
-/// stored in a watch channel so the caller can push refreshed session tokens via
-/// [`update_auth`](Self::update_auth) after keep-alive or HTTP reconnect. The
-/// `closed` flag distinguishes permanent shutdown from transient reconnect.
+/// The auth bytes are stored in a watch channel so the caller can push refreshed
+/// session tokens via [`update_auth`](Self::update_auth) after keep-alive or HTTP
+/// reconnect. The `closed` flag distinguishes permanent shutdown from transient
+/// reconnect.
 #[derive(Debug)]
 pub struct BetfairStreamClient {
     socket: SocketClient,
@@ -151,18 +154,18 @@ impl BetfairStreamClient {
                             let _ = order_clk_tx_h.send(None);
                             let _ = order_initial_clk_tx_h.send(None);
                             log::warn!(
-                                "Betfair stream INVALID_CLOCK — clocks cleared, \
+                                "Betfair stream INVALID_CLOCK: clocks cleared, \
                                  next reconnect will request a full image",
                             );
                         } else if status.connection_closed {
                             log::error!(
-                                "Betfair stream connection closed by server: {:?} — {:?}",
+                                "Betfair stream connection closed by server: {:?} - {:?}",
                                 status.error_code,
                                 status.error_message,
                             );
                         } else if status.error_code.is_some() {
                             log::warn!(
-                                "Betfair stream status error: {:?} — {:?}",
+                                "Betfair stream status error: {:?} - {:?}",
                                 status.error_code,
                                 status.error_message,
                             );
@@ -185,23 +188,13 @@ impl BetfairStreamClient {
             let market_sub = market_sub_rx.borrow().clone();
             let order_sub = order_sub_rx.borrow().clone();
 
-            if market_sub.is_none() && order_sub.is_none() {
-                let _ = tx.send(WriterCommand::Send(auth));
-                return;
-            }
+            let _ = tx.send(WriterCommand::Send(auth));
 
-            // Each subscription is sent as auth+sub in one write so that even if the
-            // write fails mid-stream and the bytes enter the reconnect buffer, auth always
-            // precedes the subscription when the buffer is drained on the next reconnect.
             if let Some(mut sub) = market_sub {
                 sub.clk = market_clk_rx.borrow().clone();
                 sub.initial_clk = market_initial_clk_rx.borrow().clone();
                 if let Ok(sub_bytes) = serde_json::to_vec(&sub) {
-                    let mut combined = Vec::with_capacity(auth.len() + 2 + sub_bytes.len());
-                    combined.extend_from_slice(&auth);
-                    combined.extend_from_slice(b"\r\n");
-                    combined.extend_from_slice(&sub_bytes);
-                    let _ = tx.send(WriterCommand::Send(Bytes::from(combined)));
+                    let _ = tx.send(WriterCommand::Send(Bytes::from(sub_bytes)));
                 }
             }
 
@@ -209,11 +202,7 @@ impl BetfairStreamClient {
                 sub.clk = order_clk_rx.borrow().clone();
                 sub.initial_clk = order_initial_clk_rx.borrow().clone();
                 if let Ok(sub_bytes) = serde_json::to_vec(&sub) {
-                    let mut combined = Vec::with_capacity(auth.len() + 2 + sub_bytes.len());
-                    combined.extend_from_slice(&auth);
-                    combined.extend_from_slice(b"\r\n");
-                    combined.extend_from_slice(&sub_bytes);
-                    let _ = tx.send(WriterCommand::Send(Bytes::from(combined)));
+                    let _ = tx.send(WriterCommand::Send(Bytes::from(sub_bytes)));
                 }
             }
         });
@@ -244,7 +233,7 @@ impl BetfairStreamClient {
             .await
             .map_err(|e| BetfairStreamError::ConnectionFailed(e.to_string()))?;
 
-        // Set once — lock-free reads thereafter.
+        // Set once, then use lock-free reads
         let _ = shared_tx.set(socket.writer_tx.clone());
 
         socket
@@ -292,7 +281,7 @@ impl BetfairStreamClient {
         // from the previous subscription are immediately rejected by the handler.
         self.market_active_sub_id.store(id, Ordering::SeqCst);
         let sub = MarketSubscription {
-            op: "marketSubscription".to_string(),
+            op: STREAM_OP_MARKET_SUBSCRIPTION.to_string(),
             id: Some(id),
             market_filter,
             market_data_filter: data_filter,
@@ -309,20 +298,10 @@ impl BetfairStreamClient {
         let _ = self.market_initial_clk_tx.send(None);
         let _ = self.market_sub_tx.send(Some(sub.clone()));
 
-        // Auth and subscription are combined into one write so they cannot be split by a
-        // write failure (which would buffer only the subscription in the reconnect buffer,
-        // causing it to be replayed before post_reconnection sends auth). Sending directly
-        // via writer_tx (not send_bytes) avoids the reconnect-wait, so a subscription made
-        // while reconnecting is also buffered correctly with auth preceding it.
         let sub_bytes = serde_json::to_vec(&sub)?;
-        let auth = self.auth_bytes_tx.borrow().clone();
-        let mut combined = Vec::with_capacity(auth.len() + 2 + sub_bytes.len());
-        combined.extend_from_slice(&auth);
-        combined.extend_from_slice(b"\r\n");
-        combined.extend_from_slice(&sub_bytes);
         self.socket
-            .writer_tx
-            .send(WriterCommand::Send(Bytes::from(combined)))
+            .send_bytes(sub_bytes)
+            .await
             .map_err(|e| BetfairStreamError::ConnectionFailed(e.to_string()))?;
         Ok(())
     }
@@ -347,7 +326,7 @@ impl BetfairStreamClient {
         let id = self.request_id.fetch_add(1, Ordering::Relaxed);
         self.order_active_sub_id.store(id, Ordering::SeqCst);
         let sub = OrderSubscription {
-            op: "orderSubscription".to_string(),
+            op: STREAM_OP_ORDER_SUBSCRIPTION.to_string(),
             id: Some(id),
             order_filter,
             clk: None,
@@ -364,14 +343,9 @@ impl BetfairStreamClient {
         let _ = self.order_sub_tx.send(Some(sub.clone()));
 
         let sub_bytes = serde_json::to_vec(&sub)?;
-        let auth = self.auth_bytes_tx.borrow().clone();
-        let mut combined = Vec::with_capacity(auth.len() + 2 + sub_bytes.len());
-        combined.extend_from_slice(&auth);
-        combined.extend_from_slice(b"\r\n");
-        combined.extend_from_slice(&sub_bytes);
         self.socket
-            .writer_tx
-            .send(WriterCommand::Send(Bytes::from(combined)))
+            .send_bytes(sub_bytes)
+            .await
             .map_err(|e| BetfairStreamError::ConnectionFailed(e.to_string()))?;
         Ok(())
     }
@@ -406,6 +380,7 @@ impl BetfairStreamClient {
 #[derive(Debug)]
 pub struct BetfairRaceStreamClient {
     socket: SocketClient,
+    auth_bytes_tx: watch::Sender<Bytes>,
     closed: AtomicBool,
 }
 
@@ -427,7 +402,9 @@ impl BetfairRaceStreamClient {
         race_fatal_tx: tokio::sync::mpsc::UnboundedSender<()>,
     ) -> Result<Self, BetfairStreamError> {
         let auth = Authentication::new(credential.app_key().to_string(), session_token);
-        let auth_bytes = Bytes::from(serde_json::to_vec(&auth)?);
+        let auth_bytes_vec = serde_json::to_vec(&auth)?;
+        let auth_bytes = Bytes::from(auth_bytes_vec.clone());
+        let (auth_bytes_tx, auth_bytes_rx) = watch::channel(auth_bytes.clone());
 
         let race_sub = RaceSubscription::new(1);
         let race_sub_bytes = Bytes::from(serde_json::to_vec(&race_sub)?);
@@ -473,15 +450,16 @@ impl BetfairRaceStreamClient {
             handler(data);
         });
 
-        let auth_reconnect = auth_bytes.clone();
+        let auth_bytes_reconnect = auth_bytes_rx;
         let sub_reconnect = race_sub_bytes.clone();
         let shared_tx_reconnect = Arc::clone(&shared_tx);
         let post_reconnection: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             let Some(tx) = shared_tx_reconnect.get() else {
                 return;
             };
-            let mut combined = Vec::with_capacity(auth_reconnect.len() + 2 + sub_reconnect.len());
-            combined.extend_from_slice(&auth_reconnect);
+            let auth = auth_bytes_reconnect.borrow().clone();
+            let mut combined = Vec::with_capacity(auth.len() + 2 + sub_reconnect.len());
+            combined.extend_from_slice(&auth);
             combined.extend_from_slice(b"\r\n");
             combined.extend_from_slice(&sub_reconnect);
             let _ = tx.send(WriterCommand::Send(Bytes::from(combined)));
@@ -514,8 +492,8 @@ impl BetfairRaceStreamClient {
 
         let _ = shared_tx.set(socket.writer_tx.clone());
 
-        let mut combined = Vec::with_capacity(auth_bytes.len() + 2 + race_sub_bytes.len());
-        combined.extend_from_slice(&auth_bytes);
+        let mut combined = Vec::with_capacity(auth_bytes_vec.len() + 2 + race_sub_bytes.len());
+        combined.extend_from_slice(&auth_bytes_vec);
         combined.extend_from_slice(b"\r\n");
         combined.extend_from_slice(&race_sub_bytes);
         socket
@@ -525,6 +503,7 @@ impl BetfairRaceStreamClient {
 
         Ok(Self {
             socket,
+            auth_bytes_tx,
             closed: AtomicBool::new(false),
         })
     }
@@ -533,6 +512,15 @@ impl BetfairRaceStreamClient {
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.socket.is_active()
+    }
+
+    /// Pushes refreshed auth bytes so the next reconnection uses
+    /// the current session token instead of the one from initial connect.
+    pub fn update_auth(&self, app_key: &str, session_token: String) {
+        let auth = Authentication::new(app_key.to_string(), session_token);
+        if let Ok(bytes) = serde_json::to_vec(&auth) {
+            let _ = self.auth_bytes_tx.send(Bytes::from(bytes));
+        }
     }
 
     /// Closes the race stream connection.
@@ -676,7 +664,7 @@ mod tests {
         let auth_bytes = Bytes::from(serde_json::to_vec(&auth).unwrap());
 
         let _ = market_sub_tx.send(Some(MarketSubscription {
-            op: "marketSubscription".to_string(),
+            op: STREAM_OP_MARKET_SUBSCRIPTION.to_string(),
             id: Some(1),
             market_filter: StreamMarketFilter::default(),
             market_data_filter: MarketDataFilter::default(),
@@ -687,7 +675,7 @@ mod tests {
             segmentation_enabled: None,
         }));
         let _ = order_sub_tx.send(Some(OrderSubscription {
-            op: "orderSubscription".to_string(),
+            op: STREAM_OP_ORDER_SUBSCRIPTION.to_string(),
             id: Some(2),
             order_filter: None,
             clk: None,
@@ -711,21 +699,13 @@ mod tests {
             let market_sub = market_sub_rx.borrow().clone();
             let order_sub = order_sub_rx.borrow().clone();
 
-            if market_sub.is_none() && order_sub.is_none() {
-                let _ = tx.send(WriterCommand::Send(auth_bytes_reconnect.clone()));
-                return;
-            }
+            let _ = tx.send(WriterCommand::Send(auth_bytes_reconnect.clone()));
 
             if let Some(mut sub) = market_sub {
                 sub.clk = market_clk_rx.borrow().clone();
                 sub.initial_clk = market_initial_clk_rx.borrow().clone();
                 if let Ok(sub_bytes) = serde_json::to_vec(&sub) {
-                    let mut combined =
-                        Vec::with_capacity(auth_bytes_reconnect.len() + 2 + sub_bytes.len());
-                    combined.extend_from_slice(&auth_bytes_reconnect);
-                    combined.extend_from_slice(b"\r\n");
-                    combined.extend_from_slice(&sub_bytes);
-                    let _ = tx.send(WriterCommand::Send(Bytes::from(combined)));
+                    let _ = tx.send(WriterCommand::Send(Bytes::from(sub_bytes)));
                 }
             }
 
@@ -733,12 +713,7 @@ mod tests {
                 sub.clk = order_clk_rx.borrow().clone();
                 sub.initial_clk = order_initial_clk_rx.borrow().clone();
                 if let Ok(sub_bytes) = serde_json::to_vec(&sub) {
-                    let mut combined =
-                        Vec::with_capacity(auth_bytes_reconnect.len() + 2 + sub_bytes.len());
-                    combined.extend_from_slice(&auth_bytes_reconnect);
-                    combined.extend_from_slice(b"\r\n");
-                    combined.extend_from_slice(&sub_bytes);
-                    let _ = tx.send(WriterCommand::Send(Bytes::from(combined)));
+                    let _ = tx.send(WriterCommand::Send(Bytes::from(sub_bytes)));
                 }
             }
         });
@@ -750,11 +725,14 @@ mod tests {
 
         post_reconnection();
 
-        // Each subscription is now a single combined write: auth\r\nsub (2 messages total)
-        let market_cmd = rx.try_recv().expect("auth+market subscription message");
-        let order_cmd = rx.try_recv().expect("auth+order subscription message");
+        let auth_cmd = rx.try_recv().expect("auth replay message");
+        let market_cmd = rx.try_recv().expect("market subscription message");
+        let order_cmd = rx.try_recv().expect("order subscription message");
         assert!(rx.try_recv().is_err(), "no further messages expected");
 
+        let WriterCommand::Send(auth_bytes) = auth_cmd else {
+            panic!("expected Send");
+        };
         let WriterCommand::Send(market_bytes) = market_cmd else {
             panic!("expected Send");
         };
@@ -762,26 +740,19 @@ mod tests {
             panic!("expected Send");
         };
 
+        let auth_str = std::str::from_utf8(&auth_bytes).unwrap();
         let market_str = std::str::from_utf8(&market_bytes).unwrap();
         let order_str = std::str::from_utf8(&order_bytes).unwrap();
 
-        let (market_auth, market_sub) = market_str
-            .split_once("\r\n")
-            .expect("CRLF separator in market combined message");
-        let (order_auth, order_sub) = order_str
-            .split_once("\r\n")
-            .expect("CRLF separator in order combined message");
-
-        assert!(market_auth.contains("\"op\":\"authentication\""));
-        assert!(market_sub.contains("\"op\":\"marketSubscription\""));
+        assert!(auth_str.contains("\"op\":\"authentication\""));
+        assert!(market_str.contains("\"op\":\"marketSubscription\""));
         // Both clk and initialClk must be injected into each resubscription
-        assert!(market_sub.contains("\"clk\":\"mcm-clk1\""));
-        assert!(market_sub.contains("\"initialClk\":\"mcm-iclk1\""));
+        assert!(market_str.contains("\"clk\":\"mcm-clk1\""));
+        assert!(market_str.contains("\"initialClk\":\"mcm-iclk1\""));
 
-        assert!(order_auth.contains("\"op\":\"authentication\""));
-        assert!(order_sub.contains("\"op\":\"orderSubscription\""));
-        assert!(order_sub.contains("\"clk\":\"ocm-clk1\""));
-        assert!(order_sub.contains("\"initialClk\":\"ocm-iclk1\""));
+        assert!(order_str.contains("\"op\":\"orderSubscription\""));
+        assert!(order_str.contains("\"clk\":\"ocm-clk1\""));
+        assert!(order_str.contains("\"initialClk\":\"ocm-iclk1\""));
     }
 
     #[rstest]

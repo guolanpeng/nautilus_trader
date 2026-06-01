@@ -15,16 +15,17 @@
 
 //! Example demonstrating live data testing with the Bybit adapter.
 //!
-//! Run with: `cargo run --example bybit-data-tester --package nautilus-bybit`
+//! Run with: `cargo run --example bybit-data-tester --package nautilus-bybit --features examples`
 
 use nautilus_bybit::{
-    common::enums::BybitProductType, config::BybitDataClientConfig,
+    common::{consts::BYBIT_CLIENT_ID, enums::BybitProductType},
+    config::BybitDataClientConfig,
     factories::BybitDataClientFactory,
 };
 use nautilus_common::enums::Environment;
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
-    identifiers::{ClientId, InstrumentId, TraderId},
+    identifiers::{InstrumentId, TraderId},
     stubs::TestDefault,
 };
 use nautilus_testkit::testers::{DataTester, DataTesterConfig};
@@ -49,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let client_factory = BybitDataClientFactory::new();
-    let client_id = ClientId::new("BYBIT");
+    let client_id = *BYBIT_CLIENT_ID;
 
     let mut node = LiveNode::builder(trader_id, environment)?
         .with_name(node_name)
@@ -57,12 +58,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_data_client(None, Box::new(client_factory), Box::new(bybit_config))?
         .build()?;
 
-    let tester_config = DataTesterConfig::new(client_id, instrument_ids)
-        .with_subscribe_quotes(true)
-        .with_subscribe_trades(true)
-        .with_subscribe_mark_prices(true)
-        .with_subscribe_index_prices(true)
-        .with_subscribe_funding_rates(true);
+    let tester_config = DataTesterConfig::builder()
+        .client_id(client_id)
+        .instrument_ids(instrument_ids)
+        .subscribe_quotes(true)
+        .subscribe_trades(true)
+        .subscribe_mark_prices(true)
+        .subscribe_index_prices(true)
+        .subscribe_funding_rates(true)
+        .manage_book(true)
+        .build();
     let tester = DataTester::new(tester_config);
 
     node.add_actor(tester)?;

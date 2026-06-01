@@ -31,7 +31,7 @@ use ustr::Ustr;
 use super::{
     consts::{
         BETFAIR_CUSTOMER_ORDER_REF_MAX_LEN, BETFAIR_PRICE_PRECISION, BETFAIR_QUANTITY_PRECISION,
-        BETFAIR_VENUE,
+        BETFAIR_VENUE, DEFAULT_BETTING_TYPE, DEFAULT_MARKET_TYPE,
     },
     types::SelectionId,
 };
@@ -89,6 +89,36 @@ pub fn parse_betfair_timestamp(s: &str) -> anyhow::Result<UnixNanos> {
 #[must_use]
 pub fn parse_millis_timestamp(timestamp_ms: u64) -> UnixNanos {
     UnixNanos::from(timestamp_ms * NANOSECONDS_IN_MILLISECOND)
+}
+
+/// Converts a Betfair decimal price into a Nautilus [`Price`].
+///
+/// # Errors
+///
+/// Returns an error if the value cannot be represented at Betfair price precision.
+pub fn parse_betfair_price(price: Decimal) -> anyhow::Result<Price> {
+    Price::from_decimal_dp(price, BETFAIR_PRICE_PRECISION).map_err(Into::into)
+}
+
+/// Normalizes a Betfair price to Nautilus price precision.
+#[must_use]
+pub fn normalize_betfair_price(price: Decimal) -> Decimal {
+    parse_betfair_price(price).map_or(price, |price| price.as_decimal())
+}
+
+/// Converts a Betfair decimal quantity into a Nautilus [`Quantity`].
+///
+/// # Errors
+///
+/// Returns an error if the value cannot be represented at Betfair quantity precision.
+pub fn parse_betfair_quantity(quantity: Decimal) -> anyhow::Result<Quantity> {
+    Quantity::from_decimal_dp(quantity, BETFAIR_QUANTITY_PRECISION).map_err(Into::into)
+}
+
+/// Normalizes a Betfair quantity to Nautilus quantity precision.
+#[must_use]
+pub fn normalize_betfair_quantity(quantity: Decimal) -> Decimal {
+    parse_betfair_quantity(quantity).map_or(quantity, |qty| qty.as_decimal())
 }
 
 /// Truncates a client order ID to a Betfair `customer_order_ref`.
@@ -184,7 +214,11 @@ pub fn parse_market_catalogue(
             desc.market_type,
             desc.market_base_rate,
         ),
-        None => (Ustr::from("ODDS"), Ustr::from("WIN"), Decimal::ZERO),
+        None => (
+            Ustr::from(DEFAULT_BETTING_TYPE),
+            Ustr::from(DEFAULT_MARKET_TYPE),
+            Decimal::ZERO,
+        ),
     };
 
     let market_name = Ustr::from(&catalogue.market_name);
@@ -198,8 +232,8 @@ pub fn parse_market_catalogue(
     let fee_rate = market_base_rate / Decimal::ONE_HUNDRED;
 
     let tick = Decimal::new(1, 2); // 0.01
-    let price_increment = Price::from_decimal_dp(tick, BETFAIR_PRICE_PRECISION)?;
-    let size_increment = Quantity::from_decimal_dp(tick, BETFAIR_QUANTITY_PRECISION)?;
+    let price_increment = parse_betfair_price(tick)?;
+    let size_increment = parse_betfair_quantity(tick)?;
 
     let mut instruments = Vec::with_capacity(runners.len());
 
@@ -309,10 +343,12 @@ pub fn parse_market_definition(
 
     let betting_type = match &def.betting_type {
         Some(bt) => Ustr::from(&format!("{bt}")),
-        None => Ustr::from("ODDS"),
+        None => Ustr::from(DEFAULT_BETTING_TYPE),
     };
     let market_name = Ustr::from(def.market_name.as_deref().unwrap_or(""));
-    let market_type = def.market_type.unwrap_or_else(|| Ustr::from("WIN"));
+    let market_type = def
+        .market_type
+        .unwrap_or_else(|| Ustr::from(DEFAULT_MARKET_TYPE));
     let market_start_time = def
         .market_time
         .as_deref()
@@ -325,8 +361,8 @@ pub fn parse_market_definition(
         .unwrap_or_default();
 
     let tick = Decimal::new(1, 2); // 0.01
-    let price_increment = Price::from_decimal_dp(tick, BETFAIR_PRICE_PRECISION)?;
-    let size_increment = Quantity::from_decimal_dp(tick, BETFAIR_QUANTITY_PRECISION)?;
+    let price_increment = parse_betfair_price(tick)?;
+    let size_increment = parse_betfair_quantity(tick)?;
 
     let market_id_ustr = Ustr::from(market_id);
 
@@ -406,11 +442,7 @@ pub fn parse_account_state(
     let exposure = funds.exposure.unwrap_or_default().abs();
     let total = available + exposure;
 
-    let total_money = Money::from_decimal(total, currency)?;
-    let locked_money = Money::from_decimal(exposure, currency)?;
-    let free_money = Money::from_decimal(available, currency)?;
-
-    let balance = AccountBalance::new(total_money, locked_money, free_money);
+    let balance = AccountBalance::from_total_and_locked(total, exposure, currency)?;
 
     Ok(AccountState::new(
         account_id,
@@ -528,6 +560,67 @@ mod tests {
     }
 
     #[rstest]
+    #[case(Decimal::new(242, 2), Decimal::new(242, 2))]
+    #[case(Decimal::new(1, 0), Decimal::new(100, 2))]
+    #[case(Decimal::new(4_287_000_000_000_001, 14), Decimal::new(4287, 2))]
+    fn test_parse_betfair_price_uses_betfair_precision(
+        #[case] input: Decimal,
+        #[case] expected: Decimal,
+    ) {
+        let price = parse_betfair_price(input).unwrap();
+
+        assert_eq!(price.as_decimal(), expected);
+        assert_eq!(price.precision, BETFAIR_PRICE_PRECISION);
+    }
+
+    #[rstest]
+    #[case(Decimal::new(100, 0), Decimal::new(10000, 2))]
+    #[case(Decimal::ZERO, Decimal::ZERO)]
+    #[case(Decimal::new(4_287_000_000_000_001, 14), Decimal::new(4287, 2))]
+    fn test_parse_betfair_quantity_uses_betfair_precision(
+        #[case] input: Decimal,
+        #[case] expected: Decimal,
+    ) {
+        let quantity = parse_betfair_quantity(input).unwrap();
+
+        assert_eq!(quantity.as_decimal(), expected);
+        assert_eq!(quantity.precision, BETFAIR_QUANTITY_PRECISION);
+    }
+
+    #[rstest]
+    #[case(Decimal::new(-1, 0))]
+    #[case(Decimal::new(-1, 2))]
+    fn test_parse_betfair_quantity_rejects_negative(#[case] input: Decimal) {
+        let result = parse_betfair_quantity(input);
+
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    #[case(Decimal::new(4_287_000_000_000_001, 14), Decimal::new(4287, 2))]
+    #[case(Decimal::new(2555, 3), Decimal::new(256, 2))]
+    fn test_normalize_betfair_price_rounds_to_betfair_precision(
+        #[case] input: Decimal,
+        #[case] expected: Decimal,
+    ) {
+        let normalized = normalize_betfair_price(input);
+
+        assert_eq!(normalized, expected);
+    }
+
+    #[rstest]
+    #[case(Decimal::new(4_287_000_000_000_001, 14), Decimal::new(4287, 2))]
+    #[case(Decimal::new(2555, 3), Decimal::new(256, 2))]
+    fn test_normalize_betfair_quantity_rounds_to_betfair_precision(
+        #[case] input: Decimal,
+        #[case] expected: Decimal,
+    ) {
+        let normalized = normalize_betfair_quantity(input);
+
+        assert_eq!(normalized, expected);
+    }
+
+    #[rstest]
     fn test_parse_market_catalogue() {
         let data = load_test_json("rest/list_market_catalogue.json");
         let catalogue: MarketCatalogue = serde_json::from_str(&data).unwrap();
@@ -561,6 +654,7 @@ mod tests {
         let catalogues: Vec<MarketCatalogue> = serde_json::from_str(&data).unwrap();
 
         let mut total = 0;
+
         for cat in &catalogues {
             let instruments =
                 parse_market_catalogue(cat, Currency::GBP(), UnixNanos::default(), None).unwrap();

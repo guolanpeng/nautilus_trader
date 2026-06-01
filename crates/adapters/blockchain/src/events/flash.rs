@@ -55,7 +55,7 @@ pub struct FlashEvent {
 impl FlashEvent {
     /// Creates a new [`FlashEvent`] instance with the specified parameters.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         dex: SharedDex,
         pool_identifier: PoolIdentifier,
@@ -92,7 +92,7 @@ impl FlashEvent {
         &self,
         chain: SharedChain,
         instrument_id: InstrumentId,
-        timestamp: Option<UnixNanos>,
+        timestamp: UnixNanos,
     ) -> PoolFlash {
         PoolFlash::new(
             chain,
@@ -103,7 +103,8 @@ impl FlashEvent {
             self.transaction_hash.clone(),
             self.transaction_index,
             self.log_index,
-            timestamp,
+            timestamp, // ts_event
+            timestamp, // ts_init (same block timestamp)
             self.sender,
             self.recipient,
             self.amount0,

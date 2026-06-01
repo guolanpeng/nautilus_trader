@@ -33,6 +33,45 @@ use serde::{
 };
 use ustr::Ustr;
 
+/// Sorted serialization for `AHashSet<T>` where element order must be deterministic.
+///
+/// Use with `#[serde(with = "nautilus_core::serialization::sorted_hashset")]`.
+pub mod sorted_hashset {
+    use ahash::AHashSet;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// Serializes an `AHashSet<T>` as a sorted array for deterministic output.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error produced by the underlying [`Serializer`] when writing
+    /// the sorted vector.
+    pub fn serialize<T, S>(set: &AHashSet<T>, s: S) -> Result<S::Ok, S::Error>
+    where
+        T: Serialize + Ord,
+        S: Serializer,
+    {
+        let mut sorted: Vec<&T> = set.iter().collect();
+        sorted.sort_unstable();
+        sorted.serialize(s)
+    }
+
+    /// Deserializes an array into an `AHashSet<T>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error produced by the underlying [`Deserializer`] when reading
+    /// the source array.
+    pub fn deserialize<'de, T, D>(d: D) -> Result<AHashSet<T>, D::Error>
+    where
+        T: Deserialize<'de> + Eq + std::hash::Hash,
+        D: Deserializer<'de>,
+    {
+        let vec = Vec::<T>::deserialize(d)?;
+        Ok(vec.into_iter().collect())
+    }
+}
+
 struct BoolVisitor;
 
 /// Zero-allocation decimal visitor for maximum deserialization performance.
@@ -184,9 +223,9 @@ pub trait Serializable: Serialize + for<'de> Deserialize<'de> {
 
 pub use self::msgpack::{FromMsgPack, MsgPackSerializable, ToMsgPack};
 
-/// Provides MsgPack serialization support for types implementing [`Serializable`].
+/// Provides `MsgPack` serialization support for types implementing [`Serializable`].
 ///
-/// This module contains traits for MsgPack serialization and deserialization,
+/// This module contains traits for `MsgPack` serialization and deserialization,
 /// separated from the core [`Serializable`] trait to allow independent opt-in.
 pub mod msgpack {
     use bytes::Bytes;
@@ -194,9 +233,9 @@ pub mod msgpack {
 
     use super::Serializable;
 
-    /// Provides deserialization from MsgPack encoded bytes.
+    /// Provides deserialization from `MsgPack` encoded bytes.
     pub trait FromMsgPack: for<'de> Deserialize<'de> + Sized {
-        /// Deserialize an object from MsgPack encoded bytes.
+        /// Deserialize an object from `MsgPack` encoded bytes.
         ///
         /// # Errors
         ///
@@ -206,9 +245,9 @@ pub mod msgpack {
         }
     }
 
-    /// Provides serialization to MsgPack encoded bytes.
+    /// Provides serialization to `MsgPack` encoded bytes.
     pub trait ToMsgPack: Serialize {
-        /// Serialize an object to MsgPack encoded bytes.
+        /// Serialize an object to `MsgPack` encoded bytes.
         ///
         /// # Errors
         ///
@@ -244,7 +283,7 @@ impl Visitor<'_> for BoolVisitor {
         Ok(u8::from(value))
     }
 
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         reason = "Intentional for parsing, value range validated"
     )]
@@ -389,8 +428,8 @@ pub fn deserialize_decimal_from_str<'de, D>(deserializer: D) -> Result<Decimal, 
 where
     D: Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    Decimal::from_str(&s).map_err(D::Error::custom)
+    let s: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
+    Decimal::from_str(s.as_ref()).map_err(D::Error::custom)
 }
 
 /// Deserializes a `Decimal` from a string field that might be empty.
@@ -404,11 +443,11 @@ pub fn deserialize_decimal_or_zero<'de, D>(deserializer: D) -> Result<Decimal, D
 where
     D: Deserializer<'de>,
 {
-    let s: String = Deserialize::deserialize(deserializer)?;
+    let s: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
     if s.is_empty() || s == "0" {
         Ok(Decimal::ZERO)
     } else {
-        Decimal::from_str(&s).map_err(D::Error::custom)
+        Decimal::from_str(s.as_ref()).map_err(D::Error::custom)
     }
 }
 
@@ -427,11 +466,13 @@ pub fn deserialize_optional_decimal_str<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    let s: String = Deserialize::deserialize(deserializer)?;
+    let s: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
     if s.is_empty() || s == "0" {
         Ok(None)
     } else {
-        Decimal::from_str(&s).map(Some).map_err(D::Error::custom)
+        Decimal::from_str(s.as_ref())
+            .map(Some)
+            .map_err(D::Error::custom)
     }
 }
 
@@ -605,11 +646,11 @@ pub fn deserialize_string_to_u8<'de, D>(deserializer: D) -> Result<u8, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let s: String = Deserialize::deserialize(deserializer)?;
+    let s: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
     if s.is_empty() {
         return Ok(0);
     }
-    s.parse::<u8>().map_err(D::Error::custom)
+    s.as_ref().parse::<u8>().map_err(D::Error::custom)
 }
 
 /// Deserializes a `u64` from a string field.
@@ -623,11 +664,11 @@ pub fn deserialize_string_to_u64<'de, D>(deserializer: D) -> Result<u64, D::Erro
 where
     D: Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
+    let s: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
     if s.is_empty() {
         Ok(0)
     } else {
-        s.parse::<u64>().map_err(D::Error::custom)
+        s.as_ref().parse::<u64>().map_err(D::Error::custom)
     }
 }
 
@@ -672,7 +713,7 @@ mod tests {
     };
 
     #[derive(Deserialize)]
-    pub struct TestStruct {
+    pub(super) struct TestStruct {
         #[serde(deserialize_with = "from_bool_as_u8")]
         pub value: u8,
     }
@@ -945,10 +986,20 @@ mod tests {
     #[rstest]
     #[case(r#"{"value":"42"}"#, 42)]
     #[case(r#"{"value":"0"}"#, 0)]
+    #[case(r#"{"value":"255"}"#, 255)]
     #[case(r#"{"value":""}"#, 0)]
     fn test_deserialize_string_to_u8(#[case] json: &str, #[case] expected: u8) {
         let result: TestStringToU8 = serde_json::from_str(json).unwrap();
         assert_eq!(result.value, expected);
+    }
+
+    #[rstest]
+    #[case(r#"{"value":"256"}"#)]
+    #[case(r#"{"value":"999"}"#)]
+    #[case(r#"{"value":"abc"}"#)]
+    fn test_deserialize_string_to_u8_invalid(#[case] json: &str) {
+        let result: Result<TestStringToU8, _> = serde_json::from_str(json);
+        assert!(result.is_err());
     }
 
     #[derive(Deserialize)]
@@ -958,12 +1009,22 @@ mod tests {
     }
 
     #[rstest]
-    #[case(r#"{"value":"12345678901234"}"#, 12345678901234)]
+    #[case(r#"{"value":"12345678901234"}"#, 12_345_678_901_234)]
     #[case(r#"{"value":"0"}"#, 0)]
+    #[case(r#"{"value":"18446744073709551615"}"#, u64::MAX)]
     #[case(r#"{"value":""}"#, 0)]
     fn test_deserialize_string_to_u64(#[case] json: &str, #[case] expected: u64) {
         let result: TestStringToU64 = serde_json::from_str(json).unwrap();
         assert_eq!(result.value, expected);
+    }
+
+    #[rstest]
+    #[case(r#"{"value":"18446744073709551616"}"#)]
+    #[case(r#"{"value":"abc"}"#)]
+    #[case(r#"{"value":"-1"}"#)]
+    fn test_deserialize_string_to_u64_invalid(#[case] json: &str) {
+        let result: Result<TestStringToU64, _> = serde_json::from_str(json);
+        assert!(result.is_err());
     }
 
     #[derive(Deserialize)]
@@ -973,7 +1034,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case(r#"{"value":"12345678901234"}"#, Some(12345678901234))]
+    #[case(r#"{"value":"12345678901234"}"#, Some(12_345_678_901_234))]
     #[case(r#"{"value":"0"}"#, Some(0))]
     #[case(r#"{"value":""}"#, None)]
     #[case(r#"{"value":null}"#, None)]

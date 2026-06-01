@@ -16,11 +16,13 @@
 //! Python bindings exposing OKX HTTP helper functions and data conversions.
 
 use chrono::{DateTime, Utc};
-use nautilus_core::python::{IntoPyObjectNautilusExt, to_pyruntime_err, to_pyvalue_err};
+use nautilus_core::python::{
+    IntoPyObjectNautilusExt, params::value_to_pyobject, to_pyruntime_err, to_pyvalue_err,
+};
 use nautilus_model::{
-    data::BarType,
-    enums::{OrderSide, OrderType, TriggerType},
-    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId},
+    data::{BarType, forward::ForwardPrice},
+    enums::{OrderSide, OrderType, PositionSide, TimeInForce, TriggerType},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     python::instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
     types::{Price, Quantity},
 };
@@ -30,37 +32,107 @@ use pyo3::{
     types::{PyDict, PyList, PyTuple},
 };
 
+use super::{extract_optional_string, extract_optional_trigger_type};
 use crate::{
-    common::enums::{OKXInstrumentType, OKXOrderStatus, OKXPositionMode, OKXTradeMode},
-    http::{client::OKXHttpClient, error::OKXHttpError, models::OKXCancelAlgoOrderRequest},
+    common::enums::{
+        OKXEnvironment, OKXInstrumentType, OKXOrderStatus, OKXPositionMode, OKXTradeMode,
+    },
+    http::{
+        client::OKXHttpClient,
+        error::OKXHttpError,
+        models::{OKXAttachAlgoOrdRequest, OKXCancelAlgoOrderRequest},
+        query::{
+            GetEventContractEventsParams, GetEventContractMarketsParams,
+            GetEventContractSeriesParams, GetSpreadsParams,
+        },
+    },
 };
 
+fn serializable_items_to_pylist<T>(py: Python<'_>, items: Vec<T>) -> PyResult<Py<PyAny>>
+where
+    T: serde::Serialize,
+{
+    let py_items: PyResult<Vec<_>> = items
+        .into_iter()
+        .map(|item| {
+            let value = serde_json::to_value(item).map_err(to_pyvalue_err)?;
+            value_to_pyobject(py, &value)
+        })
+        .collect();
+    Ok(PyList::new(py, py_items?)?.into_py_any_unwrap(py))
+}
+
+fn parse_attach_algo_ords(
+    py: Python<'_>,
+    attach_algo_ords: Option<Vec<Py<PyDict>>>,
+) -> PyResult<Option<Vec<OKXAttachAlgoOrdRequest>>> {
+    attach_algo_ords
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|item| {
+                    let dict = item.bind(py);
+                    Ok(OKXAttachAlgoOrdRequest {
+                        attach_algo_cl_ord_id: extract_optional_string(
+                            dict,
+                            "attach_algo_cl_ord_id",
+                        )?,
+                        sl_trigger_px: extract_optional_string(dict, "sl_trigger_px")?,
+                        sl_ord_px: extract_optional_string(dict, "sl_ord_px")?,
+                        sl_trigger_px_type: extract_optional_trigger_type(
+                            dict,
+                            "sl_trigger_px_type",
+                        )?,
+                        tp_trigger_px: extract_optional_string(dict, "tp_trigger_px")?,
+                        tp_ord_px: extract_optional_string(dict, "tp_ord_px")?,
+                        tp_trigger_px_type: extract_optional_trigger_type(
+                            dict,
+                            "tp_trigger_px_type",
+                        )?,
+                        callback_ratio: extract_optional_string(dict, "callback_ratio")?,
+                        callback_spread: extract_optional_string(dict, "callback_spread")?,
+                        active_px: extract_optional_string(dict, "active_px")?,
+                        new_callback_ratio: extract_optional_string(dict, "new_callback_ratio")?,
+                        new_callback_spread: extract_optional_string(dict, "new_callback_spread")?,
+                        new_active_px: extract_optional_string(dict, "new_active_px")?,
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .transpose()
+}
+
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OKXHttpClient {
+    /// Provides a higher-level HTTP client for the [OKX](https://okx.com) REST API.
+    ///
+    /// This client wraps the underlying `OKXHttpInnerClient` to handle conversions
+    /// into the Nautilus domain model.
     #[new]
     #[pyo3(signature = (
         api_key=None,
         api_secret=None,
         api_passphrase=None,
         base_url=None,
-        timeout_secs=None,
-        max_retries=None,
-        retry_delay_ms=None,
-        retry_delay_max_ms=None,
-        is_demo=false,
+        timeout_secs=60,
+        max_retries=3,
+        retry_delay_ms=1_000,
+        retry_delay_max_ms=10_000,
+        environment=OKXEnvironment::Live,
         proxy_url=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         api_key: Option<String>,
         api_secret: Option<String>,
         api_passphrase: Option<String>,
         base_url: Option<String>,
-        timeout_secs: Option<u64>,
-        max_retries: Option<u32>,
-        retry_delay_ms: Option<u64>,
-        retry_delay_max_ms: Option<u64>,
-        is_demo: bool,
+        timeout_secs: u64,
+        max_retries: u32,
+        retry_delay_ms: u64,
+        retry_delay_max_ms: u64,
+        environment: OKXEnvironment,
         proxy_url: Option<String>,
     ) -> PyResult<Self> {
         Self::with_credentials(
@@ -72,18 +144,25 @@ impl OKXHttpClient {
             max_retries,
             retry_delay_ms,
             retry_delay_max_ms,
-            is_demo,
+            environment,
             proxy_url,
         )
         .map_err(to_pyvalue_err)
     }
 
+    /// Creates a new authenticated `OKXHttpClient` using environment variables and
+    /// the default OKX HTTP base url.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
     #[staticmethod]
     #[pyo3(name = "from_env")]
     fn py_from_env() -> PyResult<Self> {
         Self::from_env().map_err(to_pyvalue_err)
     }
 
+    /// Returns the base url being used by the client.
     #[getter]
     #[pyo3(name = "base_url")]
     #[must_use]
@@ -91,6 +170,7 @@ impl OKXHttpClient {
         self.base_url()
     }
 
+    /// Returns the public API key being used by the client.
     #[getter]
     #[pyo3(name = "api_key")]
     #[must_use]
@@ -98,6 +178,7 @@ impl OKXHttpClient {
         self.api_key()
     }
 
+    /// Returns a masked version of the API key for logging purposes.
     #[getter]
     #[pyo3(name = "api_key_masked")]
     #[must_use]
@@ -105,26 +186,32 @@ impl OKXHttpClient {
         self.api_key_masked()
     }
 
+    /// Checks if the client is initialized.
+    ///
+    /// The client is considered initialized if any instruments have been cached from the venue.
     #[pyo3(name = "is_initialized")]
     #[must_use]
     pub fn py_is_initialized(&self) -> bool {
         self.is_initialized()
     }
 
+    /// Returns a snapshot of all instrument symbols currently held in the
+    /// internal cache.
     #[pyo3(name = "get_cached_symbols")]
     #[must_use]
     pub fn py_get_cached_symbols(&self) -> Vec<String> {
         self.get_cached_symbols()
     }
 
+    /// Cancel all pending HTTP requests.
     #[pyo3(name = "cancel_all_requests")]
     pub fn py_cancel_all_requests(&self) {
         self.cancel_all_requests();
     }
 
-    /// # Errors
+    /// Caches multiple instruments.
     ///
-    /// Returns a Python exception if adding the instruments to the cache fails.
+    /// Any existing instruments with the same symbols will be replaced.
     #[pyo3(name = "cache_instruments")]
     pub fn py_cache_instruments(
         &self,
@@ -135,13 +222,13 @@ impl OKXHttpClient {
             .into_iter()
             .map(|inst| pyobject_to_instrument_any(py, inst))
             .collect();
-        self.cache_instruments(instruments?);
+        self.cache_instruments(&instruments?);
         Ok(())
     }
 
-    /// # Errors
+    /// Caches a single instrument.
     ///
-    /// Returns a Python exception if adding the instrument to the cache fails.
+    /// Any existing instrument with the same symbol will be replaced.
     #[pyo3(name = "cache_instrument")]
     pub fn py_cache_instrument(&self, py: Python<'_>, instrument: Py<PyAny>) -> PyResult<()> {
         self.cache_instrument(pyobject_to_instrument_any(py, instrument)?);
@@ -149,6 +236,13 @@ impl OKXHttpClient {
     }
 
     /// Sets the position mode for the account.
+    ///
+    /// Defaults to NetMode if no position mode is provided.
+    ///
+    /// # Note
+    ///
+    /// This endpoint only works for accounts with derivatives trading enabled.
+    /// If the account only has spot trading, this will return an error.
     #[pyo3(name = "set_position_mode")]
     fn py_set_position_mode<'py>(
         &self,
@@ -167,6 +261,13 @@ impl OKXHttpClient {
         })
     }
 
+    /// Requests all instruments for the `instrument_type` from OKX.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing:
+    /// - `Vec<InstrumentAny>`: The parsed instruments
+    /// - `Vec<(Ustr, u64)>`: Mappings of inst_id to inst_id_code for WebSocket order operations
     #[pyo3(name = "request_instruments")]
     #[pyo3(signature = (instrument_type, instrument_family=None))]
     fn py_request_instruments<'py>(
@@ -206,6 +307,43 @@ impl OKXHttpClient {
         })
     }
 
+    /// Requests spread instruments from OKX.
+    #[pyo3(name = "request_spread_instruments")]
+    #[pyo3(signature = (base_currency=None, instrument_id=None, spread_id=None, state=None))]
+    fn py_request_spread_instruments<'py>(
+        &self,
+        py: Python<'py>,
+        base_currency: Option<String>,
+        instrument_id: Option<InstrumentId>,
+        spread_id: Option<String>,
+        state: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let instruments = client
+                .request_spread_instruments(GetSpreadsParams {
+                    base_ccy: base_currency,
+                    inst_id: instrument_id.map(|id| id.symbol.to_string()),
+                    sprd_id: spread_id,
+                    state,
+                })
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let py_instruments: PyResult<Vec<_>> = instruments
+                    .into_iter()
+                    .map(|inst| instrument_any_to_pyobject(py, inst))
+                    .collect();
+                Ok(PyList::new(py, py_instruments?)?.into_py_any_unwrap(py))
+            })
+        })
+    }
+
+    /// Requests a single instrument by `instrument_id` from OKX.
+    ///
+    /// Fetches the instrument from the API, caches it, and returns it.
     #[pyo3(name = "request_instrument")]
     fn py_request_instrument<'py>(
         &self,
@@ -224,6 +362,95 @@ impl OKXHttpClient {
         })
     }
 
+    /// Requests event contract series metadata from OKX.
+    #[pyo3(name = "request_event_contract_series")]
+    #[pyo3(signature = (series_id=None))]
+    fn py_request_event_contract_series<'py>(
+        &self,
+        py: Python<'py>,
+        series_id: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let series = client
+                .request_event_contract_series(GetEventContractSeriesParams { series_id })
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| serializable_items_to_pylist(py, series))
+        })
+    }
+
+    /// Requests event metadata for an event contract series from OKX.
+    #[expect(clippy::too_many_arguments)]
+    #[pyo3(name = "request_event_contract_events")]
+    #[pyo3(signature = (series_id, event_id=None, state=None, limit=None, before=None, after=None))]
+    fn py_request_event_contract_events<'py>(
+        &self,
+        py: Python<'py>,
+        series_id: String,
+        event_id: Option<String>,
+        state: Option<String>,
+        limit: Option<String>,
+        before: Option<String>,
+        after: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let events = client
+                .request_event_contract_events(GetEventContractEventsParams {
+                    series_id,
+                    event_id,
+                    state,
+                    limit,
+                    before,
+                    after,
+                })
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| serializable_items_to_pylist(py, events))
+        })
+    }
+
+    /// Requests event contract market metadata from OKX.
+    #[expect(clippy::too_many_arguments)]
+    #[pyo3(name = "request_event_contract_markets")]
+    #[pyo3(signature = (series_id, event_id=None, inst_id=None, state=None, limit=None, before=None, after=None))]
+    fn py_request_event_contract_markets<'py>(
+        &self,
+        py: Python<'py>,
+        series_id: String,
+        event_id: Option<String>,
+        inst_id: Option<String>,
+        state: Option<String>,
+        limit: Option<String>,
+        before: Option<String>,
+        after: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let markets = client
+                .request_event_contract_markets(GetEventContractMarketsParams {
+                    series_id,
+                    event_id,
+                    inst_id,
+                    state,
+                    limit,
+                    before,
+                    after,
+                })
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| serializable_items_to_pylist(py, markets))
+        })
+    }
+
+    /// Requests the account state for the `account_id` from OKX.
     #[pyo3(name = "request_account_state")]
     fn py_request_account_state<'py>(
         &self,
@@ -242,6 +469,7 @@ impl OKXHttpClient {
         })
     }
 
+    /// Requests trades for the `instrument_id` and `start` -> `end` time range.
     #[pyo3(name = "request_trades")]
     #[pyo3(signature = (instrument_id, start=None, end=None, limit=None))]
     fn py_request_trades<'py>(
@@ -267,6 +495,42 @@ impl OKXHttpClient {
         })
     }
 
+    /// Requests historical bars for the given bar type and time range.
+    ///
+    /// The aggregation source must be `EXTERNAL`. Time range validation ensures start < end.
+    /// Returns bars sorted oldest to newest.
+    ///
+    /// # Endpoint Selection
+    ///
+    /// The OKX API has different endpoints with different limits:
+    /// - Regular endpoint (`/api/v5/market/candles`): ≤ 300 rows/call, ≤ 40 req/2s
+    ///   - Used when: start is None OR age ≤ 100 days
+    /// - History endpoint (`/api/v5/market/history-candles`): ≤ 100 rows/call, ≤ 20 req/2s
+    ///   - Used when: start is Some AND age > 100 days
+    ///
+    /// Age is calculated as `Utc::now() - start` at the time of the first request.
+    ///
+    /// # Supported Aggregations
+    ///
+    /// Maps to OKX bar query parameter:
+    /// - `Second` → `{n}s`
+    /// - `Minute` → `{n}m`
+    /// - `Hour` → `{n}H`
+    /// - `Day` → `{n}D`
+    /// - `Week` → `{n}W`
+    /// - `Month` → `{n}M`
+    ///
+    /// # Pagination
+    ///
+    /// - Uses `before` parameter for backwards pagination
+    /// - Pages backwards from end time (or now) to start time
+    /// - Stops when: limit reached, time window covered, or API returns empty
+    /// - Rate limit safety: ≥ 50ms between requests
+    ///
+    /// # References
+    ///
+    /// - <https://tr.okx.com/docs-v5/en/#order-book-trading-market-data-get-candlesticks>
+    /// - <https://tr.okx.com/docs-v5/en/#order-book-trading-market-data-get-candlesticks-history>
     #[pyo3(name = "request_bars")]
     #[pyo3(signature = (bar_type, start=None, end=None, limit=None))]
     fn py_request_bars<'py>(
@@ -293,6 +557,83 @@ impl OKXHttpClient {
         })
     }
 
+    /// Requests an order book snapshot as `OrderBookDeltas` for the `instrument_id`.
+    #[pyo3(name = "request_orderbook_snapshot")]
+    #[pyo3(signature = (instrument_id, depth=None))]
+    fn py_request_orderbook_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        depth: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let deltas = client
+                .request_orderbook_snapshot(instrument_id, depth)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| Ok(deltas.into_py_any_unwrap(py)))
+        })
+    }
+
+    /// Requests historical funding rates for the `instrument_id`.
+    #[pyo3(name = "request_funding_rates")]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None))]
+    fn py_request_funding_rates<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rates = client
+                .request_funding_rates(instrument_id, start, end, limit)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let pylist = PyList::new(py, rates.into_iter().map(|r| r.into_py_any_unwrap(py)))?;
+                Ok(pylist.into_py_any_unwrap(py))
+            })
+        })
+    }
+
+    /// Requests forward prices for OKX options using the option summary endpoint.
+    #[pyo3(name = "request_forward_prices")]
+    #[pyo3(signature = (underlying, instrument_id=None))]
+    fn py_request_forward_prices<'py>(
+        &self,
+        py: Python<'py>,
+        underlying: String,
+        instrument_id: Option<InstrumentId>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let forward_prices: Vec<ForwardPrice> = client
+                .request_forward_prices(&underlying, instrument_id)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let pylist = PyList::new(
+                    py,
+                    forward_prices
+                        .into_iter()
+                        .map(|price| price.into_py_any_unwrap(py)),
+                )?;
+                Ok(pylist.into_py_any_unwrap(py))
+            })
+        })
+    }
+
+    /// Requests the latest mark price for the `instrument_type` from OKX.
     #[pyo3(name = "request_mark_price")]
     fn py_request_mark_price<'py>(
         &self,
@@ -311,6 +652,7 @@ impl OKXHttpClient {
         })
     }
 
+    /// Requests the latest index price for the `instrument_id` from OKX.
     #[pyo3(name = "request_index_price")]
     fn py_request_index_price<'py>(
         &self,
@@ -329,9 +671,15 @@ impl OKXHttpClient {
         })
     }
 
+    /// Requests historical order status reports for the given parameters.
+    ///
+    /// # References
+    ///
+    /// - <https://www.okx.com/docs-v5/en/#order-book-trading-trade-get-order-history-last-7-days>.
+    /// - <https://www.okx.com/docs-v5/en/#order-book-trading-trade-get-order-history-last-3-months>.
     #[pyo3(name = "request_order_status_reports")]
     #[pyo3(signature = (account_id, instrument_type=None, instrument_id=None, start=None, end=None, open_only=false, limit=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_order_status_reports<'py>(
         &self,
         py: Python<'py>,
@@ -367,9 +715,10 @@ impl OKXHttpClient {
         })
     }
 
+    /// Requests algo order status reports.
     #[pyo3(name = "request_algo_order_status_reports")]
     #[pyo3(signature = (account_id, instrument_type=None, instrument_id=None, algo_id=None, algo_client_order_id=None, state=None, limit=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_algo_order_status_reports<'py>(
         &self,
         py: Python<'py>,
@@ -405,6 +754,7 @@ impl OKXHttpClient {
         })
     }
 
+    /// Requests an algo order status report by client order identifier.
     #[pyo3(name = "request_algo_order_status_report")]
     fn py_request_algo_order_status_report<'py>(
         &self,
@@ -428,9 +778,14 @@ impl OKXHttpClient {
         })
     }
 
+    /// Requests fill reports (transaction details) for the given parameters.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-trade-get-transaction-details-last-3-days>.
     #[pyo3(name = "request_fill_reports")]
     #[pyo3(signature = (account_id, instrument_type=None, instrument_id=None, start=None, end=None, limit=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_fill_reports<'py>(
         &self,
         py: Python<'py>,
@@ -463,6 +818,28 @@ impl OKXHttpClient {
         })
     }
 
+    /// Requests current position status reports for the given parameters.
+    ///
+    /// # Position Modes
+    ///
+    /// OKX supports two position modes, which affects how position data is returned:
+    ///
+    /// ## Net Mode (One-way)
+    /// - `posSide` field will be `"net"`
+    /// - `pos` field uses **signed quantities**:
+    ///   - Positive value = Long position
+    ///   - Negative value = Short position
+    ///   - Zero = Flat/no position
+    ///
+    /// ## Long/Short Mode (Hedge/Dual-side)
+    /// - `posSide` field will be `"long"` or `"short"`
+    /// - `pos` field is **always positive** (use `posSide` to determine actual side)
+    /// - Allows holding simultaneous long and short positions on the same instrument
+    /// - Position IDs are suffixed with `-LONG` or `-SHORT` for uniqueness
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#trading-account-rest-api-get-positions>
     #[pyo3(name = "request_position_status_reports")]
     #[pyo3(signature = (account_id, instrument_type=None, instrument_id=None))]
     fn py_request_position_status_reports<'py>(
@@ -488,6 +865,122 @@ impl OKXHttpClient {
         })
     }
 
+    /// Places a regular order via HTTP.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-trade-post-place-order>
+    #[pyo3(name = "place_order")]
+    #[pyo3(signature = (
+        trader_id,
+        strategy_id,
+        instrument_id,
+        td_mode,
+        client_order_id,
+        order_side,
+        order_type,
+        quantity,
+        time_in_force=None,
+        price=None,
+        post_only=None,
+        reduce_only=None,
+        quote_quantity=None,
+        position_side=None,
+        attach_algo_ords=None,
+        px_usd=None,
+        px_vol=None,
+        speed_bump=None,
+        outcome=None,
+        slippage_pct=None,
+    ))]
+    #[expect(clippy::too_many_arguments)]
+    fn py_place_order<'py>(
+        &self,
+        py: Python<'py>,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        td_mode: OKXTradeMode,
+        client_order_id: ClientOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        quantity: Quantity,
+        time_in_force: Option<TimeInForce>,
+        price: Option<Price>,
+        post_only: Option<bool>,
+        reduce_only: Option<bool>,
+        quote_quantity: Option<bool>,
+        position_side: Option<PositionSide>,
+        attach_algo_ords: Option<Vec<Py<PyDict>>>,
+        px_usd: Option<String>,
+        px_vol: Option<String>,
+        speed_bump: Option<String>,
+        outcome: Option<String>,
+        slippage_pct: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let attach_algo_ords = parse_attach_algo_ords(py, attach_algo_ords)?;
+        let client = self.clone();
+
+        let _ = (trader_id, strategy_id);
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let resp = client
+                .place_order_with_domain_types(
+                    instrument_id,
+                    td_mode,
+                    client_order_id,
+                    order_side,
+                    order_type,
+                    quantity,
+                    time_in_force,
+                    price,
+                    post_only,
+                    reduce_only,
+                    quote_quantity,
+                    position_side,
+                    attach_algo_ords,
+                    px_usd,
+                    px_vol,
+                    speed_bump,
+                    outcome,
+                    slippage_pct,
+                )
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let dict = PyDict::new(py);
+
+                if let Some(ord_id) = resp.ord_id {
+                    dict.set_item("ord_id", ord_id.as_str())?;
+                }
+
+                if let Some(cl_ord_id) = resp.cl_ord_id {
+                    dict.set_item("cl_ord_id", cl_ord_id.as_str())?;
+                }
+
+                if let Some(s_code) = resp.s_code {
+                    dict.set_item("s_code", s_code)?;
+                }
+
+                if let Some(s_msg) = resp.s_msg {
+                    dict.set_item("s_msg", s_msg)?;
+                }
+
+                if let Some(sub_code) = resp.sub_code {
+                    dict.set_item("sub_code", sub_code)?;
+                }
+
+                Ok(dict.into_py_any_unwrap(py))
+            })
+        })
+    }
+
+    /// Places an algo order via HTTP.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading-post-place-algo-order>
     #[pyo3(name = "place_algo_order")]
     #[pyo3(signature = (
         trader_id,
@@ -502,11 +995,12 @@ impl OKXHttpClient {
         trigger_type=None,
         limit_price=None,
         reduce_only=None,
+        close_fraction=None,
         callback_ratio=None,
         callback_spread=None,
         activation_price=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_place_algo_order<'py>(
         &self,
         py: Python<'py>,
@@ -522,6 +1016,7 @@ impl OKXHttpClient {
         trigger_type: Option<TriggerType>,
         limit_price: Option<Price>,
         reduce_only: Option<bool>,
+        close_fraction: Option<String>,
         callback_ratio: Option<String>,
         callback_spread: Option<String>,
         activation_price: Option<Price>,
@@ -544,6 +1039,7 @@ impl OKXHttpClient {
                     trigger_type,
                     limit_price,
                     reduce_only,
+                    close_fraction,
                     callback_ratio,
                     callback_spread,
                     activation_price,
@@ -574,6 +1070,11 @@ impl OKXHttpClient {
         })
     }
 
+    /// Cancels an algo order via HTTP.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading-post-cancel-algo-order>
     #[pyo3(name = "cancel_algo_order")]
     fn py_cancel_algo_order<'py>(
         &self,
@@ -604,7 +1105,101 @@ impl OKXHttpClient {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Cancels an order via HTTP, routing spread instruments to the spread endpoint.
+    #[pyo3(name = "cancel_order")]
+    #[pyo3(signature = (instrument_id, client_order_id=None, venue_order_id=None))]
+    fn py_cancel_order<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let resp = client
+                .cancel_order(instrument_id, client_order_id, venue_order_id)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let dict = PyDict::new(py);
+                dict.set_item("ord_id", resp.ord_id)?;
+
+                if let Some(cl_ord_id) = resp.cl_ord_id {
+                    dict.set_item("cl_ord_id", cl_ord_id)?;
+                }
+
+                if let Some(s_code) = resp.s_code {
+                    dict.set_item("s_code", s_code)?;
+                }
+
+                if let Some(s_msg) = resp.s_msg {
+                    dict.set_item("s_msg", s_msg)?;
+                }
+
+                if let Some(ts) = resp.ts {
+                    dict.set_item("ts", ts)?;
+                }
+
+                Ok(dict.into_py_any_unwrap(py))
+            })
+        })
+    }
+
+    /// Cancels all open orders for an instrument via HTTP.
+    #[pyo3(name = "cancel_all_orders")]
+    fn py_cancel_all_orders<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let responses = client
+                .cancel_all_orders(instrument_id)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let results: PyResult<Vec<_>> = responses
+                    .into_iter()
+                    .map(|resp| {
+                        let dict = PyDict::new(py);
+                        dict.set_item("ord_id", resp.ord_id)?;
+
+                        if let Some(cl_ord_id) = resp.cl_ord_id {
+                            dict.set_item("cl_ord_id", cl_ord_id)?;
+                        }
+
+                        if let Some(s_code) = resp.s_code {
+                            dict.set_item("s_code", s_code)?;
+                        }
+
+                        if let Some(s_msg) = resp.s_msg {
+                            dict.set_item("s_msg", s_msg)?;
+                        }
+
+                        if let Some(ts) = resp.ts {
+                            dict.set_item("ts", ts)?;
+                        }
+
+                        Ok(dict)
+                    })
+                    .collect();
+                Ok(PyList::new(py, results?)?.into_py_any_unwrap(py))
+            })
+        })
+    }
+
+    /// Amends an algo order via HTTP.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading-post-amend-algo-order>
+    #[expect(clippy::too_many_arguments)]
     #[pyo3(name = "amend_algo_order")]
     #[pyo3(signature = (
         instrument_id,
@@ -660,12 +1255,14 @@ impl OKXHttpClient {
         })
     }
 
-    /// Cancels multiple algo orders in a single request.
+    /// Cancels multiple algo orders via HTTP in a single request.
     ///
-    /// Parameters
-    /// ----------
-    /// orders : list[tuple[InstrumentId, str]]
-    ///     List of (instrument_id, algo_id) tuples to cancel.
+    /// Items with non-zero `sCode` are logged as warnings but do not
+    /// fail the entire batch.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading-post-cancel-algo-order>
     #[pyo3(name = "cancel_algo_orders")]
     fn py_cancel_algo_orders<'py>(
         &self,
@@ -754,6 +1351,13 @@ impl OKXHttpClient {
         })
     }
 
+    /// Requests the current server time from OKX.
+    ///
+    /// Returns the OKX system time as a Unix timestamp in milliseconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or if the response cannot be parsed.
     #[pyo3(name = "get_server_time")]
     fn py_get_server_time<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();

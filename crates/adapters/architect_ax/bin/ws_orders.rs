@@ -38,6 +38,7 @@ use nautilus_architect_ax::{
     websocket::{AxOrdersWsMessage, orders::AxOrdersWebSocketClient},
 };
 use nautilus_model::identifiers::{AccountId, TraderId};
+use nautilus_network::websocket::TransportBackend;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -61,10 +62,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_client = AxRawHttpClient::new(
         Some(environment.http_url().to_string()),
         Some(environment.orders_url().to_string()),
-        Some(30),
-        None,
-        None,
-        None,
+        30,
+        3,
+        1000,
+        10_000,
         None,
     )?;
 
@@ -91,7 +92,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         environment.ws_orders_url().to_string(),
         account_id,
         trader_id,
-        Some(30),
+        30,
+        TransportBackend::default(),
+        None,
     );
 
     client.connect(&auth_response.token).await?;

@@ -11,15 +11,13 @@
 The `nautilus-polymarket` crate provides client implementations (HTTP & WebSocket), data
 models and parsing for the **Polymarket CLOB API** for trading binary option contracts.
 
-## Platform
+## NautilusTrader
 
-[NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-algorithmic trading platform, providing quantitative traders with the ability to backtest
-portfolios of automated trading strategies on historical data with an event-driven engine,
-and also deploy those same strategies live, with no code changes.
+[NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+engine for multi-asset, multi-venue trading systems.
 
-NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+The system spans research, deterministic simulation, and live execution within a single
+event-driven architecture, providing research-to-live semantic parity.
 
 ## Feature flags
 
@@ -32,13 +30,14 @@ This crate provides feature flags to control source code inclusion during compil
 
 ## API endpoints
 
-The adapter communicates with three Polymarket API surfaces:
+The adapter communicates with four Polymarket API surfaces:
 
 | API            | Base URL                                        | Auth                   | Purpose                                     |
 |----------------|-------------------------------------------------|------------------------|---------------------------------------------|
 | CLOB REST      | `https://clob.polymarket.com`                   | L2 HMAC                | Orders, trades, balances.                   |
 | CLOB WebSocket | `wss://ws-subscriptions-clob.polymarket.com/ws` | L2 HMAC (user channel) | Streaming orderbook, trades, order updates. |
-| Gamma (Data)   | `https://data-api.polymarket.com`               | None                   | Market discovery, positions.                |
+| Gamma          | `https://gamma-api.polymarket.com`              | None                   | Market and event discovery, tags, search.   |
+| Data           | `https://data-api.polymarket.com`               | None                   | Trade history and user positions.           |
 
 ## Authentication
 

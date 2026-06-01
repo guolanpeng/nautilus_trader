@@ -43,12 +43,12 @@
 
 use std::str::FromStr;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use futures_util::StreamExt;
-use nautilus_common::live::get_runtime;
+use nautilus_common::{cache::quote::QuoteCache, live::get_runtime};
 use nautilus_core::{
-    UUID4,
-    python::{call_python_threadsafe, to_pyruntime_err, to_pyvalue_err},
+    UUID4, UnixNanos,
+    python::{call_python_threadsafe, params::value_to_pyobject, to_pyruntime_err, to_pyvalue_err},
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
@@ -63,32 +63,223 @@ use nautilus_model::{
     },
     types::{Money, Price, Quantity},
 };
-use pyo3::{IntoPyObjectExt, prelude::*};
+use nautilus_network::websocket::TransportBackend;
+use pyo3::{
+    IntoPyObjectExt,
+    prelude::*,
+    types::{PyDict, PyTuple},
+};
 use ustr::Ustr;
 
+use super::{extract_optional_string, extract_optional_trigger_type};
 use crate::{
     common::{
-        enums::{OKXBookAction, OKXInstrumentStatus, OKXInstrumentType, OKXTradeMode, OKXVipLevel},
+        consts::{OKX_FIELD_CLORDID, OKX_FIELD_SCODE, OKX_FIELD_SMSG, OKX_SUCCESS_CODE},
+        enums::{
+            OKXBookAction, OKXGreeksType, OKXInstrumentStatus, OKXInstrumentType, OKXTradeMode,
+            OKXVipLevel,
+        },
         models::OKXInstrument,
         parse::{
             okx_status_to_market_action, parse_account_state, parse_instrument_any,
-            parse_position_status_report,
+            parse_millisecond_timestamp, parse_position_status_report, parse_price, parse_quantity,
         },
     },
-    http::models::{OKXAccount, OKXPosition},
+    http::models::{OKXAccount, OKXPosition, OKXSpreadOrder},
     websocket::{
         OKXWebSocketClient,
         enums::{OKXWsChannel, OKXWsOperation},
         messages::{
-            ExecutionReport, NautilusWsMessage, OKXAlgoOrderMsg, OKXBookMsg, OKXOrderMsg,
-            OKXWebSocketError, OKXWsMessage,
+            ExecutionReport, NautilusWsMessage, OKXAlgoOrderMsg, OKXBookMsg, OKXOptionSummaryMsg,
+            OKXOrderMsg, OKXWebSocketError, OKXWsMessage, WsAttachAlgoOrdParams,
+            WsAttachAlgoOrdParamsBuilder,
         },
         parse::{
             extract_fees_from_cached_instrument, parse_algo_order_msg, parse_book_msg_vec,
-            parse_index_price_msg_vec, parse_order_msg_vec, parse_ws_message_data,
+            parse_index_price_msg_vec, parse_option_summary_greeks, parse_order_msg_vec,
+            parse_spread_order_msg, parse_ws_message_data,
         },
     },
 };
+
+type PyBatchSubmitOrder = (
+    OKXInstrumentType,
+    InstrumentId,
+    OKXTradeMode,
+    ClientOrderId,
+    OrderSide,
+    OrderType,
+    Quantity,
+    Option<PositionSide>,
+    Option<Price>,
+    Option<Price>,
+    Option<bool>,
+    Option<bool>,
+    Option<String>,
+    Option<String>,
+);
+
+type PyLegacyBatchSubmitOrder = (
+    OKXInstrumentType,
+    InstrumentId,
+    OKXTradeMode,
+    ClientOrderId,
+    OrderSide,
+    OrderType,
+    Quantity,
+    Option<PositionSide>,
+    Option<Price>,
+    Option<Price>,
+    Option<bool>,
+    Option<bool>,
+);
+
+type PyBatchModifyOrder = (
+    String,
+    InstrumentId,
+    ClientOrderId,
+    ClientOrderId,
+    Option<Price>,
+    Option<Quantity>,
+    Option<String>,
+);
+
+type PyLegacyBatchModifyOrder = (
+    String,
+    InstrumentId,
+    ClientOrderId,
+    ClientOrderId,
+    Option<Price>,
+    Option<Quantity>,
+);
+
+fn extract_batch_submit_order(py: Python<'_>, obj: &Py<PyAny>) -> PyResult<PyBatchSubmitOrder> {
+    if let Ok(tuple) = obj.bind(py).cast::<PyTuple>()
+        && tuple.len() == 14
+    {
+        return Ok((
+            tuple.get_item(0)?.extract()?,
+            tuple.get_item(1)?.extract()?,
+            tuple.get_item(2)?.extract()?,
+            tuple.get_item(3)?.extract()?,
+            tuple.get_item(4)?.extract()?,
+            tuple.get_item(5)?.extract()?,
+            tuple.get_item(6)?.extract()?,
+            tuple.get_item(7)?.extract()?,
+            tuple.get_item(8)?.extract()?,
+            tuple.get_item(9)?.extract()?,
+            tuple.get_item(10)?.extract()?,
+            tuple.get_item(11)?.extract()?,
+            tuple.get_item(12)?.extract()?,
+            tuple.get_item(13)?.extract()?,
+        ));
+    }
+
+    let (
+        instrument_type,
+        instrument_id,
+        td_mode,
+        client_order_id,
+        order_side,
+        order_type,
+        quantity,
+        position_side,
+        price,
+        trigger_price,
+        post_only,
+        reduce_only,
+    ): PyLegacyBatchSubmitOrder = obj.extract(py).map_err(to_pyruntime_err)?;
+
+    Ok((
+        instrument_type,
+        instrument_id,
+        td_mode,
+        client_order_id,
+        order_side,
+        order_type,
+        quantity,
+        position_side,
+        price,
+        trigger_price,
+        post_only,
+        reduce_only,
+        None,
+        None,
+    ))
+}
+
+fn parse_attach_algo_ords(
+    py: Python<'_>,
+    attach_algo_ords: Option<Vec<Py<PyDict>>>,
+) -> PyResult<Option<Vec<WsAttachAlgoOrdParams>>> {
+    attach_algo_ords
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|item| {
+                    let dict = item.bind(py);
+                    let mut builder = WsAttachAlgoOrdParamsBuilder::default();
+
+                    if let Some(value) = extract_optional_string(dict, "attach_algo_cl_ord_id")? {
+                        builder.attach_algo_cl_ord_id(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "sl_trigger_px")? {
+                        builder.sl_trigger_px(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "sl_ord_px")? {
+                        builder.sl_ord_px(value);
+                    }
+
+                    if let Some(value) = extract_optional_trigger_type(dict, "sl_trigger_px_type")?
+                    {
+                        builder.sl_trigger_px_type(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "tp_trigger_px")? {
+                        builder.tp_trigger_px(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "tp_ord_px")? {
+                        builder.tp_ord_px(value);
+                    }
+
+                    if let Some(value) = extract_optional_trigger_type(dict, "tp_trigger_px_type")?
+                    {
+                        builder.tp_trigger_px_type(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "callback_ratio")? {
+                        builder.callback_ratio(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "callback_spread")? {
+                        builder.callback_spread(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "active_px")? {
+                        builder.active_px(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "new_callback_ratio")? {
+                        builder.new_callback_ratio(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "new_callback_spread")? {
+                        builder.new_callback_spread(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "new_active_px")? {
+                        builder.new_active_px(value);
+                    }
+
+                    builder.build().map_err(to_pyvalue_err)
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .transpose()
+}
 
 #[pyo3::pymethods]
 impl OKXWebSocketError {
@@ -121,9 +312,12 @@ impl OKXWebSocketError {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OKXWebSocketClient {
+    /// Provides a WebSocket client for connecting to [OKX](https://okx.com).
     #[new]
-    #[pyo3(signature = (url=None, api_key=None, api_secret=None, api_passphrase=None, account_id=None, heartbeat=None))]
+    #[pyo3(signature = (url=None, api_key=None, api_secret=None, api_passphrase=None, account_id=None, heartbeat=None, auth_timeout_secs=None, proxy_url=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         url: Option<String>,
         api_key: Option<String>,
@@ -131,6 +325,8 @@ impl OKXWebSocketClient {
         api_passphrase: Option<String>,
         account_id: Option<AccountId>,
         heartbeat: Option<u64>,
+        auth_timeout_secs: Option<u64>,
+        proxy_url: Option<String>,
     ) -> PyResult<Self> {
         Self::new(
             url,
@@ -139,13 +335,17 @@ impl OKXWebSocketClient {
             api_passphrase,
             account_id,
             heartbeat,
+            auth_timeout_secs,
+            TransportBackend::default(),
+            proxy_url,
         )
         .map_err(to_pyvalue_err)
     }
 
     #[staticmethod]
     #[pyo3(name = "with_credentials")]
-    #[pyo3(signature = (url=None, api_key=None, api_secret=None, api_passphrase=None, account_id=None, heartbeat=None))]
+    #[pyo3(signature = (url=None, api_key=None, api_secret=None, api_passphrase=None, account_id=None, heartbeat=None, auth_timeout_secs=None, proxy_url=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_with_credentials(
         url: Option<String>,
         api_key: Option<String>,
@@ -153,6 +353,8 @@ impl OKXWebSocketClient {
         api_passphrase: Option<String>,
         account_id: Option<AccountId>,
         heartbeat: Option<u64>,
+        auth_timeout_secs: Option<u64>,
+        proxy_url: Option<String>,
     ) -> PyResult<Self> {
         Self::with_credentials(
             url,
@@ -161,6 +363,9 @@ impl OKXWebSocketClient {
             api_passphrase,
             account_id,
             heartbeat,
+            auth_timeout_secs,
+            TransportBackend::default(),
+            proxy_url,
         )
         .map_err(to_pyvalue_err)
     }
@@ -239,7 +444,7 @@ impl OKXWebSocketClient {
     }
 
     #[pyo3(name = "connect")]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_connect<'py>(
         &mut self,
         py: Python<'py>,
@@ -250,6 +455,7 @@ impl OKXWebSocketClient {
         let call_soon: Py<PyAny> = loop_.getattr(py, "call_soon_threadsafe")?;
 
         let mut instruments_any = Vec::new();
+
         for inst in instruments {
             let inst_any = pyobject_to_instrument_any(py, inst)?;
             instruments_any.push(inst_any);
@@ -268,10 +474,11 @@ impl OKXWebSocketClient {
             get_runtime().spawn(async move {
                 let account_id = client.account_id;
                 let mut instruments_by_symbol = client.instruments_snapshot();
+                let mut quote_cache = QuoteCache::new();
                 let mut funding_cache: AHashMap<Ustr, (Ustr, u64)> = AHashMap::new();
                 let mut fee_cache: AHashMap<Ustr, Money> = AHashMap::new();
                 let mut filled_qty_cache: AHashMap<Ustr, Quantity> = AHashMap::new();
-                let _client = client;
+                let option_greeks_subs_arc = client.option_greeks_subs().clone();
                 tokio::pin!(stream);
 
                 while let Some(msg) = stream.next().await {
@@ -292,12 +499,15 @@ impl OKXWebSocketClient {
                             inst_id,
                             data,
                         } => {
+                            let greeks_guard = option_greeks_subs_arc.load();
                             handle_channel_data(
                                 &channel,
                                 inst_id,
                                 data,
                                 &mut instruments_by_symbol,
+                                &mut quote_cache,
                                 &mut funding_cache,
+                                &greeks_guard,
                                 clock,
                                 &call_soon,
                                 &callback,
@@ -318,6 +528,17 @@ impl OKXWebSocketClient {
                                 account_id,
                                 &instruments_by_symbol,
                                 &mut fee_cache,
+                                &mut filled_qty_cache,
+                                clock,
+                                &call_soon,
+                                &callback,
+                            );
+                        }
+                        OKXWsMessage::SpreadOrders(order_msgs) => {
+                            handle_spread_orders(
+                                &order_msgs,
+                                account_id,
+                                &instruments_by_symbol,
                                 &mut filled_qty_cache,
                                 clock,
                                 &call_soon,
@@ -360,7 +581,7 @@ impl OKXWebSocketClient {
                                 &code,
                                 &msg,
                                 &data,
-                                &_client,
+                                &client,
                                 account_id,
                                 clock,
                                 &call_soon,
@@ -378,7 +599,7 @@ impl OKXWebSocketClient {
                                 client_order_id,
                                 op.as_ref(),
                                 &error,
-                                &_client,
+                                &client,
                                 account_id,
                                 clock,
                                 &call_soon,
@@ -388,7 +609,10 @@ impl OKXWebSocketClient {
                         OKXWsMessage::Error(msg) => {
                             call_python_with_data(&call_soon, &callback, |py| msg.into_py_any(py));
                         }
-                        OKXWsMessage::Reconnected | OKXWsMessage::Authenticated => {}
+                        OKXWsMessage::Reconnected => {
+                            quote_cache.clear();
+                        }
+                        OKXWsMessage::Authenticated => {}
                     }
                 }
             });
@@ -797,6 +1021,62 @@ impl OKXWebSocketClient {
         })
     }
 
+    #[pyo3(name = "add_option_greeks_sub")]
+    fn py_add_option_greeks_sub(&self, instrument_id: InstrumentId) {
+        self.add_option_greeks_sub(instrument_id);
+    }
+
+    #[pyo3(name = "add_option_greeks_sub_with_conventions")]
+    fn py_add_option_greeks_sub_with_conventions(
+        &self,
+        instrument_id: InstrumentId,
+        conventions: Vec<OKXGreeksType>,
+    ) {
+        self.add_option_greeks_sub_with_conventions(
+            instrument_id,
+            conventions.into_iter().collect(),
+        );
+    }
+
+    #[pyo3(name = "remove_option_greeks_sub")]
+    fn py_remove_option_greeks_sub(&self, instrument_id: InstrumentId) {
+        self.remove_option_greeks_sub(&instrument_id);
+    }
+
+    #[pyo3(name = "subscribe_option_summary")]
+    fn py_subscribe_option_summary<'py>(
+        &self,
+        py: Python<'py>,
+        inst_family: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let family = Ustr::from(inst_family);
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.subscribe_option_summary(family).await {
+                log::error!("Failed to subscribe to option summary: {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_option_summary")]
+    fn py_unsubscribe_option_summary<'py>(
+        &self,
+        py: Python<'py>,
+        inst_family: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let family = Ustr::from(inst_family);
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.unsubscribe_option_summary(family).await {
+                log::error!("Failed to unsubscribe from option summary: {e}");
+            }
+            Ok(())
+        })
+    }
+
     #[pyo3(name = "subscribe_funding_rates")]
     fn py_subscribe_funding_rates<'py>(
         &self,
@@ -829,6 +1109,36 @@ impl OKXWebSocketClient {
         })
     }
 
+    #[pyo3(name = "subscribe_event_contract_markets")]
+    fn py_subscribe_event_contract_markets<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.subscribe_event_contract_markets().await {
+                log::error!("Failed to subscribe to event contract markets: {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_event_contract_markets")]
+    fn py_unsubscribe_event_contract_markets<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.unsubscribe_event_contract_markets().await {
+                log::error!("Failed to unsubscribe from event contract markets: {e}");
+            }
+            Ok(())
+        })
+    }
+
     #[pyo3(name = "subscribe_orders")]
     fn py_subscribe_orders<'py>(
         &self,
@@ -856,6 +1166,30 @@ impl OKXWebSocketClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if let Err(e) = client.unsubscribe_orders(instrument_type).await {
                 log::error!("Failed to unsubscribe from orders '{instrument_type}': {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "subscribe_spread_orders")]
+    fn py_subscribe_spread_orders<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.subscribe_spread_orders().await {
+                log::error!("Failed to subscribe to spread orders: {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_spread_orders")]
+    fn py_unsubscribe_spread_orders<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.unsubscribe_spread_orders().await {
+                log::error!("Failed to unsubscribe from spread orders: {e}");
             }
             Ok(())
         })
@@ -998,8 +1332,14 @@ impl OKXWebSocketClient {
         reduce_only=None,
         quote_quantity=None,
         position_side=None,
+        attach_algo_ords=None,
+        px_usd=None,
+        px_vol=None,
+        speed_bump=None,
+        outcome=None,
+        slippage_pct=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_submit_order<'py>(
         &self,
         py: Python<'py>,
@@ -1018,7 +1358,14 @@ impl OKXWebSocketClient {
         reduce_only: Option<bool>,
         quote_quantity: Option<bool>,
         position_side: Option<PositionSide>,
+        attach_algo_ords: Option<Vec<Py<PyDict>>>,
+        px_usd: Option<String>,
+        px_vol: Option<String>,
+        speed_bump: Option<String>,
+        outcome: Option<String>,
+        slippage_pct: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let attach_algo_ords = parse_attach_algo_ords(py, attach_algo_ords)?;
         let client = self.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1039,6 +1386,12 @@ impl OKXWebSocketClient {
                     reduce_only,
                     quote_quantity,
                     position_side,
+                    attach_algo_ords,
+                    px_usd,
+                    px_vol,
+                    speed_bump,
+                    outcome,
+                    slippage_pct,
                 )
                 .await
                 .map_err(to_pyvalue_err)
@@ -1052,7 +1405,6 @@ impl OKXWebSocketClient {
         client_order_id=None,
         venue_order_id=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
     fn py_cancel_order<'py>(
         &self,
         py: Python<'py>,
@@ -1087,8 +1439,11 @@ impl OKXWebSocketClient {
         venue_order_id=None,
         price=None,
         quantity=None,
+        new_px_usd=None,
+        new_px_vol=None,
+        speed_bump=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_modify_order<'py>(
         &self,
         py: Python<'py>,
@@ -1099,6 +1454,9 @@ impl OKXWebSocketClient {
         venue_order_id: Option<VenueOrderId>,
         price: Option<Price>,
         quantity: Option<Quantity>,
+        new_px_usd: Option<String>,
+        new_px_vol: Option<String>,
+        speed_bump: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
@@ -1112,13 +1470,15 @@ impl OKXWebSocketClient {
                     price,
                     quantity,
                     venue_order_id,
+                    new_px_usd,
+                    new_px_vol,
+                    speed_bump,
                 )
                 .await
                 .map_err(to_pyvalue_err)
         })
     }
 
-    #[allow(clippy::type_complexity)]
     #[pyo3(name = "batch_submit_orders")]
     fn py_batch_submit_orders<'py>(
         &self,
@@ -1141,20 +1501,9 @@ impl OKXWebSocketClient {
                 trigger_price,
                 post_only,
                 reduce_only,
-            ): (
-                OKXInstrumentType,
-                InstrumentId,
-                OKXTradeMode,
-                ClientOrderId,
-                OrderSide,
-                OrderType,
-                Quantity,
-                Option<PositionSide>,
-                Option<Price>,
-                Option<Price>,
-                Option<bool>,
-                Option<bool>,
-            ) = obj.extract(py).map_err(to_pyruntime_err)?;
+                speed_bump,
+                outcome,
+            ) = extract_batch_submit_order(py, &obj)?;
 
             domain_orders.push((
                 instrument_type,
@@ -1169,6 +1518,8 @@ impl OKXWebSocketClient {
                 trigger_price,
                 post_only,
                 reduce_only,
+                speed_bump,
+                outcome,
             ));
         }
 
@@ -1219,6 +1570,9 @@ impl OKXWebSocketClient {
         let mut domain_orders = Vec::with_capacity(orders.len());
 
         for obj in orders {
+            let extracted_with_event_params: PyResult<PyBatchModifyOrder> =
+                obj.extract(py).map_err(to_pyruntime_err);
+
             let (
                 instrument_type,
                 instrument_id,
@@ -1226,14 +1580,29 @@ impl OKXWebSocketClient {
                 new_client_order_id,
                 price,
                 quantity,
-            ): (
-                String,
-                InstrumentId,
-                ClientOrderId,
-                ClientOrderId,
-                Option<Price>,
-                Option<Quantity>,
-            ) = obj.extract(py).map_err(to_pyruntime_err)?;
+                speed_bump,
+            ) = if let Ok(values) = extracted_with_event_params {
+                values
+            } else {
+                let (
+                    instrument_type,
+                    instrument_id,
+                    client_order_id,
+                    new_client_order_id,
+                    price,
+                    quantity,
+                ): PyLegacyBatchModifyOrder = obj.extract(py).map_err(to_pyruntime_err)?;
+
+                (
+                    instrument_type,
+                    instrument_id,
+                    client_order_id,
+                    new_client_order_id,
+                    price,
+                    quantity,
+                    None,
+                )
+            };
             let inst_type =
                 OKXInstrumentType::from_str(&instrument_type).map_err(to_pyvalue_err)?;
             domain_orders.push((
@@ -1243,6 +1612,7 @@ impl OKXWebSocketClient {
                 new_client_order_id,
                 price,
                 quantity,
+                speed_bump,
             ));
         }
 
@@ -1308,9 +1678,11 @@ fn handle_book_data(
 ) {
     let Some(inst_id) = inst_id else { return };
     let Some(instrument) = instruments_by_symbol.get(&inst_id) else {
+        log::warn!("No cached instrument for book data: {inst_id}");
         return;
     };
     let ts_init = clock.get_time_ns();
+
     match parse_book_msg_vec(
         data,
         &instrument.id(),
@@ -1329,17 +1701,72 @@ fn handle_book_data(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn handle_channel_data(
     channel: &OKXWsChannel,
     inst_id: Option<Ustr>,
     data: serde_json::Value,
     instruments_by_symbol: &mut AHashMap<Ustr, InstrumentAny>,
+    quote_cache: &mut QuoteCache,
     funding_cache: &mut AHashMap<Ustr, (Ustr, u64)>,
+    option_greeks_subs: &AHashMap<InstrumentId, AHashSet<OKXGreeksType>>,
     clock: &AtomicTime,
     call_soon: &Py<PyAny>,
     callback: &Py<PyAny>,
 ) {
+    if matches!(channel, OKXWsChannel::OptionSummary) {
+        let ts_init = clock.get_time_ns();
+
+        match serde_json::from_value::<Vec<OKXOptionSummaryMsg>>(data) {
+            Ok(msgs) => {
+                for msg in &msgs {
+                    let Some(instrument) = instruments_by_symbol.get(&msg.inst_id) else {
+                        continue;
+                    };
+                    let instrument_id = instrument.id();
+                    let Some(conventions) = option_greeks_subs.get(&instrument_id) else {
+                        continue;
+                    };
+
+                    for greeks_type in conventions {
+                        match parse_option_summary_greeks(
+                            msg,
+                            &instrument_id,
+                            *greeks_type,
+                            ts_init,
+                        ) {
+                            Ok(greeks) => {
+                                Python::attach(|py| match greeks.into_py_any(py) {
+                                    Ok(py_obj) => {
+                                        call_python_threadsafe(py, call_soon, callback, py_obj);
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "Failed to convert OptionGreeks to Python: {e}"
+                                        );
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "Failed to parse option summary for {} ({greeks_type:?}): {e}",
+                                    msg.inst_id
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => log::error!("Failed to deserialize option summary data: {e}"),
+        }
+        return;
+    }
+
+    if matches!(channel, OKXWsChannel::EventContractMarkets) {
+        dispatch_json_value_to_python(&data, call_soon, callback);
+        return;
+    }
+
     let Some(inst_id) = inst_id else { return };
 
     if matches!(channel, OKXWsChannel::IndexTickers) {
@@ -1372,12 +1799,27 @@ fn handle_channel_data(
     }
 
     let Some(instrument) = instruments_by_symbol.get(&inst_id) else {
+        log::warn!("No cached instrument for {channel:?}: {inst_id}");
         return;
     };
     let instrument_id = instrument.id();
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
     let ts_init = clock.get_time_ns();
+
+    if matches!(channel, OKXWsChannel::BboTbt) {
+        handle_bbo_tbt(
+            data,
+            instrument_id,
+            price_precision,
+            size_precision,
+            ts_init,
+            quote_cache,
+            call_soon,
+            callback,
+        );
+        return;
+    }
 
     match parse_ws_message_data(
         channel,
@@ -1399,6 +1841,57 @@ fn handle_channel_data(
     }
 }
 
+#[expect(clippy::too_many_arguments)]
+fn handle_bbo_tbt(
+    data: serde_json::Value,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+    ts_init: UnixNanos,
+    quote_cache: &mut QuoteCache,
+    call_soon: &Py<PyAny>,
+    callback: &Py<PyAny>,
+) {
+    let msgs: Vec<OKXBookMsg> = match serde_json::from_value(data) {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            log::error!("Failed to deserialize BboTbt data: {e}");
+            return;
+        }
+    };
+
+    for msg in &msgs {
+        let bid = msg.bids.first();
+        let ask = msg.asks.first();
+
+        let bid_price = bid.and_then(|e| parse_price(&e.price, price_precision).ok());
+        let bid_size = bid.and_then(|e| parse_quantity(&e.size, size_precision).ok());
+        let ask_price = ask.and_then(|e| parse_price(&e.price, price_precision).ok());
+        let ask_size = ask.and_then(|e| parse_quantity(&e.size, size_precision).ok());
+        let ts_event = parse_millisecond_timestamp(msg.ts);
+
+        match quote_cache.process(
+            instrument_id,
+            bid_price,
+            ask_price,
+            bid_size,
+            ask_size,
+            ts_event,
+            ts_init,
+        ) {
+            Ok(quote) => {
+                Python::attach(|py| {
+                    let py_obj = data_to_pycapsule(py, Data::Quote(quote));
+                    call_python_threadsafe(py, call_soon, callback, py_obj);
+                });
+            }
+            Err(e) => {
+                log::debug!("Skipping partial BboTbt for {instrument_id}: {e}");
+            }
+        }
+    }
+}
+
 fn handle_instruments(
     okx_instruments: Vec<OKXInstrument>,
     instruments_by_symbol: &mut AHashMap<Ustr, InstrumentAny>,
@@ -1407,6 +1900,7 @@ fn handle_instruments(
     callback: &Py<PyAny>,
 ) {
     let ts_init = clock.get_time_ns();
+
     for okx_inst in okx_instruments {
         let inst_key = Ustr::from(&okx_inst.inst_id);
         let (margin_init, margin_maint, maker_fee, taker_fee) =
@@ -1446,7 +1940,7 @@ fn handle_instruments(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn handle_orders(
     order_msgs: &[OKXOrderMsg],
     account_id: AccountId,
@@ -1458,6 +1952,7 @@ fn handle_orders(
     callback: &Py<PyAny>,
 ) {
     let ts_init = clock.get_time_ns();
+
     match parse_order_msg_vec(
         order_msgs,
         account_id,
@@ -1473,6 +1968,43 @@ fn handle_orders(
             log::error!("Failed to parse order messages: {e}");
         }
     }
+}
+
+fn handle_spread_orders(
+    order_msgs: &[OKXSpreadOrder],
+    account_id: AccountId,
+    instruments_by_symbol: &AHashMap<Ustr, InstrumentAny>,
+    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
+    clock: &AtomicTime,
+    call_soon: &Py<PyAny>,
+    callback: &Py<PyAny>,
+) {
+    let ts_init = clock.get_time_ns();
+    let mut reports = Vec::with_capacity(order_msgs.len());
+
+    for msg in order_msgs {
+        match parse_spread_order_msg(
+            msg,
+            account_id,
+            instruments_by_symbol,
+            filled_qty_cache,
+            ts_init,
+        ) {
+            Ok(report) => {
+                if let Some(instrument) = instruments_by_symbol.get(&msg.sprd_id)
+                    && !msg.acc_fill_sz.is_empty()
+                    && msg.acc_fill_sz != "0"
+                    && let Ok(qty) = parse_quantity(&msg.acc_fill_sz, instrument.size_precision())
+                {
+                    filled_qty_cache.insert(msg.ord_id, qty);
+                }
+                reports.push(report);
+            }
+            Err(e) => log::error!("Failed to parse spread order message: {e}"),
+        }
+    }
+
+    dispatch_execution_reports_to_python(reports, call_soon, callback);
 }
 
 fn handle_algo_orders(
@@ -1524,6 +2056,7 @@ fn handle_positions(
 ) {
     if let Ok(positions) = serde_json::from_value::<Vec<OKXPosition>>(data) {
         let ts_init = clock.get_time_ns();
+
         for position in positions {
             let inst_key = Ustr::from(&position.inst_id);
             if let Some(instrument) = instruments_by_symbol.get(&inst_key) {
@@ -1546,7 +2079,7 @@ fn handle_positions(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn handle_order_response(
     id: Option<&str>,
     op: &OKXWsOperation,
@@ -1560,11 +2093,20 @@ fn handle_order_response(
     callback: &Py<PyAny>,
 ) {
     for item in data {
-        let s_code = item.get("sCode").and_then(|v| v.as_str()).unwrap_or("");
-        let s_msg = item.get("sMsg").and_then(|v| v.as_str()).unwrap_or("");
-        let cl_ord_id = item.get("clOrdId").and_then(|v| v.as_str()).unwrap_or("");
+        let s_code = item
+            .get(OKX_FIELD_SCODE)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let s_msg = item
+            .get(OKX_FIELD_SMSG)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let cl_ord_id = item
+            .get(OKX_FIELD_CLORDID)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
-        if s_code == "0" {
+        if s_code == OKX_SUCCESS_CODE {
             log::debug!("Order response ok: op={op:?} cl_ord_id={cl_ord_id}");
             match op {
                 OKXWsOperation::Order | OKXWsOperation::BatchOrders => {
@@ -1694,7 +2236,7 @@ fn handle_order_response(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn handle_send_failed(
     request_id: &str,
     client_order_id: Option<ClientOrderId>,
@@ -1790,6 +2332,14 @@ where
     });
 }
 
+fn dispatch_json_value_to_python(
+    data: &serde_json::Value,
+    call_soon: &Py<PyAny>,
+    callback: &Py<PyAny>,
+) {
+    call_python_with_data(call_soon, callback, |py| value_to_pyobject(py, data));
+}
+
 fn dispatch_nautilus_ws_msg_to_python(
     msg: NautilusWsMessage,
     call_soon: &Py<PyAny>,
@@ -1821,6 +2371,9 @@ fn dispatch_nautilus_ws_msg_to_python(
             if let Some(status) = status {
                 call_python_with_data(call_soon, callback, |py| status.into_py_any(py));
             }
+        }
+        NautilusWsMessage::Raw(data) => {
+            dispatch_json_value_to_python(&data, call_soon, callback);
         }
         _ => {}
     }

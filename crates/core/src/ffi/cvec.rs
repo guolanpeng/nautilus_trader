@@ -57,24 +57,6 @@ pub struct CVec {
     pub cap: usize,
 }
 
-// SAFETY: CVec is marked as Send to satisfy PyO3's PyCapsule requirements, which need
-// to transfer ownership across the Python/Rust boundary. However, CVec contains raw
-// pointers and is only safe to use in single-threaded contexts or with external
-// synchronization guarantees.
-//
-// The Send impl is required for:
-// 1. PyO3's PyCapsule::new_with_destructor which has a Send bound
-// 2. Transferring CVec ownership to Python (which runs on a single GIL-protected thread)
-//
-// IMPORTANT: Do not send CVec instances across threads without ensuring:
-// - The underlying data type T is itself Send + Sync
-// - Proper external synchronization (e.g., mutex) protects concurrent access
-// - The CVec is consumed on the same thread where it will be reconstructed
-//
-// In practice, CVec usage in this codebase is confined to the Python FFI boundary
-// where the Python GIL provides the necessary synchronization.
-unsafe impl Send for CVec {}
-
 impl CVec {
     /// Returns an empty [`CVec`].
     ///
@@ -82,7 +64,7 @@ impl CVec {
     /// absence of data when crossing the FFI boundary.
     ///
     /// Uses a dangling pointer (like `Vec::new()`) rather than null to satisfy
-    /// `Vec::from_raw_parts` preconditions when the CVec is later dropped.
+    /// `Vec::from_raw_parts` preconditions when the `CVec` is later dropped.
     #[must_use]
     pub fn empty() -> Self {
         Self {
@@ -106,6 +88,10 @@ impl<T> From<Vec<T>> for CVec {
             let len = data.len();
             let cap = data.capacity();
             let ptr = data.as_mut_ptr();
+            #[allow(
+                clippy::mem_forget,
+                reason = "intentional ownership transfer to C; matching CVec::drop reclaims via Vec::from_raw_parts"
+            )]
             std::mem::forget(data);
             Self {
                 ptr: ptr.cast::<std::ffi::c_void>(),
@@ -162,6 +148,11 @@ mod tests {
         assert_eq!(cap, vec_cap);
 
         let data = ptr.cast::<u64>();
+        // SAFETY: data points to a valid Vec<u64> of length 3 owned by `cvec`
+        #[allow(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "test asserts on three pointer reads in sequence"
+        )]
         unsafe {
             assert_eq!(*data, test_data[0]);
             assert_eq!(*data.add(1), test_data[1]);

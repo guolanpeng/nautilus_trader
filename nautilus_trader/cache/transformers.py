@@ -16,6 +16,7 @@
 import msgspec
 
 from nautilus_trader.accounting.accounts.base import Account
+from nautilus_trader.accounting.accounts.betting import BettingAccount
 from nautilus_trader.accounting.accounts.cash import CashAccount
 from nautilus_trader.accounting.accounts.margin import MarginAccount
 from nautilus_trader.core import nautilus_pyo3
@@ -48,7 +49,9 @@ from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.instruments import Cfd
 from nautilus_trader.model.instruments import Commodity
 from nautilus_trader.model.instruments import CryptoFuture
+from nautilus_trader.model.instruments import CryptoFuturesSpread
 from nautilus_trader.model.instruments import CryptoOption
+from nautilus_trader.model.instruments import CryptoOptionSpread
 from nautilus_trader.model.instruments import CryptoPerpetual
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.instruments import Equity
@@ -59,6 +62,7 @@ from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.instruments import OptionContract
 from nautilus_trader.model.instruments import OptionSpread
 from nautilus_trader.model.instruments import PerpetualContract
+from nautilus_trader.model.instruments import TokenizedAsset
 from nautilus_trader.model.objects import Currency
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.orders import Order
@@ -103,8 +107,16 @@ def transform_instrument_to_pyo3(instrument: Instrument):  # noqa: C901
         return nautilus_pyo3.Commodity.from_dict(Commodity.to_dict(instrument))
     elif isinstance(instrument, CryptoFuture):
         return nautilus_pyo3.CryptoFuture.from_dict(CryptoFuture.to_dict(instrument))
+    elif isinstance(instrument, CryptoFuturesSpread):
+        return nautilus_pyo3.CryptoFuturesSpread.from_dict(
+            CryptoFuturesSpread.to_dict(instrument),
+        )
     elif isinstance(instrument, CryptoOption):
         return nautilus_pyo3.CryptoOption.from_dict(CryptoOption.to_dict(instrument))
+    elif isinstance(instrument, CryptoOptionSpread):
+        return nautilus_pyo3.CryptoOptionSpread.from_dict(
+            CryptoOptionSpread.to_dict(instrument),
+        )
     elif isinstance(instrument, CryptoPerpetual):
         return nautilus_pyo3.CryptoPerpetual.from_dict(CryptoPerpetual.to_dict(instrument))
     elif isinstance(instrument, CurrencyPair):
@@ -123,6 +135,8 @@ def transform_instrument_to_pyo3(instrument: Instrument):  # noqa: C901
         return nautilus_pyo3.OptionSpread.from_dict(OptionSpread.to_dict(instrument))
     elif isinstance(instrument, PerpetualContract):
         return nautilus_pyo3.PerpetualContract.from_dict(PerpetualContract.to_dict(instrument))
+    elif isinstance(instrument, TokenizedAsset):
+        return nautilus_pyo3.TokenizedAsset.from_dict(TokenizedAsset.to_dict(instrument))
     else:
         raise ValueError(f"Unknown instrument type: {instrument}")
 
@@ -140,8 +154,12 @@ def transform_instrument_from_pyo3(instrument_pyo3) -> Instrument | None:  # noq
         return Commodity.from_pyo3(instrument_pyo3)
     elif isinstance(instrument_pyo3, nautilus_pyo3.CryptoFuture):
         return CryptoFuture.from_pyo3(instrument_pyo3)
+    elif isinstance(instrument_pyo3, nautilus_pyo3.CryptoFuturesSpread):
+        return CryptoFuturesSpread.from_pyo3(instrument_pyo3)
     elif isinstance(instrument_pyo3, nautilus_pyo3.CryptoOption):
         return CryptoOption.from_pyo3(instrument_pyo3)
+    elif isinstance(instrument_pyo3, nautilus_pyo3.CryptoOptionSpread):
+        return CryptoOptionSpread.from_pyo3(instrument_pyo3)
     elif isinstance(instrument_pyo3, nautilus_pyo3.CryptoPerpetual):
         return CryptoPerpetual.from_pyo3(instrument_pyo3)
     elif isinstance(instrument_pyo3, nautilus_pyo3.CurrencyPair):
@@ -160,6 +178,8 @@ def transform_instrument_from_pyo3(instrument_pyo3) -> Instrument | None:  # noq
         return OptionSpread.from_pyo3(instrument_pyo3)
     elif isinstance(instrument_pyo3, nautilus_pyo3.PerpetualContract):
         return PerpetualContract.from_pyo3(instrument_pyo3)
+    elif isinstance(instrument_pyo3, nautilus_pyo3.TokenizedAsset):
+        return TokenizedAsset.from_pyo3(instrument_pyo3)
     else:
         raise ValueError(f"Unknown instrument type: {instrument_pyo3}")
 
@@ -218,6 +238,14 @@ def from_order_initialized_cython_to_order_pyo3(order_event):
         return nautilus_pyo3.StopMarketOrder.create(order_event_pyo3)
     elif order_event_pyo3.order_type == nautilus_pyo3.OrderType.STOP_LIMIT:
         return nautilus_pyo3.StopLimitOrder.create(order_event_pyo3)
+    elif order_event_pyo3.order_type == nautilus_pyo3.OrderType.LIMIT_IF_TOUCHED:
+        return nautilus_pyo3.LimitIfTouchedOrder.create(order_event_pyo3)
+    elif order_event_pyo3.order_type == nautilus_pyo3.OrderType.MARKET_TO_LIMIT:
+        return nautilus_pyo3.MarketToLimitOrder.create(order_event_pyo3)
+    elif order_event_pyo3.order_type == nautilus_pyo3.OrderType.TRAILING_STOP_MARKET:
+        return nautilus_pyo3.TrailingStopMarketOrder.create(order_event_pyo3)
+    elif order_event_pyo3.order_type == nautilus_pyo3.OrderType.TRAILING_STOP_LIMIT:
+        return nautilus_pyo3.TrailingStopLimitOrder.create(order_event_pyo3)
     else:
         raise ValueError(f"Unknown order type: {order_event_pyo3.order_type}")
 
@@ -272,6 +300,7 @@ def transform_order_to_pyo3(order: Order):
     if not isinstance(init_event, OrderInitialized):
         raise KeyError("init event should be of type OrderInitialized")
     order_py3 = from_order_initialized_cython_to_order_pyo3(init_event)
+
     for event_cython in events:
         event_pyo3 = transform_order_event_to_pyo3(event_cython)
         order_py3.apply(event_pyo3)
@@ -279,13 +308,14 @@ def transform_order_to_pyo3(order: Order):
 
 
 def transform_order_from_pyo3(order_pyo3) -> Order:
-    events_pyo3 = order_pyo3.events
+    events_pyo3 = order_pyo3.events()
     if len(events_pyo3) == 0:
         raise ValueError("Missing events in order")
     init_event = events_pyo3.pop(0)
     if not isinstance(init_event, nautilus_pyo3.OrderInitialized):
         raise KeyError("init event should be of type OrderInitialized")
     order_cython = from_order_initialized_pyo3_to_order_cython(init_event)
+
     for event_pyo3 in events_pyo3:
         event_cython = transform_order_event_from_pyo3(event_pyo3)
         order_cython.apply(event_cython)
@@ -338,10 +368,12 @@ def from_account_state_pyo3_to_account_cython(
     calculate_account_state: bool,
 ) -> Account:
     account_state_cython = transform_account_state_pyo3_to_cython(account_state_pyo3)
-    if account_state_pyo3.account_type == nautilus_pyo3.AccountType.CASH:
-        return CashAccount(account_state_cython, calculate_account_state)
-    elif account_state_pyo3.account_type == nautilus_pyo3.AccountType.MARGIN:
+    if account_state_pyo3.account_type == nautilus_pyo3.AccountType.MARGIN:
         return MarginAccount(account_state_cython, calculate_account_state)
+    elif account_state_pyo3.account_type == nautilus_pyo3.AccountType.CASH:
+        return CashAccount(account_state_cython, calculate_account_state)
+    elif account_state_pyo3.account_type == nautilus_pyo3.AccountType.BETTING:
+        return BettingAccount(account_state_cython, calculate_account_state)
     else:
         raise ValueError(f"Unsupported account type: {account_state_pyo3.account_type}")
 
@@ -351,10 +383,12 @@ def from_account_state_cython_to_account_pyo3(
     calculate_account_state: bool,
 ):
     account_state_pyo3 = transform_account_state_cython_to_pyo3(account_state)
-    if account_state_pyo3.account_type == nautilus_pyo3.AccountType.CASH:
-        return nautilus_pyo3.CashAccount(account_state_pyo3, calculate_account_state)
-    elif account_state_pyo3.account_type == nautilus_pyo3.AccountType.MARGIN:
+    if account_state_pyo3.account_type == nautilus_pyo3.AccountType.MARGIN:
         return nautilus_pyo3.MarginAccount(account_state_pyo3, calculate_account_state)
+    elif account_state_pyo3.account_type == nautilus_pyo3.AccountType.CASH:
+        return nautilus_pyo3.CashAccount(account_state_pyo3, calculate_account_state)
+    elif account_state_pyo3.account_type == nautilus_pyo3.AccountType.BETTING:
+        return nautilus_pyo3.BettingAccount(account_state_pyo3, calculate_account_state)  # type: ignore[attr-defined]
     else:
         raise ValueError(f"Unsupported account type: {account_state_pyo3.account_type}")
 
@@ -366,6 +400,7 @@ def transform_account_to_pyo3(account: Account):
     init_event = events.pop(0)
     calculate_account_state = account.calculate_account_state
     account_pyo3 = from_account_state_cython_to_account_pyo3(init_event, calculate_account_state)
+
     for account_state_cython in events:
         event_pyo3 = transform_account_state_cython_to_pyo3(account_state_cython)
         account_pyo3.apply(event_pyo3)
@@ -379,6 +414,7 @@ def transform_account_from_pyo3(account_pyo3) -> Account:
     init_event = events_pyo3.pop(0)
     calculate_account_state = account_pyo3.calculate_account_state
     account = from_account_state_pyo3_to_account_cython(init_event, calculate_account_state)
+
     for account_state_pyo3 in events_pyo3:
         event = transform_account_state_pyo3_to_cython(account_state_pyo3)
         account.apply(event)

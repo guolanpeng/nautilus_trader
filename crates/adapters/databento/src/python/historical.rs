@@ -15,14 +15,15 @@
 
 //! Python bindings for the Databento historical client.
 
-use std::path::PathBuf;
+use std::{fmt::Debug, path::PathBuf};
 
 use nautilus_core::{
     python::{IntoPyObjectNautilusExt, to_pyexception, to_pyvalue_err},
     time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
-    enums::BarAggregation, identifiers::InstrumentId,
+    enums::BarAggregation,
+    identifiers::{InstrumentId, Symbol},
     python::instruments::instrument_any_to_pyobject,
 };
 use pyo3::{
@@ -31,8 +32,9 @@ use pyo3::{
     types::{PyDict, PyList},
 };
 
-use crate::historical::{
-    DatabentoHistoricalClient as CoreDatabentoHistoricalClient, RangeQueryParams,
+use crate::{
+    common::Credential,
+    historical::{DatabentoHistoricalClient as CoreDatabentoHistoricalClient, RangeQueryParams},
 };
 
 /// Python wrapper for the core Databento historical client.
@@ -40,15 +42,29 @@ use crate::historical::{
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.databento")
 )]
-#[derive(Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.databento")
+)]
 pub struct DatabentoHistoricalClient {
-    #[pyo3(get)]
-    pub key: String,
     inner: CoreDatabentoHistoricalClient,
 }
 
+impl Debug for DatabentoHistoricalClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(DatabentoHistoricalClient))
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl DatabentoHistoricalClient {
+    /// Core Databento historical client for fetching historical market data.
+    ///
+    /// This client provides both synchronous and asynchronous interfaces for fetching
+    /// various types of historical market data from Databento.
     #[new]
     fn py_new(
         key: String,
@@ -57,16 +73,35 @@ impl DatabentoHistoricalClient {
     ) -> PyResult<Self> {
         let clock = get_atomic_clock_realtime();
         let inner = CoreDatabentoHistoricalClient::new(
-            key.clone(),
+            Credential::new(key),
             publishers_filepath,
             clock,
             use_exchange_as_venue,
         )
         .map_err(to_pyvalue_err)?;
 
-        Ok(Self { key, inner })
+        Ok(Self { inner })
     }
 
+    /// Returns the API key from the stored credential.
+    #[getter]
+    #[pyo3(name = "api_key")]
+    fn py_api_key(&self) -> &str {
+        self.inner.api_key()
+    }
+
+    /// Caches a `price_precision` for the given `symbol`.
+    ///
+    /// When market data is fetched without an explicit `price_precision`, the
+    /// client resolves precision per record from this cache. Instruments
+    /// returned by `Self.get_range_instruments` are inserted automatically.
+    #[pyo3(name = "set_price_precision")]
+    fn py_set_price_precision(&self, symbol: &str, price_precision: u8) {
+        self.inner
+            .set_price_precision(Symbol::from(symbol), price_precision);
+    }
+
+    /// Gets the date range for a specific dataset.
     #[pyo3(name = "get_dataset_range")]
     fn py_get_dataset_range<'py>(
         &self,
@@ -89,9 +124,10 @@ impl DatabentoHistoricalClient {
         })
     }
 
+    /// Fetches instrument definitions for the given parameters.
     #[pyo3(name = "get_range_instruments")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None))]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_get_range_instruments<'py>(
         &self,
         py: Python<'py>,
@@ -102,9 +138,7 @@ impl DatabentoHistoricalClient {
         limit: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let symbols = inner
-            .prepare_symbols_from_instrument_ids(&instrument_ids)
-            .map_err(to_pyvalue_err)?;
+        let symbols = inner.prepare_symbols_from_instrument_ids(&instrument_ids);
 
         let params = RangeQueryParams {
             dataset,
@@ -133,9 +167,10 @@ impl DatabentoHistoricalClient {
         })
     }
 
+    /// Fetches quote ticks for the given parameters.
     #[pyo3(name = "get_range_quotes")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None, schema=None))]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_range_quotes<'py>(
         &self,
         py: Python<'py>,
@@ -148,9 +183,7 @@ impl DatabentoHistoricalClient {
         schema: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let symbols = inner
-            .prepare_symbols_from_instrument_ids(&instrument_ids)
-            .map_err(to_pyvalue_err)?;
+        let symbols = inner.prepare_symbols_from_instrument_ids(&instrument_ids);
 
         let params = RangeQueryParams {
             dataset,
@@ -170,9 +203,10 @@ impl DatabentoHistoricalClient {
         })
     }
 
+    /// Fetches trade ticks for the given parameters.
     #[pyo3(name = "get_range_trades")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None))]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_range_trades<'py>(
         &self,
         py: Python<'py>,
@@ -184,9 +218,7 @@ impl DatabentoHistoricalClient {
         price_precision: Option<u8>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let symbols = inner
-            .prepare_symbols_from_instrument_ids(&instrument_ids)
-            .map_err(to_pyvalue_err)?;
+        let symbols = inner.prepare_symbols_from_instrument_ids(&instrument_ids);
 
         let params = RangeQueryParams {
             dataset,
@@ -206,9 +238,10 @@ impl DatabentoHistoricalClient {
         })
     }
 
+    /// Fetches bars for the given parameters.
     #[pyo3(name = "get_range_bars")]
     #[pyo3(signature = (dataset, instrument_ids, aggregation, start, end=None, limit=None, price_precision=None, timestamp_on_close=true))]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_range_bars<'py>(
         &self,
         py: Python<'py>,
@@ -222,9 +255,7 @@ impl DatabentoHistoricalClient {
         timestamp_on_close: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let symbols = inner
-            .prepare_symbols_from_instrument_ids(&instrument_ids)
-            .map_err(to_pyvalue_err)?;
+        let symbols = inner.prepare_symbols_from_instrument_ids(&instrument_ids);
 
         let params = RangeQueryParams {
             dataset,
@@ -246,7 +277,7 @@ impl DatabentoHistoricalClient {
 
     #[pyo3(name = "get_order_book_depth10")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, depth=None))]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_get_order_book_depth10<'py>(
         &self,
         py: Python<'py>,
@@ -257,9 +288,7 @@ impl DatabentoHistoricalClient {
         depth: Option<usize>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let symbols = inner
-            .prepare_symbols_from_instrument_ids(&instrument_ids)
-            .map_err(to_pyvalue_err)?;
+        let symbols = inner.prepare_symbols_from_instrument_ids(&instrument_ids);
 
         let params = RangeQueryParams {
             dataset,
@@ -279,9 +308,10 @@ impl DatabentoHistoricalClient {
         })
     }
 
+    /// Fetches order book deltas for the given parameters.
     #[pyo3(name = "get_range_order_book_deltas")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None))]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_range_order_book_deltas<'py>(
         &self,
         py: Python<'py>,
@@ -293,9 +323,7 @@ impl DatabentoHistoricalClient {
         price_precision: Option<u8>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let symbols = inner
-            .prepare_symbols_from_instrument_ids(&instrument_ids)
-            .map_err(to_pyvalue_err)?;
+        let symbols = inner.prepare_symbols_from_instrument_ids(&instrument_ids);
 
         let params = RangeQueryParams {
             dataset,
@@ -315,9 +343,10 @@ impl DatabentoHistoricalClient {
         })
     }
 
+    /// Fetches imbalance data for the given parameters.
     #[pyo3(name = "get_range_imbalance")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None))]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_range_imbalance<'py>(
         &self,
         py: Python<'py>,
@@ -329,9 +358,7 @@ impl DatabentoHistoricalClient {
         price_precision: Option<u8>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let symbols = inner
-            .prepare_symbols_from_instrument_ids(&instrument_ids)
-            .map_err(to_pyvalue_err)?;
+        let symbols = inner.prepare_symbols_from_instrument_ids(&instrument_ids);
 
         let params = RangeQueryParams {
             dataset,
@@ -351,9 +378,10 @@ impl DatabentoHistoricalClient {
         })
     }
 
+    /// Fetches statistics data for the given parameters.
     #[pyo3(name = "get_range_statistics")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None, price_precision=None))]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_get_range_statistics<'py>(
         &self,
         py: Python<'py>,
@@ -365,9 +393,7 @@ impl DatabentoHistoricalClient {
         price_precision: Option<u8>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let symbols = inner
-            .prepare_symbols_from_instrument_ids(&instrument_ids)
-            .map_err(to_pyvalue_err)?;
+        let symbols = inner.prepare_symbols_from_instrument_ids(&instrument_ids);
 
         let params = RangeQueryParams {
             dataset,
@@ -387,9 +413,10 @@ impl DatabentoHistoricalClient {
         })
     }
 
+    /// Fetches status data for the given parameters.
     #[pyo3(name = "get_range_status")]
     #[pyo3(signature = (dataset, instrument_ids, start, end=None, limit=None))]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_get_range_status<'py>(
         &self,
         py: Python<'py>,
@@ -400,9 +427,7 @@ impl DatabentoHistoricalClient {
         limit: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let symbols = inner
-            .prepare_symbols_from_instrument_ids(&instrument_ids)
-            .map_err(to_pyvalue_err)?;
+        let symbols = inner.prepare_symbols_from_instrument_ids(&instrument_ids);
 
         let params = RangeQueryParams {
             dataset,

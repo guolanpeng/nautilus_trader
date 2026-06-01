@@ -15,7 +15,7 @@
 
 //! Sandbox example replaying Tardis Machine data through a LiveNode.
 //!
-//! Run with: `cargo run --example tardis-data-tester -p nautilus-tardis`
+//! Run with: `cargo run --example tardis-data-tester -p nautilus-tardis --features examples`
 //!
 //! Prerequisites:
 //! - Set `TARDIS_API_KEY` (used by the HTTP client to fetch instrument metadata)
@@ -26,9 +26,11 @@
 use chrono::NaiveDate;
 use nautilus_common::enums::Environment;
 use nautilus_live::node::LiveNode;
-use nautilus_model::identifiers::{ClientId, InstrumentId, TraderId};
+use nautilus_model::identifiers::{InstrumentId, TraderId};
 use nautilus_tardis::{
-    config::TardisDataClientConfig, enums::TardisExchange, factories::TardisDataClientFactory,
+    common::{consts::TARDIS_CLIENT_ID, enums::TardisExchange},
+    config::TardisDataClientConfig,
+    factories::TardisDataClientFactory,
     machine::types::ReplayNormalizedRequestOptions,
 };
 use nautilus_testkit::testers::{DataTester, DataTesterConfig};
@@ -51,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let client_id = ClientId::new("TARDIS");
+    let client_id = *TARDIS_CLIENT_ID;
     let instrument_ids = vec![InstrumentId::from("BTCUSDT-PERP.BINANCE")];
 
     let mut node = LiveNode::builder(TraderId::from("TESTER-001"), Environment::Sandbox)?
@@ -64,9 +66,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?
         .build()?;
 
-    let tester_config = DataTesterConfig::new(client_id, instrument_ids)
-        .with_subscribe_trades(true)
-        .with_subscribe_book_deltas(true);
+    let tester_config = DataTesterConfig::builder()
+        .client_id(client_id)
+        .instrument_ids(instrument_ids)
+        .subscribe_quotes(true)
+        .subscribe_trades(true)
+        .subscribe_mark_prices(true)
+        .subscribe_index_prices(true)
+        .subscribe_funding_rates(true)
+        // .subscribe_book_deltas(true)
+        .manage_book(true)
+        .build();
     let tester = DataTester::new(tester_config);
 
     node.add_actor(tester)?;

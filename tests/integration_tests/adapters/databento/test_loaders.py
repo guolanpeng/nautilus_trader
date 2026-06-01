@@ -16,6 +16,7 @@
 import pytest
 
 from nautilus_trader import TEST_DATA_DIR
+from nautilus_trader.adapters.databento import loaders as loaders_module
 from nautilus_trader.adapters.databento.loaders import DatabentoDataLoader
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.model.currencies import USD
@@ -47,21 +48,34 @@ DATABENTO_TEST_DATA_DIR = TEST_DATA_DIR / "databento"
 REPO_ROOT = TEST_DATA_DIR.parents[1]
 DATABENTO_RUST_TEST_DATA_DIR = REPO_ROOT / "crates" / "adapters" / "databento" / "test_data"
 
+# Symbols carried by the bundled DBN test data; all instruments are USD-priced
+# (precision 2). The loader no longer falls back to a default precision, so
+# we seed the cache here for tests that load market data without first loading
+# the matching DEFINITION schema.
+_TEST_SYMBOLS_PRICE_PRECISION_2 = ("ESH1", "ESM4", "ESU4", "ESH4", "SPOT")
+
+
+def _make_loader() -> DatabentoDataLoader:
+    loader = DatabentoDataLoader()
+    for symbol in _TEST_SYMBOLS_PRICE_PRECISION_2:
+        loader.set_price_precision(symbol, 2)
+    return loader
+
 
 def test_get_publishers() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
 
     # Act
     result = loader.get_publishers()
 
     # Assert
-    assert len(result) == 107  # From built-in map
+    assert len(result) == 110  # From built-in map
 
 
 def test_loader_definition_glbx_futures() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_TEST_DATA_DIR / "definition-glbx-es-fut.dbn.zst"
 
     # Act
@@ -91,7 +105,7 @@ def test_loader_definition_glbx_futures() -> None:
 
 def test_loader_definition_xcme_futures() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_TEST_DATA_DIR / "definition-glbx-es-fut.dbn.zst"
 
     # Act
@@ -121,7 +135,7 @@ def test_loader_definition_xcme_futures() -> None:
 
 def test_loader_definition_glbx_options() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_TEST_DATA_DIR / "definition-glbx-es-opt.dbn.zst"
 
     # Act
@@ -153,7 +167,7 @@ def test_loader_definition_glbx_options() -> None:
 
 def test_loader_definition_opra_pillar() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_TEST_DATA_DIR / "definition-opra.dbn.zst"
 
     # Act
@@ -185,7 +199,7 @@ def test_loader_definition_opra_pillar() -> None:
 
 def test_loader_xnasitch_definition() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.definition.dbn.zst"
 
     # Act
@@ -214,7 +228,7 @@ def test_loader_xnasitch_definition() -> None:
 
 def test_loader_mbo() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.mbo.dbn.zst"
 
     # Act
@@ -239,7 +253,7 @@ def test_loader_mbo() -> None:
 
 def test_loader_mbo_pyo3() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.mbo.dbn.zst"
 
     # Act
@@ -264,7 +278,7 @@ def test_loader_mbo_pyo3() -> None:
 
 def test_loader_mbp_1() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.mbp-1.dbn.zst"
 
     # Act
@@ -284,9 +298,32 @@ def test_loader_mbp_1() -> None:
     assert quote.ts_init == 1609160400006136329
 
 
+def test_loader_legacy_cython_drops_capsule(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange
+    loader = _make_loader()
+    path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.mbp-1.dbn.zst"
+    drop_call_count = 0
+    original_drop = loaders_module.drop_cvec_pycapsule
+
+    def counting_drop(capsule) -> None:
+        nonlocal drop_call_count
+        drop_call_count += 1
+        original_drop(capsule)
+
+    monkeypatch.setattr(loaders_module, "drop_cvec_pycapsule", counting_drop)
+
+    # Act
+    data = loader.from_dbn_file(path, as_legacy_cython=True)
+
+    # Assert
+    assert len(data) == 2
+    assert isinstance(data[0], QuoteTick)
+    assert drop_call_count == 1
+
+
 def test_loader_mbp_1_pyo3() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.mbp-1.dbn.zst"
 
     # Act
@@ -308,7 +345,7 @@ def test_loader_mbp_1_pyo3() -> None:
 
 def test_loader_bbo_1s() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.bbo-1s.dbn.zst"
 
     # Act
@@ -329,7 +366,7 @@ def test_loader_bbo_1s() -> None:
 
 def test_loader_bbo_1s_pyo3() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.bbo-1s.dbn.zst"
 
     # Act
@@ -350,7 +387,7 @@ def test_loader_bbo_1s_pyo3() -> None:
 
 def test_loader_bbo_1m() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.bbo-1m.dbn.zst"
 
     # Act
@@ -371,7 +408,7 @@ def test_loader_bbo_1m() -> None:
 
 def test_loader_bbo_1m_pyo3() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.bbo-1m.dbn.zst"
 
     # Act
@@ -392,7 +429,7 @@ def test_loader_bbo_1m_pyo3() -> None:
 
 def test_loader_mbp_10() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.mbp-10.dbn.zst"
 
     # Act
@@ -426,7 +463,7 @@ def test_loader_mbp_10() -> None:
 
 def test_loader_mbp_10_pyo3() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.mbp-10.dbn.zst"
 
     # Act
@@ -460,7 +497,7 @@ def test_loader_mbp_10_pyo3() -> None:
 
 def test_loader_tbbo_quotes() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.tbbo.dbn.zst"
 
     # Act
@@ -481,7 +518,7 @@ def test_loader_tbbo_quotes() -> None:
 
 def test_loader_tbbo_quotes_pyo3() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.tbbo.dbn.zst"
 
     # Act
@@ -502,7 +539,7 @@ def test_loader_tbbo_quotes_pyo3() -> None:
 
 def test_loader_tbbo_quotes_and_trades() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.tbbo.dbn.zst"
 
     # Act
@@ -538,7 +575,7 @@ def test_loader_tbbo_quotes_and_trades() -> None:
 
 def test_loader_trades() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.trades.dbn.zst"
 
     # Act
@@ -560,7 +597,7 @@ def test_loader_trades() -> None:
 
 def test_loader_trades_pyo3() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.trades.dbn.zst"
 
     # Act
@@ -582,7 +619,7 @@ def test_loader_trades_pyo3() -> None:
 
 def test_loader_ohlcv_1s() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.ohlcv-1s.dbn.zst"
 
     # Act
@@ -615,7 +652,7 @@ def test_loader_with_ohlcv_1m_pyo3(
     expected_ts_event: int,
 ) -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.ohlcv-1m.dbn.zst"
 
     # Act
@@ -639,7 +676,7 @@ def test_loader_with_ohlcv_1m_pyo3(
 
 def test_loader_with_ohlcv_1h() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.ohlcv-1h.dbn.zst"
 
     # Act
@@ -658,7 +695,7 @@ def test_loader_with_ohlcv_1h() -> None:
 
 def test_loader_with_ohlcv_1d() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.ohlcv-1d.dbn.zst"
 
     # Act
@@ -670,7 +707,7 @@ def test_loader_with_ohlcv_1d() -> None:
 
 def test_load_order_book_deltas() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.mbo.dbn.zst"
 
     # Act
@@ -684,7 +721,7 @@ def test_load_order_book_deltas() -> None:
 
 def test_load_order_book_depth10_pyo3() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.mbp-10.dbn.zst"
 
     # Act
@@ -698,7 +735,7 @@ def test_load_order_book_depth10_pyo3() -> None:
 
 def test_load_quote_ticks() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.mbp-1.dbn.zst"
 
     # Act
@@ -712,7 +749,7 @@ def test_load_quote_ticks() -> None:
 
 def test_load_mixed_ticks() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.tbbo.dbn.zst"
 
     # Act
@@ -726,7 +763,7 @@ def test_load_mixed_ticks() -> None:
 
 def test_load_trade_ticks() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.trades.dbn.zst"
 
     # Act
@@ -773,7 +810,7 @@ def test_load_bars(
     ts_init: int,
 ) -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / filename
 
     # Act
@@ -792,7 +829,7 @@ def test_load_bars(
 
 def test_load_status() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.status.dbn.zst"
 
     # Act
@@ -813,7 +850,7 @@ def test_load_status() -> None:
 
 def test_load_status_pyo3() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.status.dbn.zst"
 
     # Act
@@ -834,7 +871,7 @@ def test_load_status_pyo3() -> None:
 
 def test_load_imbalance() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.imbalance.dbn.zst"
 
     # Act
@@ -848,7 +885,7 @@ def test_load_imbalance() -> None:
 
 def test_load_statistics() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     path = DATABENTO_RUST_TEST_DATA_DIR / "test_data.statistics.dbn.zst"
     instrument_id = nautilus_pyo3.InstrumentId.from_str("ESM4.GLBX")
 
@@ -863,7 +900,7 @@ def test_load_statistics() -> None:
 
 def test_loader_cmbp_1() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     # Use the test data from the Rust crate
     path = (
         REPO_ROOT / "crates" / "adapters" / "databento" / "test_data" / "test_data.cmbp-1.dbn.zst"
@@ -889,7 +926,7 @@ def test_loader_cmbp_1() -> None:
 
 def test_loader_cmbp_1_pyo3() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     # Use the test data from the Rust crate
     path = (
         REPO_ROOT / "crates" / "adapters" / "databento" / "test_data" / "test_data.cmbp-1.dbn.zst"
@@ -915,7 +952,7 @@ def test_loader_cmbp_1_pyo3() -> None:
 
 def test_loader_cbbo_1s() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     # Use the test data from the Rust crate
     path = (
         REPO_ROOT / "crates" / "adapters" / "databento" / "test_data" / "test_data.cbbo-1s.dbn.zst"
@@ -943,7 +980,7 @@ def test_loader_cbbo_1s() -> None:
 
 def test_loader_cbbo_1s_pyo3() -> None:
     # Arrange
-    loader = DatabentoDataLoader()
+    loader = _make_loader()
     # Use the test data from the Rust crate
     path = (
         REPO_ROOT / "crates" / "adapters" / "databento" / "test_data" / "test_data.cbbo-1s.dbn.zst"

@@ -27,7 +27,7 @@ use nautilus_core::{
 };
 use nautilus_model::{
     identifiers::{ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
-    types::Currency,
+    types::{Currency, Price},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -37,11 +37,14 @@ use super::error::AxWsErrorResponse;
 use crate::{
     common::{
         enums::{
-            AxCancelReason, AxCancelRejectionReason, AxCandleWidth, AxMarketDataLevel,
-            AxMdRequestType, AxOrderRequestType, AxOrderSide, AxOrderStatus, AxOrderType,
-            AxOrderWsMessageType, AxTimeInForce,
+            AxCancelReason, AxCancelRejectionReason, AxCandleWidth, AxInstrumentState,
+            AxMarketDataLevel, AxMdRequestType, AxOrderRequestType, AxOrderSide, AxOrderStatus,
+            AxOrderType, AxOrderWsMessageType, AxTimeInForce,
         },
-        parse::{deserialize_decimal_or_zero, deserialize_optional_decimal_or_zero},
+        parse::{
+            deserialize_decimal_or_zero, deserialize_optional_decimal_from_str,
+            deserialize_optional_decimal_or_zero,
+        },
     },
     http::models::AxOrderRejectReason,
 };
@@ -244,6 +247,21 @@ pub struct AxMdTicker {
     /// Open interest.
     #[serde(default)]
     pub oi: Option<i64>,
+    /// Mark price.
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
+    pub m: Option<Decimal>,
+    /// Instrument state.
+    #[serde(default)]
+    pub i: Option<AxInstrumentState>,
+    /// Price band lower limit.
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
+    pub pl: Option<Decimal>,
+    /// Price band upper limit.
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
+    pub pu: Option<Decimal>,
+    /// Last settlement price.
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
+    pub lsp: Option<Decimal>,
 }
 
 /// Trade message from market data WebSocket.
@@ -356,6 +374,9 @@ pub struct AxMdBookL2 {
     pub b: Vec<AxBookLevel>,
     /// Ask levels.
     pub a: Vec<AxBookLevel>,
+    /// Whether this update is a full snapshot.
+    #[serde(default)]
+    pub st: bool,
 }
 
 /// Level 3 order book update (individual order quantities).
@@ -374,6 +395,9 @@ pub struct AxMdBookL3 {
     pub b: Vec<AxBookLevelL3>,
     /// Ask levels with order breakdown.
     pub a: Vec<AxBookLevelL3>,
+    /// Whether this update is a full snapshot.
+    #[serde(default)]
+    pub st: bool,
 }
 
 /// Place order request via WebSocket.
@@ -934,6 +958,8 @@ pub struct OrderMetadata {
     pub price_precision: u8,
     /// Quote currency for the instrument.
     pub quote_currency: Currency,
+    /// Pending trigger price from a modify command (WS does not carry this).
+    pub pending_trigger_price: Option<Price>,
 }
 
 #[cfg(test)]
@@ -1111,6 +1137,17 @@ mod tests {
         let json = include_str!("../../test_data/ws_md_ticker.json");
         let msg: AxMdTicker = serde_json::from_str(json).unwrap();
         assert_eq!(msg.s.as_str(), "EURUSD-PERP");
+        assert_eq!(msg.m, Some(dec!(50010.50)));
+        assert_eq!(msg.i, Some(AxInstrumentState::Open));
+    }
+
+    #[rstest]
+    fn test_load_md_ticker_captured_optional_fields_default_to_none() {
+        let json = include_str!("../../test_data/ws_md_ticker_captured.json");
+        let msg: AxMdTicker = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.s.as_str(), "EURUSD-PERP");
+        assert_eq!(msg.m, None);
+        assert_eq!(msg.i, None);
     }
 
     #[rstest]
@@ -1272,60 +1309,61 @@ mod tests {
         assert_eq!(orders[1].oid, "O-01KF4QM3K9FJZWYA02JF9Y1FJA");
     }
 
-    #[rstest]
-    fn test_raw_message_error_variant() {
-        let json = include_str!("../../test_data/ws_order_error_response.json");
-        let msg = parse_order_message(json).unwrap();
-        assert!(matches!(msg, AxOrdersWsFrame::Error(_)));
+    #[derive(Debug, Eq, PartialEq)]
+    enum FrameKind {
+        Error,
+        ListResponse,
+        AcknowledgedEvent,
+        PlaceResponse,
+        CancelResponse,
+        OpenOrdersResponse,
+    }
+
+    fn classify(frame: &AxOrdersWsFrame) -> FrameKind {
+        match frame {
+            AxOrdersWsFrame::Error(_) => FrameKind::Error,
+            AxOrdersWsFrame::Response(AxWsOrderResponse::List(_)) => FrameKind::ListResponse,
+            AxOrdersWsFrame::Response(AxWsOrderResponse::PlaceOrder(_)) => FrameKind::PlaceResponse,
+            AxOrdersWsFrame::Response(AxWsOrderResponse::CancelOrder(_)) => {
+                FrameKind::CancelResponse
+            }
+            AxOrdersWsFrame::Response(AxWsOrderResponse::OpenOrders(_)) => {
+                FrameKind::OpenOrdersResponse
+            }
+            AxOrdersWsFrame::Event(e) => match **e {
+                AxWsOrderEvent::Acknowledged(_) => FrameKind::AcknowledgedEvent,
+                _ => panic!("unexpected event variant"),
+            },
+        }
     }
 
     #[rstest]
-    fn test_raw_message_list_response_variant() {
-        let json = include_str!("../../test_data/ws_order_list_response.json");
-        let msg = parse_order_message(json).unwrap();
-        assert!(matches!(
-            msg,
-            AxOrdersWsFrame::Response(AxWsOrderResponse::List(_))
-        ));
-    }
-
-    #[rstest]
-    fn test_raw_message_event_variant() {
-        let json = include_str!("../../test_data/ws_order_acknowledged.json");
-        let msg = parse_order_message(json).unwrap();
-        assert!(matches!(
-            msg,
-            AxOrdersWsFrame::Event(ref e) if matches!(**e, AxWsOrderEvent::Acknowledged(_))
-        ));
-    }
-
-    #[rstest]
-    fn test_raw_message_place_response_variant() {
-        let json = include_str!("../../test_data/ws_order_place_response.json");
-        let msg = parse_order_message(json).unwrap();
-        assert!(matches!(
-            msg,
-            AxOrdersWsFrame::Response(AxWsOrderResponse::PlaceOrder(_))
-        ));
-    }
-
-    #[rstest]
-    fn test_raw_message_cancel_response_variant() {
-        let json = include_str!("../../test_data/ws_order_cancel_response.json");
-        let msg = parse_order_message(json).unwrap();
-        assert!(matches!(
-            msg,
-            AxOrdersWsFrame::Response(AxWsOrderResponse::CancelOrder(_))
-        ));
-    }
-
-    #[rstest]
-    fn test_raw_message_open_orders_response_variant() {
-        let json = include_str!("../../test_data/ws_order_open_orders_response.json");
-        let msg = parse_order_message(json).unwrap();
-        assert!(matches!(
-            msg,
-            AxOrdersWsFrame::Response(AxWsOrderResponse::OpenOrders(_))
-        ));
+    #[case::error(
+        include_str!("../../test_data/ws_order_error_response.json"),
+        FrameKind::Error,
+    )]
+    #[case::list(
+        include_str!("../../test_data/ws_order_list_response.json"),
+        FrameKind::ListResponse,
+    )]
+    #[case::acknowledged_event(
+        include_str!("../../test_data/ws_order_acknowledged.json"),
+        FrameKind::AcknowledgedEvent,
+    )]
+    #[case::place_response(
+        include_str!("../../test_data/ws_order_place_response.json"),
+        FrameKind::PlaceResponse,
+    )]
+    #[case::cancel_response(
+        include_str!("../../test_data/ws_order_cancel_response.json"),
+        FrameKind::CancelResponse,
+    )]
+    #[case::open_orders(
+        include_str!("../../test_data/ws_order_open_orders_response.json"),
+        FrameKind::OpenOrdersResponse,
+    )]
+    fn test_parse_order_message_variants(#[case] json: &str, #[case] expected: FrameKind) {
+        let msg = parse_order_message(json).expect("should parse");
+        assert_eq!(classify(&msg), expected);
     }
 }

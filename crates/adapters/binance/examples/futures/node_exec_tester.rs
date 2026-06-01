@@ -15,27 +15,29 @@
 
 //! Example demonstrating live execution testing with the Binance Futures USD-M adapter.
 //!
-//! Run with: `cargo run --example binance-futures-exec-tester --package nautilus-binance`
+//! Run with: `cargo run --example binance-futures-exec-tester --package nautilus-binance --features examples`
 //!
-//! Requires environment variables based on the configured environment
-//! (Ed25519 keys are auto-detected):
-//! - Mainnet: `BINANCE_API_KEY` / `BINANCE_API_SECRET`
-//! - Testnet (Spot): `BINANCE_TESTNET_API_KEY` / `BINANCE_TESTNET_API_SECRET`
-//! - Testnet (Futures): `BINANCE_FUTURES_TESTNET_API_KEY` / `BINANCE_FUTURES_TESTNET_API_SECRET`
-//! - Demo: `BINANCE_DEMO_API_KEY` / `BINANCE_DEMO_API_SECRET`
+//! Requires environment variables (Ed25519 keys are auto-detected):
+//! - Testnet: `BINANCE_FUTURES_TESTNET_API_KEY` / `BINANCE_FUTURES_TESTNET_API_SECRET`
+//!
+//! Create testnet credentials from the Binance Futures testnet platform.
 
 use nautilus_binance::{
-    common::enums::{BinanceEnvironment, BinanceProductType},
+    common::{
+        consts::BINANCE_CLIENT_ID,
+        enums::{BinanceEnvironment, BinanceProductType},
+    },
     config::{BinanceDataClientConfig, BinanceExecClientConfig},
     factories::{BinanceDataClientFactory, BinanceExecutionClientFactory},
 };
 use nautilus_common::enums::Environment;
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
-    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId},
+    identifiers::{AccountId, InstrumentId, StrategyId, TraderId},
     types::Quantity,
 };
 use nautilus_testkit::testers::{ExecTester, ExecTesterConfig};
+use nautilus_trading::strategy::StrategyConfig;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("BINANCE-FUTURES-001");
     let node_name = "BINANCE-FUTURES-EXEC-TESTER-001".to_string();
-    let client_id = ClientId::new("BINANCE");
+    let client_id = *BINANCE_CLIENT_ID;
     let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
 
     let data_config = BinanceDataClientConfig {
@@ -78,22 +80,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let order_qty = Quantity::from("0.01"); // Small quantity for testing
 
-    let mut tester_config = ExecTesterConfig::new(
-        StrategyId::from("EXEC_TESTER-001"),
-        instrument_id,
-        client_id,
-        order_qty,
-    )
-    .with_log_data(false)
-    .with_open_position_on_start(order_qty.as_decimal())
-    .with_cancel_orders_on_stop(true)
-    .with_close_positions_on_stop(true);
-
-    // Use UUIDs for unique client order IDs across restarts
-    tester_config.base.use_uuid_client_order_ids = true;
-
-    tester_config.base.external_order_claims = Some(vec![instrument_id]);
-    tester_config.use_post_only = true;
+    let tester_config = ExecTesterConfig::builder()
+        .base(StrategyConfig {
+            strategy_id: Some(StrategyId::from("EXEC_TESTER-001")),
+            external_order_claims: Some(vec![instrument_id]),
+            ..Default::default()
+        })
+        .instrument_id(instrument_id)
+        .client_id(client_id)
+        .order_qty(order_qty)
+        .log_data(false)
+        .open_position_on_start_qty(order_qty.as_decimal())
+        .use_post_only(true)
+        .build();
 
     let tester = ExecTester::new(tester_config);
 

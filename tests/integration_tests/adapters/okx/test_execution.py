@@ -29,10 +29,15 @@ from nautilus_trader.execution.messages import CancelOrder
 from nautilus_trader.execution.messages import GenerateFillReports
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
+from nautilus_trader.execution.messages import ModifyOrder
+from nautilus_trader.execution.messages import SubmitOrder
+from nautilus_trader.execution.messages import SubmitOrderList
+from nautilus_trader.model.enums import ContingencyType
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TriggerType
+from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.events import OrderDenied
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.events import OrderUpdated
@@ -44,7 +49,9 @@ from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import LimitOrder
+from nautilus_trader.model.orders import MarketIfTouchedOrder
 from nautilus_trader.model.orders import MarketOrder
+from nautilus_trader.model.orders import OrderList
 from nautilus_trader.model.orders import StopMarketOrder
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
@@ -110,6 +117,68 @@ def exec_client_builder(
     return builder
 
 
+def _build_bracket_order_list(
+    instrument_id: InstrumentId,
+) -> tuple[OrderList, MarketOrder, StopMarketOrder, MarketIfTouchedOrder]:
+    order_list_id = TestIdStubs.order_list_id()
+    entry_order = MarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument_id,
+        client_order_id=ClientOrderId("O-bracket-entry"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.010000"),
+        time_in_force=TimeInForce.GTC,
+        contingency_type=ContingencyType.OTO,
+        order_list_id=order_list_id,
+        linked_order_ids=[ClientOrderId("O-bracket-sl"), ClientOrderId("O-bracket-tp")],
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    sl_order = StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument_id,
+        client_order_id=ClientOrderId("O-bracket-sl"),
+        order_side=OrderSide.SELL,
+        quantity=entry_order.quantity,
+        trigger_price=Price.from_str("39000.00"),
+        trigger_type=TriggerType.DEFAULT,
+        time_in_force=TimeInForce.GTC,
+        reduce_only=True,
+        contingency_type=ContingencyType.OUO,
+        order_list_id=order_list_id,
+        linked_order_ids=[ClientOrderId("O-bracket-tp")],
+        parent_order_id=entry_order.client_order_id,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    tp_order = MarketIfTouchedOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument_id,
+        client_order_id=ClientOrderId("O-bracket-tp"),
+        order_side=OrderSide.SELL,
+        quantity=entry_order.quantity,
+        trigger_price=Price.from_str("41000.00"),
+        trigger_type=TriggerType.DEFAULT,
+        time_in_force=TimeInForce.GTC,
+        reduce_only=True,
+        contingency_type=ContingencyType.OUO,
+        order_list_id=order_list_id,
+        linked_order_ids=[sl_order.client_order_id],
+        parent_order_id=entry_order.client_order_id,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    return (
+        OrderList(order_list_id=order_list_id, orders=[entry_order, sl_order, tp_order]),
+        entry_order,
+        sl_order,
+        tp_order,
+    )
+
+
 @pytest.mark.asyncio
 async def test_connect_success(exec_client_builder, monkeypatch):
     # Arrange
@@ -137,6 +206,9 @@ async def test_connect_success(exec_client_builder, monkeypatch):
         business_ws.subscribe_orders_algo.assert_awaited_once_with(
             nautilus_pyo3.OKXInstrumentType.SPOT,
         )
+        business_ws.subscribe_algo_advance.assert_awaited_once_with(
+            nautilus_pyo3.OKXInstrumentType.SPOT,
+        )
         private_ws.subscribe_fills.assert_not_called()
         private_ws.subscribe_account.assert_awaited_once()
     finally:
@@ -146,6 +218,31 @@ async def test_connect_success(exec_client_builder, monkeypatch):
     http_client.cancel_all_requests.assert_called_once()
     private_ws.close.assert_awaited_once()
     business_ws.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_connect_events_skips_algo_channels(exec_client_builder, monkeypatch):
+    # Arrange
+    client, private_ws, business_ws, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.EVENTS,)},
+    )
+
+    monkeypatch.setattr(client, "_await_account_registered", AsyncMock())
+
+    # Act
+    await client._connect()
+
+    try:
+        # Assert
+        private_ws.subscribe_orders.assert_awaited_once_with(nautilus_pyo3.OKXInstrumentType.EVENTS)
+        business_ws.subscribe_orders_algo.assert_not_called()
+        business_ws.subscribe_algo_advance.assert_not_called()
+    finally:
+        await client._disconnect()
+
+    # Assert
+    http_client.cancel_all_requests.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -177,6 +274,39 @@ async def test_generate_order_status_reports_converts_results(exec_client_builde
     # Assert
     http_client.request_order_status_reports.assert_awaited_once()
     assert reports == [expected_report]
+
+
+@pytest.mark.asyncio
+async def test_generate_order_status_reports_load_spreads_uses_generic_request(
+    exec_client_builder,
+    monkeypatch,
+):
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"load_spreads": True},
+    )
+    http_client.request_order_status_reports.return_value = []
+
+    command = GenerateOrderStatusReports(
+        instrument_id=None,
+        start=None,
+        end=None,
+        open_only=True,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act
+    reports = await client.generate_order_status_reports(command)
+
+    # Assert
+    assert reports == []
+    calls = http_client.request_order_status_reports.await_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs["instrument_type"] == nautilus_pyo3.OKXInstrumentType.SPOT
+    assert "instrument_type" not in calls[1].kwargs
+    assert "instrument_id" not in calls[1].kwargs
 
 
 @pytest.mark.asyncio
@@ -229,6 +359,39 @@ async def test_generate_fill_reports_converts_results(exec_client_builder, monke
     # Assert
     http_client.request_fill_reports.assert_awaited_once()
     assert reports == [expected_report]
+
+
+@pytest.mark.asyncio
+async def test_generate_fill_reports_load_spreads_uses_generic_request(
+    exec_client_builder,
+    monkeypatch,
+):
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"load_spreads": True},
+    )
+    http_client.request_fill_reports.return_value = []
+
+    command = GenerateFillReports(
+        instrument_id=None,
+        venue_order_id=None,
+        start=None,
+        end=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act
+    reports = await client.generate_fill_reports(command)
+
+    # Assert
+    assert reports == []
+    calls = http_client.request_fill_reports.await_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs["instrument_type"] == nautilus_pyo3.OKXInstrumentType.SPOT
+    assert "instrument_type" not in calls[1].kwargs
+    assert "instrument_id" not in calls[1].kwargs
 
 
 @pytest.mark.asyncio
@@ -674,6 +837,7 @@ async def test_cancel_all_orders_uses_batch_cancel_by_default(
 
     # Create 5 open orders
     orders = []
+
     for i in range(5):
         order = LimitOrder(
             trader_id=TestIdStubs.trader_id(),
@@ -741,6 +905,7 @@ async def test_cancel_all_orders_batches_in_chunks_of_20(
 
     # Create 45 open orders and add to cache
     orders = []
+
     for i in range(45):
         order = LimitOrder(
             trader_id=TestIdStubs.trader_id(),
@@ -819,6 +984,7 @@ async def test_cancel_all_orders_handles_mixed_regular_and_algo_orders(
 
     # Create 3 regular orders
     regular_orders = []
+
     for i in range(3):
         order = LimitOrder(
             trader_id=TestIdStubs.trader_id(),
@@ -843,6 +1009,7 @@ async def test_cancel_all_orders_handles_mixed_regular_and_algo_orders(
 
     # Create 2 algo orders and register them in _algo_order_ids
     algo_client_ids = []
+
     for i in range(2):
         client_id = ClientOrderId(f"O-algo-{i}")
         algo_client_ids.append(client_id)
@@ -851,7 +1018,7 @@ async def test_cancel_all_orders_handles_mixed_regular_and_algo_orders(
         client._algo_order_instruments[client_id] = instrument.id
 
     # Mock the HTTP cancel_algo_order call
-    http_client.cancel_algo_order = AsyncMock()
+    http_client.cancel_algo_order = AsyncMock(return_value={"s_code": "0"})
 
     # Act - Create batch with regular orders only (algo orders should be skipped)
     regular_cancels = [
@@ -896,8 +1063,678 @@ async def test_cancel_all_orders_handles_mixed_regular_and_algo_orders(
 
 
 # =====================================================================================
+# Bracket Order List Tests
+# =====================================================================================
+
+
+@pytest.mark.asyncio
+async def test_submit_order_list_bracket_uses_rest_parent_submit_with_attached_oco(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # Arrange
+    client, private_ws, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    client._cache.add_instrument(instrument)
+    http_client.place_order = AsyncMock(
+        return_value={
+            "ord_id": "ord-123",
+            "cl_ord_id": "O-bracket-entry",
+            "s_code": "0",
+        },
+    )
+    rejected_reasons: list[str] = []
+    monkeypatch.setattr(
+        client,
+        "generate_order_rejected",
+        lambda **kwargs: rejected_reasons.append(kwargs["reason"]),
+    )
+
+    order_list_id = TestIdStubs.order_list_id()
+    entry_order = LimitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-bracket-entry"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("0.010000"),
+        price=Price.from_str("40000.00"),
+        time_in_force=TimeInForce.GTC,
+        contingency_type=ContingencyType.OTO,
+        order_list_id=order_list_id,
+        linked_order_ids=[ClientOrderId("O-bracket-sl"), ClientOrderId("O-bracket-tp")],
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    sl_order = StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-bracket-sl"),
+        order_side=OrderSide.SELL,
+        quantity=entry_order.quantity,
+        trigger_price=Price.from_str("39000.00"),
+        trigger_type=TriggerType.DEFAULT,
+        time_in_force=TimeInForce.GTC,
+        reduce_only=True,
+        contingency_type=ContingencyType.OUO,
+        order_list_id=order_list_id,
+        linked_order_ids=[ClientOrderId("O-bracket-tp")],
+        parent_order_id=entry_order.client_order_id,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    tp_order = MarketIfTouchedOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-bracket-tp"),
+        order_side=OrderSide.SELL,
+        quantity=entry_order.quantity,
+        trigger_price=Price.from_str("41000.00"),
+        trigger_type=TriggerType.DEFAULT,
+        time_in_force=TimeInForce.GTC,
+        reduce_only=True,
+        contingency_type=ContingencyType.OUO,
+        order_list_id=order_list_id,
+        linked_order_ids=[sl_order.client_order_id],
+        parent_order_id=entry_order.client_order_id,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    order_list = OrderList(
+        order_list_id=order_list_id,
+        orders=[entry_order, sl_order, tp_order],
+    )
+    command = SubmitOrderList(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        order_list=order_list,
+        position_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act
+    await client._submit_order_list(command)
+
+    # Assert
+    assert rejected_reasons == []
+    http_client.place_order.assert_awaited_once()
+    private_ws.submit_order.assert_not_called()
+    call = http_client.place_order.await_args
+    assert call is not None
+    attach_algo_ords = call.kwargs["attach_algo_ords"]
+    assert len(attach_algo_ords) == 1
+    assert attach_algo_ords[0]["attach_algo_cl_ord_id"] == "O-bracket-sl"
+    assert attach_algo_ords[0]["sl_trigger_px"] == "39000.00"
+    assert attach_algo_ords[0]["sl_ord_px"] == "-1"
+    assert attach_algo_ords[0]["tp_trigger_px"] == "41000.00"
+    assert attach_algo_ords[0]["tp_ord_px"] == "-1"
+    http_client.place_algo_order.assert_not_called()
+
+
+def test_merge_attach_algo_ords_rejects_bracket_and_params_overlap():
+    # Arrange
+    bracket_attach_algo_ords = [{"sl_trigger_px": "39000.00"}]
+    params = {"attach_algo_ords": [{"tp_trigger_px": "41000.00"}]}
+
+    # Act, Assert
+    with pytest.raises(ValueError, match="cannot be combined"):
+        OKXExecutionClient._merge_attach_algo_ords(bracket_attach_algo_ords, params)
+
+
+@pytest.mark.asyncio
+async def test_place_order_http_forwards_event_params(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        client_order_id=ClientOrderId("O-event-http"),
+        price=Price.from_str("40000.00"),
+        quantity=Quantity.from_str("0.010000"),
+    )
+    attach_algo_ords = [{"tp_trigger_px": "41000.00"}]
+    http_client.place_order = AsyncMock(return_value={"s_code": "0"})
+
+    # Act
+    await client._place_order_http(
+        order=order,
+        params={"speed_bump": 0, "outcome": "yes"},
+        attach_algo_ords=attach_algo_ords,
+    )
+
+    # Assert
+    http_client.place_order.assert_awaited_once()
+    call = http_client.place_order.await_args
+    assert call is not None
+    assert call.kwargs["attach_algo_ords"] == attach_algo_ords
+    assert call.kwargs["speed_bump"] == "0"
+    assert call.kwargs["outcome"] == "yes"
+
+
+@pytest.mark.asyncio
+async def test_submit_regular_order_websocket_forwards_event_params(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # Arrange
+    client, private_ws, _, _, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        client_order_id=ClientOrderId("O-event-ws"),
+        price=Price.from_str("40000.00"),
+        quantity=Quantity.from_str("0.010000"),
+    )
+    attach_algo_ords = [{"tp_trigger_px": "41000.00"}]
+    private_ws.submit_order = AsyncMock()
+
+    # Act
+    await client._submit_regular_order_websocket(
+        order=order,
+        params={"speed_bump": 0, "outcome": "yes"},
+        attach_algo_ords=attach_algo_ords,
+    )
+
+    # Assert
+    private_ws.submit_order.assert_awaited_once()
+    call = private_ws.submit_order.await_args
+    assert call is not None
+    assert call.kwargs["attach_algo_ords"] == attach_algo_ords
+    assert call.kwargs["speed_bump"] == "0"
+    assert call.kwargs["outcome"] == "yes"
+
+
+@pytest.mark.asyncio
+async def test_submit_order_websocket_rejects_invalid_attach_algo_ords_params(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # Arrange
+    client, private_ws, _, _, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        client_order_id=ClientOrderId("O-invalid-attach"),
+        price=Price.from_str("40000.00"),
+        quantity=Quantity.from_str("0.010000"),
+    )
+    command = SubmitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        order=order,
+        position_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        params={"attach_algo_ords": "bad"},
+    )
+    rejected_reasons: list[str] = []
+    private_ws.submit_order = AsyncMock()
+    monkeypatch.setattr(client, "generate_order_submitted", lambda **_: None)
+    monkeypatch.setattr(
+        client,
+        "generate_order_rejected",
+        lambda **kwargs: rejected_reasons.append(kwargs["reason"]),
+    )
+
+    # Act
+    await client._submit_order_websocket(command)
+
+    # Assert
+    assert rejected_reasons == ["OKX attach_algo_ords param must be a list of dicts"]
+    private_ws.submit_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_modify_order_websocket_forwards_speed_bump(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # Arrange
+    client, private_ws, _, _, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    order = TestExecStubs.limit_order(
+        instrument=instrument,
+        client_order_id=ClientOrderId("O-event-modify"),
+        price=Price.from_str("40000.00"),
+        quantity=Quantity.from_str("0.010000"),
+    )
+    command = ModifyOrder(
+        trader_id=order.trader_id,
+        strategy_id=order.strategy_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=None,
+        quantity=Quantity.from_str("0.020000"),
+        price=Price.from_str("40100.00"),
+        trigger_price=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        params={"speed_bump": 0},
+    )
+    private_ws.modify_order = AsyncMock()
+
+    # Act
+    await client._modify_order_websocket(command, order)
+
+    # Assert
+    private_ws.modify_order.assert_awaited_once()
+    call = private_ws.modify_order.await_args
+    assert call is not None
+    assert call.kwargs["speed_bump"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_attached_oco_status_report_accepts_both_logical_children(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    client._cache.add_instrument(instrument)
+    client._cache.add_account(TestExecStubs.cash_account(account_id=client.account_id))
+    client._set_connected(True)
+    http_client.place_order = AsyncMock(
+        return_value={
+            "ord_id": "ord-123",
+            "cl_ord_id": "O-bracket-entry",
+            "s_code": "0",
+        },
+    )
+
+    order_list, entry_order, sl_order, tp_order = _build_bracket_order_list(instrument.id)
+    for order in order_list.orders:
+        client._cache.add_order(order, None, None)
+
+    captured: list = []
+    monkeypatch.setattr(client, "_send_order_event", lambda event: captured.append(event))
+
+    command = SubmitOrderList(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        order_list=order_list,
+        position_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    await client._submit_order_list(command)
+    captured.clear()
+
+    pyo3_report = nautilus_pyo3.OrderStatusReport(
+        account_id=nautilus_pyo3.AccountId(client.account_id.value),
+        instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument.id.value),
+        venue_order_id=nautilus_pyo3.VenueOrderId("algo-oco-1"),
+        client_order_id=nautilus_pyo3.ClientOrderId(sl_order.client_order_id.value),
+        order_side=nautilus_pyo3.OrderSide.SELL,
+        order_type=nautilus_pyo3.OrderType.MARKET_IF_TOUCHED,
+        time_in_force=nautilus_pyo3.TimeInForce.GTC,
+        order_status=nautilus_pyo3.OrderStatus.ACCEPTED,
+        quantity=nautilus_pyo3.Quantity.from_str(str(sl_order.quantity)),
+        filled_qty=nautilus_pyo3.Quantity.from_str("0"),
+        trigger_price=nautilus_pyo3.Price.from_str("41000.00"),
+        trigger_type=nautilus_pyo3.TriggerType.DEFAULT,
+        reduce_only=True,
+        ts_accepted=0,
+        ts_last=0,
+        report_id=nautilus_pyo3.UUID4(),
+        ts_init=0,
+    )
+
+    # Act
+    client._handle_order_status_report_pyo3(pyo3_report)
+
+    # Assert
+    accepted_ids = sorted(
+        event.client_order_id for event in captured if isinstance(event, OrderAccepted)
+    )
+    assert accepted_ids == sorted([sl_order.client_order_id, tp_order.client_order_id])
+    assert not any(isinstance(event, OrderUpdated) for event in captured)
+    assert client._algo_order_ids[sl_order.client_order_id] == "algo-oco-1"
+    assert client._algo_order_ids[tp_order.client_order_id] == "algo-oco-1"
+    assert client._algo_order_instruments[sl_order.client_order_id] == entry_order.instrument_id
+    assert client._algo_order_instruments[tp_order.client_order_id] == entry_order.instrument_id
+
+
+@pytest.mark.asyncio
+async def test_attached_oco_status_report_rebuilds_binding_from_cached_orders(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    client._cache.add_instrument(instrument)
+    client._cache.add_account(TestExecStubs.cash_account(account_id=client.account_id))
+    client._set_connected(True)
+    http_client.place_order = AsyncMock(
+        return_value={
+            "ord_id": "ord-123",
+            "cl_ord_id": "O-bracket-entry",
+            "s_code": "0",
+        },
+    )
+
+    order_list, entry_order, sl_order, tp_order = _build_bracket_order_list(instrument.id)
+    for order in order_list.orders:
+        client._cache.add_order(order, None, None)
+
+    captured: list = []
+    monkeypatch.setattr(client, "_send_order_event", lambda event: captured.append(event))
+
+    command = SubmitOrderList(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        order_list=order_list,
+        position_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    await client._submit_order_list(command)
+    client._attached_oco_bindings.clear()
+    captured.clear()
+
+    pyo3_report = nautilus_pyo3.OrderStatusReport(
+        account_id=nautilus_pyo3.AccountId(client.account_id.value),
+        instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument.id.value),
+        venue_order_id=nautilus_pyo3.VenueOrderId("algo-oco-1"),
+        client_order_id=nautilus_pyo3.ClientOrderId(sl_order.client_order_id.value),
+        order_side=nautilus_pyo3.OrderSide.SELL,
+        order_type=nautilus_pyo3.OrderType.MARKET_IF_TOUCHED,
+        time_in_force=nautilus_pyo3.TimeInForce.GTC,
+        order_status=nautilus_pyo3.OrderStatus.ACCEPTED,
+        quantity=nautilus_pyo3.Quantity.from_str(str(sl_order.quantity)),
+        filled_qty=nautilus_pyo3.Quantity.from_str("0"),
+        trigger_price=nautilus_pyo3.Price.from_str("41000.00"),
+        trigger_type=nautilus_pyo3.TriggerType.DEFAULT,
+        reduce_only=True,
+        ts_accepted=0,
+        ts_last=0,
+        report_id=nautilus_pyo3.UUID4(),
+        ts_init=0,
+    )
+
+    # Act
+    client._handle_order_status_report_pyo3(pyo3_report)
+
+    # Assert
+    accepted_ids = sorted(
+        event.client_order_id for event in captured if isinstance(event, OrderAccepted)
+    )
+    assert accepted_ids == sorted([sl_order.client_order_id, tp_order.client_order_id])
+    assert client._attached_oco_binding(entry_order.client_order_id) is not None
+    assert client._algo_order_ids[sl_order.client_order_id] == "algo-oco-1"
+    assert client._algo_order_ids[tp_order.client_order_id] == "algo-oco-1"
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_for_attached_oco_secondary_child_uses_shared_algo_id(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    client._cache.add_instrument(instrument)
+    http_client.place_order = AsyncMock(
+        return_value={
+            "ord_id": "ord-123",
+            "cl_ord_id": "O-bracket-entry",
+            "s_code": "0",
+        },
+    )
+    http_client.cancel_algo_order = AsyncMock(return_value={"s_code": "0", "s_msg": ""})
+
+    order_list, _, sl_order, tp_order = _build_bracket_order_list(instrument.id)
+    for order in order_list.orders:
+        client._cache.add_order(order, None, None)
+
+    command = SubmitOrderList(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        order_list=order_list,
+        position_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    await client._submit_order_list(command)
+    client._algo_order_ids[sl_order.client_order_id] = "algo-oco-1"
+    client._algo_order_instruments[sl_order.client_order_id] = instrument.id
+
+    cancel = CancelOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=tp_order.client_order_id,
+        venue_order_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act
+    await client._cancel_order(cancel)
+
+    # Assert
+    http_client.cancel_algo_order.assert_awaited_once()
+    call = http_client.cancel_algo_order.await_args
+    assert call is not None
+    assert call.kwargs["algo_id"] == "algo-oco-1"
+    assert sl_order.client_order_id not in client._algo_order_ids
+    assert tp_order.client_order_id not in client._algo_order_ids
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_for_attached_oco_secondary_child_rebuilds_binding_from_cached_orders(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    client._cache.add_instrument(instrument)
+    http_client.place_order = AsyncMock(
+        return_value={
+            "ord_id": "ord-123",
+            "cl_ord_id": "O-bracket-entry",
+            "s_code": "0",
+        },
+    )
+    http_client.cancel_algo_order = AsyncMock(return_value={"s_code": "0", "s_msg": ""})
+
+    order_list, entry_order, sl_order, tp_order = _build_bracket_order_list(instrument.id)
+    for order in order_list.orders:
+        client._cache.add_order(order, None, None)
+
+    command = SubmitOrderList(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        order_list=order_list,
+        position_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    await client._submit_order_list(command)
+    client._attached_oco_bindings.clear()
+    client._algo_order_ids[sl_order.client_order_id] = "algo-oco-1"
+    client._algo_order_instruments[sl_order.client_order_id] = instrument.id
+
+    cancel = CancelOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=tp_order.client_order_id,
+        venue_order_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act
+    await client._cancel_order(cancel)
+
+    # Assert
+    http_client.cancel_algo_order.assert_awaited_once()
+    call = http_client.cancel_algo_order.await_args
+    assert call is not None
+    assert call.kwargs["algo_id"] == "algo-oco-1"
+    assert sl_order.client_order_id not in client._algo_order_ids
+    assert tp_order.client_order_id not in client._algo_order_ids
+
+
+# =====================================================================================
 # Quote Quantity Order Tests
 # =====================================================================================
+
+
+@pytest.mark.asyncio
+async def test_submit_close_fraction_algo_order_forwards_param(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # Arrange
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    client._cache.add_instrument(instrument)
+    http_client.place_algo_order = AsyncMock(return_value={"algo_id": "algo-123", "s_code": "0"})
+
+    order = StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-close-fraction"),
+        order_side=OrderSide.SELL,
+        quantity=Quantity.from_str("0.010000"),
+        trigger_price=Price.from_str("40000.00"),
+        trigger_type=TriggerType.DEFAULT,
+        time_in_force=TimeInForce.GTC,
+        expire_time_ns=0,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    from nautilus_trader.execution.messages import SubmitOrder
+
+    command = SubmitOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        order=order,
+        position_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+        params={"close_fraction": "1"},
+    )
+
+    # Act
+    await client._submit_order(command)
+
+    # Assert
+    http_client.place_algo_order.assert_awaited_once()
+    call = http_client.place_algo_order.await_args
+    assert call is not None
+    assert call.kwargs["close_fraction"] == "1"
+    assert call.kwargs["reduce_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_handle_close_fraction_algo_accept_report_uses_cached_order_quantity(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    client, _, _, _, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    client._cache.add_instrument(instrument)
+    client._cache.add_account(TestExecStubs.cash_account(account_id=client.account_id))
+    client._set_connected(True)
+
+    order = StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-close-fraction-report"),
+        order_side=OrderSide.SELL,
+        quantity=Quantity.from_str("0.010000"),
+        trigger_price=Price.from_str("40000.00"),
+        trigger_type=TriggerType.DEFAULT,
+        time_in_force=TimeInForce.GTC,
+        expire_time_ns=0,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    client._cache.add_order(order, None, None)
+
+    captured: list = []
+
+    def _capture(event):
+        captured.append(event)
+
+    monkeypatch.setattr(client, "_send_order_event", _capture)
+
+    pyo3_report = nautilus_pyo3.OrderStatusReport(
+        account_id=nautilus_pyo3.AccountId(client.account_id.value),
+        instrument_id=nautilus_pyo3.InstrumentId.from_str(instrument.id.value),
+        venue_order_id=nautilus_pyo3.VenueOrderId("algo-close-frac-1"),
+        client_order_id=nautilus_pyo3.ClientOrderId(order.client_order_id.value),
+        order_side=nautilus_pyo3.OrderSide.SELL,
+        order_type=nautilus_pyo3.OrderType.STOP_MARKET,
+        time_in_force=nautilus_pyo3.TimeInForce.GTC,
+        order_status=nautilus_pyo3.OrderStatus.ACCEPTED,
+        quantity=nautilus_pyo3.Quantity.from_str("0"),
+        filled_qty=nautilus_pyo3.Quantity.from_str("0"),
+        trigger_price=nautilus_pyo3.Price.from_str("40000.00"),
+        trigger_type=nautilus_pyo3.TriggerType.DEFAULT,
+        reduce_only=True,
+        ts_accepted=0,
+        ts_last=0,
+        report_id=nautilus_pyo3.UUID4(),
+        ts_init=0,
+    )
+
+    client._handle_order_status_report_pyo3(pyo3_report)
+
+    assert any(isinstance(event, OrderAccepted) for event in captured)
+    assert not any(isinstance(event, OrderUpdated) for event in captured)
+    assert client._algo_order_ids[order.client_order_id] == "algo-close-frac-1"
 
 
 @pytest.mark.asyncio
@@ -1036,8 +1873,8 @@ async def test_spot_margin_market_buy_quote_quantity_converts_on_first_fill(
     filled_event = next(event for event in emitted_events if isinstance(event, OrderFilled))
     assert filled_event.last_qty == Quantity.from_str("0.005225")
 
-    # Order should no longer be quote_quantity
-    assert not order.is_quote_quantity
+    # OrderUpdated should signal conversion from quote to base quantity
+    assert not updated_event.is_quote_quantity
 
 
 @pytest.mark.asyncio
@@ -1219,6 +2056,9 @@ async def test_spot_margin_market_buy_quote_quantity_handles_partial_fills(
 
     def _capture(event):
         emitted_events.append(event)
+        # Apply events so the order state transitions for subsequent fills
+        if isinstance(event, OrderUpdated):
+            order.apply(event)
 
     monkeypatch.setattr(client, "_send_order_event", _capture)
 

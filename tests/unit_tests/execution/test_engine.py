@@ -35,10 +35,8 @@ from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.messages import SubmitOrderList
 from nautilus_trader.execution.messages import TradingCommand
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.data import QuoteTick
-from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import AccountType
-from nautilus_trader.model.enums import AggressorSide
+from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
@@ -46,7 +44,6 @@ from nautilus_trader.model.enums import PositionSide
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TriggerType
 from nautilus_trader.model.events import OrderCanceled
-from nautilus_trader.model.events import OrderDenied
 from nautilus_trader.model.events import OrderUpdated
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
@@ -69,6 +66,7 @@ from nautilus_trader.test_kit.mocks.cache_database import MockCacheDatabase
 from nautilus_trader.test_kit.mocks.exec_clients import MockExecutionClient
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
+from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 from nautilus_trader.trading.strategy import Strategy
 
@@ -2201,6 +2199,478 @@ class TestExecutionEngine:
         assert position_flipped.quantity == Quantity.from_int(100_000)
         assert position_flipped.side == PositionSide.LONG
 
+    def test_reduce_only_netting_fill_does_not_open_opposite_position(self) -> None:
+        # Arrange
+        self.exec_engine.start()
+
+        account_id = TestIdStubs.account_id()
+        external_strategy_id = StrategyId("EXTERNAL")
+        external_order = TestExecStubs.limit_order(
+            instrument=AUDUSD_SIM,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(100_000),
+            strategy_id=external_strategy_id,
+        )
+        external_fill = TestEventStubs.order_filled(
+            external_order,
+            AUDUSD_SIM,
+            account_id=account_id,
+            position_id=PositionId(f"{AUDUSD_SIM.id}-EXTERNAL"),
+            last_qty=Quantity.from_int(100_000),
+            last_px=Price.from_str("1.00000"),
+        )
+        external_position = Position(AUDUSD_SIM, external_fill)
+        self.cache.add_position(external_position, OmsType.NETTING)
+
+        config = StrategyConfig(oms_type="NETTING")
+        strategy = Strategy(config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_oms_type(strategy)
+
+        order = strategy.order_factory.limit(
+            AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(25_000),
+            Price.from_str("1.10000"),
+            reduce_only=True,
+        )
+        submit_order = SubmitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            position_id=None,
+            order=order,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order)
+        self.exec_engine.process(TestEventStubs.order_submitted(order, account_id=account_id))
+        self.exec_engine.process(TestEventStubs.order_accepted(order, account_id=account_id))
+        self.exec_engine.process(
+            TestEventStubs.order_filled(
+                order,
+                AUDUSD_SIM,
+                account_id=account_id,
+                last_qty=Quantity.from_int(25_000),
+                last_px=Price.from_str("1.10000"),
+            ),
+        )
+
+        # Assert
+        phantom_position_id = PositionId(f"{AUDUSD_SIM.id}-{strategy.id}")
+        positions_open = self.cache.positions_open(
+            instrument_id=AUDUSD_SIM.id,
+            account_id=account_id,
+        )
+
+        assert order.status == OrderStatus.FILLED
+        assert self.cache.position(phantom_position_id) is None
+        assert positions_open == [external_position]
+
+    def test_reduce_only_netting_fill_updates_own_open_position(self) -> None:
+        # Arrange
+        self.exec_engine.start()
+
+        account_id = TestIdStubs.account_id()
+        strategy = self._registered_netting_strategy()
+
+        open_order = strategy.order_factory.limit(
+            AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+            Price.from_str("1.00000"),
+        )
+        self._add_order_and_process_fill(open_order, account_id, "V-OWN-001")
+
+        reduce_only_order = strategy.order_factory.limit(
+            AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(25_000),
+            Price.from_str("1.10000"),
+            reduce_only=True,
+        )
+
+        # Act
+        self._add_order_and_process_fill(reduce_only_order, account_id, "V-OWN-002")
+
+        # Assert
+        position_id = PositionId(f"{AUDUSD_SIM.id}-{strategy.id}")
+        position = self.cache.position(position_id)
+
+        assert reduce_only_order.status == OrderStatus.FILLED
+        assert position.quantity == Quantity.from_int(75_000)
+        assert position.side == PositionSide.LONG
+        assert self.cache.positions_open(account_id=account_id) == [position]
+
+    def test_reduce_only_netting_fill_does_not_reopen_closed_position(self) -> None:
+        # Arrange
+        self.exec_engine.start()
+
+        account_id = TestIdStubs.account_id()
+        strategy = self._registered_netting_strategy()
+
+        open_order = strategy.order_factory.limit(
+            AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+            Price.from_str("1.00000"),
+        )
+        close_order = strategy.order_factory.limit(
+            AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+            Price.from_str("1.10000"),
+        )
+        self._add_order_and_process_fill(open_order, account_id, "V-CLOSED-001")
+        self._add_order_and_process_fill(close_order, account_id, "V-CLOSED-002")
+
+        reduce_only_order = strategy.order_factory.limit(
+            AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(25_000),
+            Price.from_str("1.10000"),
+            reduce_only=True,
+        )
+
+        # Act
+        self._add_order_and_process_fill(reduce_only_order, account_id, "V-CLOSED-003")
+
+        # Assert
+        position_id = PositionId(f"{AUDUSD_SIM.id}-{strategy.id}")
+        position = self.cache.position(position_id)
+
+        assert reduce_only_order.status == OrderStatus.FILLED
+        assert position.is_closed
+        assert position.quantity == Quantity.from_int(0)
+        assert self.cache.positions_open(account_id=account_id) == []
+        assert self.cache.positions_closed(account_id=account_id) == [position]
+
+    def _registered_netting_strategy(self) -> Strategy:
+        config = StrategyConfig(oms_type="NETTING")
+        strategy = Strategy(config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_oms_type(strategy)
+        return strategy
+
+    def _add_order_and_process_fill(
+        self,
+        order,
+        account_id: AccountId,
+        venue_order_id: str,
+    ) -> None:
+        self.cache.add_order(order, position_id=None)
+        self.exec_engine.process(TestEventStubs.order_submitted(order, account_id=account_id))
+        self.exec_engine.process(
+            TestEventStubs.order_accepted(
+                order,
+                account_id=account_id,
+                venue_order_id=VenueOrderId(venue_order_id),
+            ),
+        )
+        self.exec_engine.process(
+            TestEventStubs.order_filled(
+                order,
+                AUDUSD_SIM,
+                account_id=account_id,
+                last_qty=order.quantity,
+                last_px=order.price,
+            ),
+        )
+
+    def test_submit_order_denied_with_custom_position_id_under_netting(self) -> None:
+        # Arrange
+        self.exec_engine.start()
+
+        config = StrategyConfig(oms_type="NETTING")
+        strategy = Strategy(config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_oms_type(strategy)
+
+        order = strategy.order_factory.market(
+            AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+
+        custom_position_id = PositionId(f"{AUDUSD_SIM.id}-GRID")
+        submit_order = SubmitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            position_id=custom_position_id,
+            order=order,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order)
+
+        # Assert
+        assert order.status == OrderStatus.DENIED
+        assert "NETTING" in order.last_event.reason
+        assert f"{AUDUSD_SIM.id}-{strategy.id}" in order.last_event.reason
+
+    def test_submit_order_list_denied_with_custom_position_id_under_netting(self) -> None:
+        # Arrange
+        self.exec_engine.start()
+
+        config = StrategyConfig(oms_type="NETTING")
+        strategy = Strategy(config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_oms_type(strategy)
+
+        entry = strategy.order_factory.market(
+            AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        stop_loss = strategy.order_factory.stop_market(
+            AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+            Price.from_str("0.50000"),
+        )
+        take_profit = strategy.order_factory.limit(
+            AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+            Price.from_str("1.00000"),
+        )
+
+        bracket = OrderList(
+            order_list_id=OrderListId("L-001"),
+            orders=[entry, stop_loss, take_profit],
+        )
+
+        custom_position_id = PositionId(f"{AUDUSD_SIM.id}-GRID")
+        submit_order_list = SubmitOrderList(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            order_list=bracket,
+            position_id=custom_position_id,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order_list)
+
+        # Assert
+        assert entry.status == OrderStatus.DENIED
+        assert stop_loss.status == OrderStatus.DENIED
+        assert take_profit.status == OrderStatus.DENIED
+
+    @pytest.mark.parametrize("oms_type", ["NETTING", "HEDGING"])
+    def test_submit_order_list_denies_mixed_instruments_with_position_id_regardless_of_oms(
+        self,
+        oms_type: str,
+    ) -> None:
+        # Arrange
+        self.cache.add_instrument(GBPUSD_SIM)
+        self.exec_engine.start()
+
+        config = StrategyConfig(oms_type=oms_type)
+        strategy = Strategy(config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_oms_type(strategy)
+
+        order_a = strategy.order_factory.market(
+            AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        order_b = strategy.order_factory.market(
+            GBPUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+
+        order_list = OrderList(
+            order_list_id=OrderListId("L-MIXED-POS"),
+            orders=[order_a, order_b],
+        )
+
+        position_id = PositionId(f"{AUDUSD_SIM.id}-LEGACY")
+        submit_order_list = SubmitOrderList(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            order_list=order_list,
+            position_id=position_id,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order_list)
+
+        # Assert
+        assert order_a.status == OrderStatus.DENIED
+        assert order_b.status == OrderStatus.DENIED
+        assert "mixed-instrument" in order_a.last_event.reason
+        assert "position belongs" in order_a.last_event.reason
+
+    def test_submit_order_denied_with_unspecified_strategy_oms_and_netting_client(self) -> None:
+        # Arrange: register a NETTING client for BINANCE alongside the default
+        # HEDGING SIM client; the strategy is left at UNSPECIFIED so resolution
+        # must fall through to the routed (NETTING) client.
+        self.cache.add_instrument(BTCUSDT_BINANCE)
+
+        netting_client = MockExecutionClient(
+            client_id=ClientId(BTCUSDT_BINANCE.venue.value),
+            venue=BTCUSDT_BINANCE.venue,
+            account_type=AccountType.MARGIN,
+            base_currency=USD,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+            oms_type=OmsType.NETTING,
+        )
+        self.portfolio.update_account(
+            TestEventStubs.margin_account_state(account_id=netting_client.account_id),
+        )
+        self.exec_engine.register_client(netting_client)
+        self.exec_engine.start()
+
+        strategy = Strategy()  # default config: oms_type=UNSPECIFIED
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_oms_type(strategy)
+
+        order = strategy.order_factory.market(
+            BTCUSDT_BINANCE.id,
+            OrderSide.BUY,
+            Quantity.from_int(1),
+        )
+
+        custom_position_id = PositionId(f"{BTCUSDT_BINANCE.id}-GRID")
+        submit_order = SubmitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            position_id=custom_position_id,
+            order=order,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order)
+
+        # Assert
+        assert order.status == OrderStatus.DENIED
+        assert "NETTING" in order.last_event.reason
+
+    def test_submit_order_allowed_with_custom_position_id_under_hedging(self) -> None:
+        # Arrange
+        self.exec_engine.start()
+
+        config = StrategyConfig(oms_type="HEDGING")
+        strategy = Strategy(config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_oms_type(strategy)
+
+        order = strategy.order_factory.market(
+            AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+
+        custom_position_id = PositionId(f"{AUDUSD_SIM.id}-GRID")
+        submit_order = SubmitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            position_id=custom_position_id,
+            order=order,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order)
+        self.exec_engine.process(TestEventStubs.order_submitted(order))
+
+        # Assert
+        assert order.status == OrderStatus.SUBMITTED
+
+    def test_submit_order_allowed_with_deterministic_netting_position_id(self) -> None:
+        # Arrange
+        self.exec_engine.start()
+
+        config = StrategyConfig(oms_type="NETTING")
+        strategy = Strategy(config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_oms_type(strategy)
+
+        order = strategy.order_factory.market(
+            AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+
+        deterministic_position_id = PositionId(f"{AUDUSD_SIM.id}-{strategy.id}")
+        submit_order = SubmitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            position_id=deterministic_position_id,
+            order=order,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order)
+        self.exec_engine.process(TestEventStubs.order_submitted(order))
+
+        # Assert
+        assert order.status == OrderStatus.SUBMITTED
+
     def test_handle_updated_order_event(self) -> None:
         # Arrange
         self.exec_engine.start()
@@ -2261,320 +2731,6 @@ class TestExecutionEngine:
         # TODO: This test was updated as the venue order ID currently does not change once assigned
         cached_order = self.cache.order(order.client_order_id)
         assert cached_order.venue_order_id == new_venue_id
-
-    def test_submit_order_with_quote_quantity_and_no_prices_denies(self) -> None:
-        # Arrange
-        self.exec_engine.start()
-
-        strategy = Strategy()
-        strategy.register(
-            trader_id=self.trader_id,
-            portfolio=self.portfolio,
-            msgbus=self.msgbus,
-            cache=self.cache,
-            clock=self.clock,
-        )
-
-        order = strategy.order_factory.limit(
-            instrument_id=AUDUSD_SIM.id,
-            order_side=OrderSide.BUY,
-            price=Price.from_str("10.0"),
-            quantity=Quantity.from_int(100_000),
-            quote_quantity=True,  # <-- Quantity denominated in quote currency
-        )
-
-        # Act
-        strategy.submit_order(order)
-
-        # Assert
-        assert order.quantity == Quantity.from_int(100_000)
-        assert order.is_closed
-        assert isinstance(order.last_event, OrderDenied)
-
-    def test_submit_bracket_order_with_quote_quantity_and_no_prices_denies(self) -> None:
-        # Arrange
-        self.exec_engine.start()
-
-        strategy = Strategy()
-        strategy.register(
-            trader_id=self.trader_id,
-            portfolio=self.portfolio,
-            msgbus=self.msgbus,
-            cache=self.cache,
-            clock=self.clock,
-        )
-
-        bracket = strategy.order_factory.bracket(
-            instrument_id=AUDUSD_SIM.id,
-            order_side=OrderSide.BUY,
-            tp_price=Price.from_str("20.0"),
-            sl_trigger_price=Price.from_str("10.0"),
-            quantity=Quantity.from_int(100_000),
-            quote_quantity=True,  # <-- Quantity denominated in quote currency
-        )
-
-        # Act
-        strategy.submit_order_list(bracket)
-
-        # Assert
-        assert bracket.orders[0].quantity == Quantity.from_int(100_000)
-        assert bracket.orders[1].quantity == Quantity.from_int(100_000)
-        assert bracket.orders[2].quantity == Quantity.from_int(100_000)
-        assert bracket.orders[0].is_quote_quantity
-        assert bracket.orders[1].is_quote_quantity
-        assert bracket.orders[2].is_quote_quantity
-        assert isinstance(bracket.orders[0].last_event, OrderDenied)
-        assert isinstance(bracket.orders[1].last_event, OrderDenied)
-        assert isinstance(bracket.orders[2].last_event, OrderDenied)
-
-    @pytest.mark.parametrize(
-        ("order_side", "expected_quantity"),
-        [
-            [OrderSide.BUY, Quantity.from_str("124984")],
-            [OrderSide.SELL, Quantity.from_str("125000")],
-        ],
-    )
-    def test_submit_order_with_quote_quantity_and_quote_tick_converts_to_base_quantity(
-        self,
-        order_side: OrderSide,
-        expected_quantity: Quantity,
-    ) -> None:
-        # Arrange
-        self.exec_engine.start()
-
-        # Set up market
-        tick = QuoteTick(
-            instrument_id=AUDUSD_SIM.id,
-            bid_price=Price.from_str("0.80000"),
-            ask_price=Price.from_str("0.80010"),
-            bid_size=Quantity.from_int(10_000_000),
-            ask_size=Quantity.from_int(10_000_000),
-            ts_event=0,
-            ts_init=0,
-        )
-        self.cache.add_quote_tick(tick)
-
-        strategy = Strategy()
-        strategy.register(
-            trader_id=self.trader_id,
-            portfolio=self.portfolio,
-            msgbus=self.msgbus,
-            cache=self.cache,
-            clock=self.clock,
-        )
-
-        order = strategy.order_factory.limit(
-            instrument_id=AUDUSD_SIM.id,
-            order_side=order_side,
-            price=Price.from_str("10.0"),
-            quantity=Quantity.from_int(100_000),
-            quote_quantity=True,  # <-- Quantity denominated in quote currency
-        )
-
-        strategy.submit_order(order)
-
-        # Act
-        self.exec_engine.process(TestEventStubs.order_submitted(order))
-        self.exec_engine.process(TestEventStubs.order_accepted(order))
-        self.exec_engine.process(TestEventStubs.order_filled(order, AUDUSD_SIM))
-
-        # Assert
-        assert order.quantity == expected_quantity
-        assert not order.is_quote_quantity
-
-    @pytest.mark.parametrize(
-        ("order_side", "expected_quantity"),
-        [
-            [OrderSide.BUY, Quantity.from_str("124992")],
-            [OrderSide.SELL, Quantity.from_str("124992")],
-        ],
-    )
-    def test_submit_order_with_quote_quantity_and_trade_ticks_converts_to_base_quantity(
-        self,
-        order_side: OrderSide,
-        expected_quantity: Quantity,
-    ) -> None:
-        # Arrange
-        self.exec_engine.start()
-
-        # Set up market
-        tick = TradeTick(
-            instrument_id=AUDUSD_SIM.id,
-            price=Price.from_str("0.80005"),
-            size=Quantity.from_int(100_000),
-            aggressor_side=AggressorSide.BUYER,
-            trade_id=TradeId("123456"),
-            ts_event=0,
-            ts_init=0,
-        )
-
-        self.cache.add_trade_tick(tick)
-
-        strategy = Strategy()
-        strategy.register(
-            trader_id=self.trader_id,
-            portfolio=self.portfolio,
-            msgbus=self.msgbus,
-            cache=self.cache,
-            clock=self.clock,
-        )
-
-        order = strategy.order_factory.limit(
-            instrument_id=AUDUSD_SIM.id,
-            order_side=order_side,
-            price=Price.from_str("10.0"),
-            quantity=Quantity.from_int(100_000),
-            quote_quantity=True,  # <-- Quantity denominated in quote currency
-        )
-
-        strategy.submit_order(order)
-
-        # Act
-        self.exec_engine.process(TestEventStubs.order_submitted(order))
-        self.exec_engine.process(TestEventStubs.order_accepted(order))
-        self.exec_engine.process(TestEventStubs.order_filled(order, AUDUSD_SIM))
-
-        # Assert
-        assert order.quantity == expected_quantity
-        assert not order.is_quote_quantity
-
-    def test_submit_order_with_quote_quantity_and_conversion_disabled_keeps_quote_quantity(
-        self,
-    ) -> None:
-        # Arrange
-        local_clock = TestClock()
-        msgbus = MessageBus(trader_id=self.trader_id, clock=local_clock)
-        cache = Cache(database=MockCacheDatabase())
-        portfolio = Portfolio(msgbus=msgbus, cache=cache, clock=local_clock)
-        portfolio.update_account(TestEventStubs.margin_account_state())
-
-        config = ExecEngineConfig(convert_quote_qty_to_base=False, debug=True)
-        exec_engine = ExecutionEngine(
-            msgbus=msgbus,
-            cache=cache,
-            clock=local_clock,
-            config=config,
-        )
-
-        exec_client = MockExecutionClient(
-            client_id=ClientId(self.venue.value),
-            venue=self.venue,
-            account_type=AccountType.MARGIN,
-            base_currency=USD,
-            msgbus=msgbus,
-            cache=cache,
-            clock=local_clock,
-        )
-        exec_engine.register_client(exec_client)
-        exec_engine.start()
-
-        cache.add_instrument(AUDUSD_SIM)
-
-        tick = QuoteTick(
-            instrument_id=AUDUSD_SIM.id,
-            bid_price=Price.from_str("0.80000"),
-            ask_price=Price.from_str("0.80010"),
-            bid_size=Quantity.from_int(10_000_000),
-            ask_size=Quantity.from_int(10_000_000),
-            ts_event=0,
-            ts_init=0,
-        )
-        cache.add_quote_tick(tick)
-
-        strategy = Strategy()
-        strategy.register(
-            trader_id=self.trader_id,
-            portfolio=portfolio,
-            msgbus=msgbus,
-            cache=cache,
-            clock=local_clock,
-        )
-
-        order = strategy.order_factory.limit(
-            instrument_id=AUDUSD_SIM.id,
-            order_side=OrderSide.BUY,
-            price=Price.from_str("10.0"),
-            quantity=Quantity.from_int(100_000),
-            quote_quantity=True,
-        )
-        original_qty = order.quantity
-
-        strategy.submit_order(order)
-
-        # Act
-        exec_engine.process(TestEventStubs.order_submitted(order))
-        exec_engine.process(TestEventStubs.order_accepted(order))
-
-        # Assert
-        assert order.is_quote_quantity
-        assert order.quantity == original_qty
-
-    @pytest.mark.parametrize(
-        ("order_side", "expected_quantity"),
-        [
-            [OrderSide.BUY, Quantity.from_str("124984")],
-            [OrderSide.SELL, Quantity.from_str("125000")],
-        ],
-    )
-    def test_submit_bracket_order_with_quote_quantity_and_ticks_converts_expected(
-        self,
-        order_side: OrderSide,
-        expected_quantity: Quantity,
-    ) -> None:
-        # Arrange
-        self.exec_engine.start()
-
-        trade_tick = TradeTick(
-            instrument_id=AUDUSD_SIM.id,
-            price=Price.from_str("0.80005"),
-            size=Quantity.from_int(100_000),
-            aggressor_side=AggressorSide.BUYER,
-            trade_id=TradeId("123456"),
-            ts_event=0,
-            ts_init=0,
-        )
-
-        self.cache.add_trade_tick(trade_tick)
-
-        quote_tick = QuoteTick(
-            instrument_id=AUDUSD_SIM.id,
-            bid_price=Price.from_str("0.80000"),
-            ask_price=Price.from_str("0.80010"),
-            bid_size=Quantity.from_int(10_000_000),
-            ask_size=Quantity.from_int(10_000_000),
-            ts_event=0,
-            ts_init=0,
-        )
-        self.cache.add_quote_tick(quote_tick)
-
-        strategy = Strategy()
-        strategy.register(
-            trader_id=self.trader_id,
-            portfolio=self.portfolio,
-            msgbus=self.msgbus,
-            cache=self.cache,
-            clock=self.clock,
-        )
-
-        bracket = strategy.order_factory.bracket(
-            instrument_id=AUDUSD_SIM.id,
-            order_side=order_side,
-            tp_price=Price.from_str("20.0"),
-            sl_trigger_price=Price.from_str("10.0"),
-            quantity=Quantity.from_int(100_000),
-            quote_quantity=True,  # <-- Quantity denominated in quote currency
-        )
-
-        # Act
-        strategy.submit_order_list(bracket)
-
-        # Assert
-        assert bracket.orders[0].quantity == expected_quantity
-        assert bracket.orders[1].quantity == expected_quantity
-        assert bracket.orders[2].quantity == expected_quantity
-        assert not bracket.orders[0].is_quote_quantity
-        assert not bracket.orders[1].is_quote_quantity
-        assert not bracket.orders[2].is_quote_quantity
 
     def test_submit_market_should_not_add_to_own_book(self) -> None:
         # Arrange
@@ -3099,6 +3255,7 @@ class TestExecutionEngine:
 
         # The flipped position should be the one that's open
         flipped_position = None
+
         for pos in positions:
             if pos.id != position_id and pos.is_open:
                 flipped_position = pos
@@ -3656,6 +3813,7 @@ class TestExecutionEngine:
 
         # === Test Case 2: Multiple orders at same price level ===
         same_price_orders = []
+
         for _ in range(3):
             order = strategy.order_factory.limit(
                 instrument_id=instrument.id,

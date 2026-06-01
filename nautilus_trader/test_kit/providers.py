@@ -32,7 +32,6 @@ from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.datetime import secs_to_nanos
-from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.currencies import ADA
 from nautilus_trader.model.currencies import AUD
 from nautilus_trader.model.currencies import BTC
@@ -57,7 +56,9 @@ from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.instruments import Cfd
 from nautilus_trader.model.instruments import Commodity
 from nautilus_trader.model.instruments import CryptoFuture
+from nautilus_trader.model.instruments import CryptoFuturesSpread
 from nautilus_trader.model.instruments import CryptoOption
+from nautilus_trader.model.instruments import CryptoOptionSpread
 from nautilus_trader.model.instruments import CryptoPerpetual
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.instruments import Equity
@@ -336,6 +337,7 @@ class TestInstrumentProvider:
         """
         if activation is None:
             activation = pd.Timestamp("2021-12-25", tz=pytz.utc)
+
         if expiration is None:
             expiration = pd.Timestamp("2022-3-25", tz=pytz.utc)
         return CryptoFuture(
@@ -886,6 +888,64 @@ class TestInstrumentProvider:
         )
 
     @staticmethod
+    def crypto_futures_spread_inverse() -> CryptoFuturesSpread:
+        return CryptoFuturesSpread(
+            instrument_id=InstrumentId(
+                symbol=Symbol("BTC-FS-19MAY26_PERP"),
+                venue=Venue("DERIBIT"),
+            ),
+            raw_symbol=Symbol("BTC-FS-19MAY26_PERP"),
+            underlying=BTC,
+            quote_currency=USD,
+            settlement_currency=BTC,
+            is_inverse=True,
+            strategy_type="FS",
+            activation_ns=pd.Timestamp("2026-05-12T00:00:00", tz=pytz.utc).value,
+            expiration_ns=pd.Timestamp("2026-05-19T08:00:00", tz=pytz.utc).value,
+            price_precision=1,
+            size_precision=0,
+            price_increment=Price.from_str("0.5"),
+            size_increment=Quantity.from_int(1),
+            multiplier=Quantity.from_int(10),
+            lot_size=Quantity.from_int(1),
+            margin_init=Decimal(0),
+            margin_maint=Decimal(0),
+            maker_fee=Decimal("0.0003"),
+            taker_fee=Decimal("0.0003"),
+            ts_event=0,
+            ts_init=0,
+        )
+
+    @staticmethod
+    def crypto_option_spread_inverse() -> CryptoOptionSpread:
+        return CryptoOptionSpread(
+            instrument_id=InstrumentId(
+                symbol=Symbol("BTC-CS-19MAY26-70000_75000"),
+                venue=Venue("DERIBIT"),
+            ),
+            raw_symbol=Symbol("BTC-CS-19MAY26-70000_75000"),
+            underlying=BTC,
+            quote_currency=BTC,
+            settlement_currency=BTC,
+            is_inverse=True,
+            strategy_type="CS",
+            activation_ns=pd.Timestamp("2026-05-12T00:00:00", tz=pytz.utc).value,
+            expiration_ns=pd.Timestamp("2026-05-19T08:00:00", tz=pytz.utc).value,
+            price_precision=4,
+            size_precision=1,
+            price_increment=Price.from_str("0.0001"),
+            size_increment=Quantity.from_str("0.1"),
+            multiplier=Quantity.from_int(1),
+            lot_size=Quantity.from_str("0.1"),
+            margin_init=Decimal(0),
+            margin_maint=Decimal(0),
+            maker_fee=Decimal("0.0003"),
+            taker_fee=Decimal("0.0003"),
+            ts_event=0,
+            ts_init=0,
+        )
+
+    @staticmethod
     def commodity() -> Commodity:
         return Commodity(
             instrument_id=InstrumentId(symbol=Symbol("CL"), venue=Venue("NYMEX")),
@@ -1148,11 +1208,11 @@ class TestDataGenerator:
                 Price(row["price"], price_prec),
                 Quantity(row["quantity"], quantity_prec),
                 AggressorSide.NO_AGGRESSOR,
-                TradeId(UUID4().value),
+                TradeId(f"T-{i:010d}"),
                 dt_to_unix_nanos(idx),
                 dt_to_unix_nanos(idx),
             )
-            for idx, row in df.iterrows()
+            for i, (idx, row) in enumerate(df.iterrows())
         ]
 
     @staticmethod

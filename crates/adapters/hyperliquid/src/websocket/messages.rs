@@ -17,18 +17,21 @@ use ahash::AHashMap;
 use derive_builder::Builder;
 use nautilus_model::{
     data::{
-        Bar, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDeltas, QuoteTick,
-        TradeTick,
+        Bar, Data, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDeltas,
+        OrderBookDepth10, QuoteTick, TradeTick,
     },
     reports::{FillReport, OrderStatusReport},
 };
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use crate::common::enums::{
-    HyperliquidBarInterval, HyperliquidFillDirection, HyperliquidLiquidationMethod,
-    HyperliquidOrderStatus as HyperliquidOrderStatusEnum, HyperliquidSide, HyperliquidTpSl,
-    HyperliquidTwapStatus,
+use crate::{
+    common::enums::{
+        HyperliquidBarInterval, HyperliquidFillDirection, HyperliquidLiquidationMethod,
+        HyperliquidOrderStatus as HyperliquidOrderStatusEnum, HyperliquidSide,
+        HyperliquidTimeInForce, HyperliquidTpSl, HyperliquidTwapStatus,
+    },
+    http::models::{HyperliquidExchangeRequest, HyperliquidExecAction},
 };
 
 /// Represents an outbound WebSocket message from client to Hyperliquid.
@@ -67,6 +70,8 @@ pub enum SubscriptionRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         dex: Option<String>,
     },
+    /// Aggregate asset contexts across all perp dexes.
+    AllDexsAssetCtxs,
     /// Notifications for a user.
     Notification { user: String },
     /// Web data for frontend.
@@ -124,7 +129,9 @@ pub enum PostRequest {
     /// Info request (no signature required).
     Info { payload: serde_json::Value },
     /// Action request (requires signature).
-    Action { payload: ActionPayload },
+    Action {
+        payload: HyperliquidExchangeRequest<HyperliquidExecAction>,
+    },
 }
 
 /// Action payload with signature.
@@ -315,6 +322,8 @@ pub enum HyperliquidWsMessage {
     Post { data: PostResponse },
     /// All mid prices.
     AllMids { data: AllMidsData },
+    /// Aggregate asset contexts across all perp dexes.
+    AllDexsAssetCtxs { data: WsAllDexsAssetCtxsData },
     /// Notifications.
     Notification { data: NotificationData },
     /// Web data.
@@ -376,7 +385,13 @@ pub enum PostResponsePayload {
 /// All mid prices data.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AllMidsData {
-    pub mids: AHashMap<String, String>,
+    pub mids: AHashMap<Ustr, String>,
+}
+
+/// `allDexsAssetCtxs` data payload.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WsAllDexsAssetCtxsData {
+    pub ctxs: Vec<(String, Vec<PerpsAssetCtx>)>,
 }
 
 /// Notification data.
@@ -465,6 +480,9 @@ pub struct WsBasicOrderData {
     #[serde(rename = "origSz")]
     pub orig_sz: String,
     pub cloid: Option<String>,
+    pub tif: Option<HyperliquidTimeInForce>,
+    #[serde(rename = "reduceOnly")]
+    pub reduce_only: Option<bool>,
     /// Trigger price for conditional orders (stop/take-profit).
     #[serde(rename = "triggerPx")]
     pub trigger_px: Option<String>,
@@ -1038,6 +1056,8 @@ pub enum NautilusWsMessage {
     Quote(QuoteTick),
     /// Parsed order book deltas.
     Deltas(OrderBookDeltas),
+    /// Parsed order book depth-10 snapshot.
+    Depth10(Box<OrderBookDepth10>),
     /// Parsed candle/bar.
     Candle(Bar),
     /// Mark price update.
@@ -1046,6 +1066,8 @@ pub enum NautilusWsMessage {
     IndexPrice(IndexPriceUpdate),
     /// Funding rate update.
     FundingRate(FundingRateUpdate),
+    /// Custom data (e.g. allMids).
+    CustomData(Data),
     /// Error occurred.
     Error(String),
     /// WebSocket reconnected.
@@ -1057,7 +1079,7 @@ pub enum NautilusWsMessage {
 /// This enum allows both order status updates and fill reports.
 /// to be sent through the execution engine.
 #[derive(Debug, Clone)]
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 pub enum ExecutionReport {
     /// Order status report.
     Order(OrderStatusReport),

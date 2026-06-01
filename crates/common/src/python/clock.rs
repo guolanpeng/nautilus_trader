@@ -41,10 +41,12 @@ use crate::{
     unsendable,
     from_py_object
 )]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.common")]
 #[derive(Debug, Clone)]
 pub struct PyClock(Rc<RefCell<dyn Clock>>);
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyClock {
     #[staticmethod]
     #[pyo3(name = "new_test")]
@@ -106,6 +108,16 @@ impl PyClock {
             .register_default_handler(TimeEventCallback::from(callback));
     }
 
+    #[pyo3(name = "cancel_default_handler")]
+    fn py_cancel_default_handler(&mut self) {
+        self.0.borrow_mut().cancel_default_handler();
+    }
+
+    #[pyo3(name = "cancel_callbacks")]
+    fn py_cancel_callbacks(&mut self) {
+        self.0.borrow_mut().cancel_callbacks();
+    }
+
     #[pyo3(
         name = "set_time_alert",
         signature = (name, alert_time, callback=None, allow_past=None)
@@ -150,7 +162,7 @@ impl PyClock {
             .map_err(to_pyvalue_err)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[pyo3(
         name = "set_timer",
         signature = (name, interval, start_time=None, stop_time=None, callback=None, allow_past=None, fire_immediately=None)
@@ -188,7 +200,7 @@ impl PyClock {
             .map_err(to_pyvalue_err)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[pyo3(
         name = "set_timer_ns",
         signature = (name, interval_ns, start_time_ns=None, stop_time_ns=None, callback=None, allow_past=None, fire_immediately=None)
@@ -306,7 +318,7 @@ mod tests {
         TestClock::new()
     }
 
-    pub fn test_callback() -> TimeEventCallback {
+    pub(super) fn test_callback() -> TimeEventCallback {
         Python::initialize();
         Python::attach(|py| {
             let py_list = PyList::empty(py);
@@ -316,7 +328,7 @@ mod tests {
         })
     }
 
-    pub fn test_py_callback() -> Py<PyAny> {
+    pub(super) fn test_py_callback() -> Py<PyAny> {
         Python::initialize();
         Python::attach(|py| {
             let py_list = PyList::empty(py);

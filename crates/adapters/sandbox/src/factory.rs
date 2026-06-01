@@ -18,11 +18,14 @@
 use std::{any::Any, cell::RefCell, rc::Rc};
 
 use nautilus_common::{
-    cache::Cache, clients::ExecutionClient, clock::Clock, live::clock::LiveClock,
+    cache::Cache,
+    clients::ExecutionClient,
+    clock::Clock,
+    factories::{ClientConfig, SimulatedExecutionClientFactory},
+    live::clock::LiveClock,
 };
 use nautilus_execution::client::core::ExecutionClientCore;
 use nautilus_model::identifiers::ClientId;
-use nautilus_system::factories::{ClientConfig, ExecutionClientFactory};
 
 use crate::{config::SandboxExecutionClientConfig, execution::SandboxExecutionClient};
 
@@ -33,7 +36,19 @@ impl ClientConfig for SandboxExecutionClientConfig {
 }
 
 /// Factory for creating sandbox execution clients.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.sandbox",
+        unsendable,
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.sandbox")
+)]
 pub struct SandboxExecutionClientFactory;
 
 impl SandboxExecutionClientFactory {
@@ -44,7 +59,7 @@ impl SandboxExecutionClientFactory {
     }
 }
 
-impl ExecutionClientFactory for SandboxExecutionClientFactory {
+impl SimulatedExecutionClientFactory for SandboxExecutionClientFactory {
     fn create(
         &self,
         name: &str,

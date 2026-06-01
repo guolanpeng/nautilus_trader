@@ -30,7 +30,11 @@ use rust_decimal::Decimal;
 use crate::defi::{
     Chain, Pool, PoolIdentifier, PoolLiquidityUpdate, PoolLiquidityUpdateType, Token,
     data::{DexPoolData, PoolFeeCollect, block::BlockPosition},
-    pool_analysis::{profiler::PoolProfiler, quote::SwapQuote},
+    pool_analysis::{
+        compare::{PoolProfilerComparison, compare_pool_profiler, compare_pool_profiler_detailed},
+        profiler::PoolProfiler,
+        quote::SwapQuote,
+    },
     stubs::{arbitrum, uniswap_v3},
     tick_map::{
         liquidity_math::tick_spacing_to_max_liquidity_per_tick,
@@ -61,6 +65,7 @@ fn sqrt_price_x98() -> U160 {
 /// # Panics
 ///
 /// Panics if chain metadata or initial parameters are invalid for pool creation.
+#[must_use]
 pub fn pool_definition(
     fee: Option<u32>,
     tick_spacing: Option<i32>,
@@ -123,7 +128,7 @@ fn create_mint_event(
         pool_definition.instrument_id,
         pool_definition.pool_identifier,
         PoolLiquidityUpdateType::Mint,
-        100000,
+        100_000,
         "0x1aa3506e78dd6e7e53986fa310c7ef1b7825042e19693c04eb56b2404067407b".to_string(),
         0,
         next_log_index(),
@@ -134,7 +139,8 @@ fn create_mint_event(
         amount1,
         ticker_lower,
         ticker_upper,
-        None,
+        UnixNanos::default(),
+        UnixNanos::default(),
     )
 }
 
@@ -158,7 +164,7 @@ fn create_burn_event(
         pool_definition.instrument_id,
         pool_definition.pool_identifier,
         PoolLiquidityUpdateType::Burn,
-        100000,
+        100_000,
         "0x1aa3506e78dd6e7e53986fa310c7ef1b7825042e19693c04eb56b2404067407b".to_string(),
         0,
         next_log_index(),
@@ -169,7 +175,8 @@ fn create_burn_event(
         amount1,
         ticker_lower,
         ticker_upper,
-        None,
+        UnixNanos::default(),
+        UnixNanos::default(),
     )
 }
 
@@ -185,7 +192,7 @@ fn create_collect_event(
         uniswap_v3(),
         pool_definition.instrument_id,
         pool_definition.pool_identifier,
-        100000,
+        100_000,
         "0x1aa3506e78dd6e7e53986fa310c7ef1b7825042e19693c04eb56b2404067407b".to_string(),
         0,
         next_log_index(),
@@ -194,13 +201,14 @@ fn create_collect_event(
         amount1,
         ticker_lower,
         ticker_upper,
-        None,
+        UnixNanos::default(),
+        UnixNanos::default(),
     )
 }
 
 fn create_block_position() -> BlockPosition {
     BlockPosition::new(
-        100000,
+        100_000,
         "0x1aa3506e78dd6e7e53986fa310c7ef1b7825042e19693c04eb56b2404067407b".to_string(),
         0,
         next_log_index(),
@@ -223,7 +231,7 @@ fn other_address() -> Address {
 fn profiler() -> PoolProfiler {
     let pool_definition = pool_definition(None, None, None);
     let mut profiler = PoolProfiler::new(Arc::new(pool_definition));
-    profiler.initialize(sqrt_price_x98());
+    profiler.initialize(sqrt_price_x98()).unwrap();
     profiler
 }
 
@@ -249,11 +257,25 @@ fn test_initialize_success(profiler: PoolProfiler) {
 }
 
 #[rstest]
-#[should_panic(expected = "Pool already initialized")]
 fn test_initialize_already_initialized(mut profiler: PoolProfiler) {
+    use crate::defi::pool_analysis::error::PoolProfilerError;
+
+    let expected_instrument_id = profiler.pool.instrument_id;
+    let expected_pool_identifier = profiler.pool.pool_identifier;
     let price_sqrt_ratio = U160::from_str("511495728837967332084595714").unwrap();
-    // Initialize again to panic
-    profiler.initialize(price_sqrt_ratio);
+
+    let err = profiler.initialize(price_sqrt_ratio).unwrap_err();
+
+    match err {
+        PoolProfilerError::AlreadyInitialized {
+            instrument_id,
+            pool_identifier,
+        } => {
+            assert_eq!(instrument_id, expected_instrument_id);
+            assert_eq!(pool_identifier, expected_pool_identifier);
+        }
+        other => panic!("expected AlreadyInitialized, was {other:?}"),
+    }
 }
 
 #[rstest]
@@ -262,13 +284,53 @@ fn test_if_starting_price_is_too_low() {
     let pool_definition = pool_definition(None, None, None);
     let mut profiler = PoolProfiler::new(Arc::new(pool_definition));
     let price_sqrt_ratio = U160::from_str("1").unwrap();
-    profiler.initialize(price_sqrt_ratio);
+    profiler.initialize(price_sqrt_ratio).unwrap();
 }
 
 #[rstest]
-#[should_panic(expected = "Pool is not initialized")]
-fn test_process_mint_with_fail_if_pool_not_initialized() {
+fn test_initialize_returns_initial_tick_mismatch() {
+    use crate::defi::pool_analysis::error::PoolProfilerError;
+
+    // Pool fixture stores initial_tick derived from sqrt_price_x98.
     let pool_definition = pool_definition(None, None, None);
+    let expected_initial_tick = pool_definition.initial_tick.unwrap();
+    let expected_instrument_id = pool_definition.instrument_id;
+    let expected_pool_identifier = pool_definition.pool_identifier;
+    let mut profiler = PoolProfiler::new(Arc::new(pool_definition));
+
+    // Initialize with a 1:1 sqrt price (tick 0), which disagrees with the pool's
+    // stored initial_tick derived from sqrt_price_x98.
+    let mismatched_sqrt_price = encode_sqrt_ratio_x96(1, 1);
+    let expected_calculated_tick = get_tick_at_sqrt_ratio(mismatched_sqrt_price);
+    assert_ne!(expected_initial_tick, expected_calculated_tick);
+
+    let err = profiler.initialize(mismatched_sqrt_price).unwrap_err();
+
+    match err {
+        PoolProfilerError::InitialTickMismatch {
+            instrument_id,
+            pool_identifier,
+            initial_tick,
+            calculated_tick,
+        } => {
+            assert_eq!(instrument_id, expected_instrument_id);
+            assert_eq!(pool_identifier, expected_pool_identifier);
+            assert_eq!(initial_tick, expected_initial_tick);
+            assert_eq!(calculated_tick, expected_calculated_tick);
+        }
+        other => panic!("expected InitialTickMismatch, was {other:?}"),
+    }
+
+    assert!(!profiler.is_initialized);
+}
+
+#[rstest]
+fn test_process_mint_with_fail_if_pool_not_initialized() {
+    use crate::defi::pool_analysis::error::{PoolEventKind, PoolProfilerError};
+
+    let pool_definition = pool_definition(None, None, None);
+    let expected_instrument_id = pool_definition.instrument_id;
+    let expected_pool_identifier = pool_definition.pool_identifier;
     let mut profiler = PoolProfiler::new(Arc::new(pool_definition));
     let tick_spacing = profiler.pool.tick_spacing.unwrap();
     let mint_event = create_mint_event(
@@ -277,9 +339,26 @@ fn test_process_mint_with_fail_if_pool_not_initialized() {
         (tick_spacing * 2) as i32,
         1,
     );
-    profiler
+
+    let err = profiler
         .process(&DexPoolData::LiquidityUpdate(mint_event))
-        .unwrap();
+        .unwrap_err();
+    let profiler_err = err
+        .downcast_ref::<PoolProfilerError>()
+        .expect("expected PoolProfilerError");
+
+    match profiler_err {
+        PoolProfilerError::NotInitialized {
+            instrument_id,
+            pool_identifier,
+            event_kind,
+        } => {
+            assert_eq!(*instrument_id, expected_instrument_id);
+            assert_eq!(*pool_identifier, expected_pool_identifier);
+            assert_eq!(*event_kind, PoolEventKind::Mint);
+        }
+        other => panic!("expected NotInitialized, was {other:?}"),
+    }
 }
 
 #[rstest]
@@ -317,7 +396,7 @@ fn test_if_pool_process_fails_if_outside_tick_bounds(mut profiler: PoolProfiler)
         pool_definition.instrument_id,
         pool_definition.pool_identifier,
         PoolLiquidityUpdateType::Mint,
-        100000,
+        100_000,
         "0x1aa3506e78dd6e7e53986fa310c7ef1b7825042e19693c04eb56b2404067407b".to_string(),
         0,
         1,
@@ -328,7 +407,8 @@ fn test_if_pool_process_fails_if_outside_tick_bounds(mut profiler: PoolProfiler)
         U256::from(1000),
         invalid_tick_lower,
         invalid_tick_upper,
-        None,
+        UnixNanos::default(),
+        UnixNanos::default(),
     );
     let result = profiler.process(&DexPoolData::LiquidityUpdate(mint_event));
     assert!(result.is_err());
@@ -345,8 +425,8 @@ fn test_execute_mint_equivalence() {
     let mut profiler1 = PoolProfiler::new(Arc::new(pool_definition.clone()));
     let mut profiler2 = PoolProfiler::new(Arc::new(pool_definition));
 
-    profiler1.initialize(sqrt_price_x98());
-    profiler2.initialize(sqrt_price_x98());
+    profiler1.initialize(sqrt_price_x98()).unwrap();
+    profiler2.initialize(sqrt_price_x98()).unwrap();
 
     let tick_lower = -240;
     let tick_upper = 0;
@@ -442,8 +522,8 @@ fn test_execute_burn_equivalence() {
     let mut profiler1 = PoolProfiler::new(Arc::new(pool_definition.clone()));
     let mut profiler2 = PoolProfiler::new(Arc::new(pool_definition));
 
-    profiler1.initialize(sqrt_price_x98());
-    profiler2.initialize(sqrt_price_x98());
+    profiler1.initialize(sqrt_price_x98()).unwrap();
+    profiler2.initialize(sqrt_price_x98()).unwrap();
 
     let tick_lower = -240;
     let tick_upper = 0;
@@ -561,8 +641,8 @@ fn test_execute_swap_equivalence() {
     let mut profiler1 = PoolProfiler::new(Arc::new(pool_definition.clone()));
     let mut profiler2 = PoolProfiler::new(Arc::new(pool_definition));
 
-    profiler1.initialize(sqrt_price_x98());
-    profiler2.initialize(sqrt_price_x98());
+    profiler1.initialize(sqrt_price_x98()).unwrap();
+    profiler2.initialize(sqrt_price_x98()).unwrap();
 
     // Set up initial liquidity in both profilers
     let min_tick = PoolTick::get_min_tick(TICK_SPACING);
@@ -587,6 +667,8 @@ fn test_execute_swap_equivalence() {
         uniswap_v3(),
         pool_identifier,
         create_block_position(),
+        UnixNanos::default(),
+        UnixNanos::default(),
         user_address(),
         user_address(),
     );
@@ -630,13 +712,122 @@ fn test_execute_swap_equivalence() {
     // but the core state (tick, price, liquidity) should be identical
 }
 
+#[rstest]
+fn test_process_swap_snaps_sqrt_price_to_event() {
+    let pool_definition = pool_definition(None, None, None);
+    let pool_identifier = pool_definition.pool_identifier;
+    let mut profiler = PoolProfiler::new(Arc::new(pool_definition));
+
+    profiler.initialize(sqrt_price_x98()).unwrap();
+
+    let min_tick = PoolTick::get_min_tick(TICK_SPACING);
+    let max_tick = PoolTick::get_max_tick(TICK_SPACING);
+    let mint_event = create_mint_event(lp_address(), min_tick, max_tick, 10000);
+    profiler
+        .process(&DexPoolData::LiquidityUpdate(mint_event))
+        .unwrap();
+
+    let swap_quote = profiler
+        .swap_exact_in(U256::from(1000u32), true, None)
+        .unwrap();
+    let mut swap_event = swap_quote.to_swap_event(
+        arbitrum(),
+        uniswap_v3(),
+        pool_identifier,
+        create_block_position(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        user_address(),
+        user_address(),
+    );
+    let event_sqrt_price = swap_event.sqrt_price_x96 - U160::from(1u8);
+    assert_eq!(get_tick_at_sqrt_ratio(event_sqrt_price), swap_event.tick);
+
+    swap_event.sqrt_price_x96 = event_sqrt_price;
+    let zero_for_one = swap_event.amount0.is_positive();
+    let amount_specified = if zero_for_one {
+        swap_event.amount0
+    } else {
+        swap_event.amount1
+    };
+    let simulated_quote = profiler
+        .simulate_swap_through_ticks(amount_specified, zero_for_one, event_sqrt_price)
+        .unwrap();
+    assert_ne!(simulated_quote.sqrt_price_after_x96, event_sqrt_price);
+
+    profiler.process(&DexPoolData::Swap(swap_event)).unwrap();
+
+    assert_eq!(profiler.state.price_sqrt_ratio_x96, event_sqrt_price);
+}
+
+#[rstest]
+fn test_compare_pool_profiler_reports_sqrt_only_mismatch(mut profiler: PoolProfiler) {
+    let min_tick = PoolTick::get_min_tick(TICK_SPACING);
+    let max_tick = PoolTick::get_max_tick(TICK_SPACING);
+    let mint_event = create_mint_event(lp_address(), min_tick, max_tick, 10000);
+    profiler
+        .process(&DexPoolData::LiquidityUpdate(mint_event))
+        .unwrap();
+
+    let mut snapshot = profiler.extract_snapshot();
+    snapshot.state.price_sqrt_ratio_x96 += U160::from(1u8);
+    assert_eq!(
+        get_tick_at_sqrt_ratio(snapshot.state.price_sqrt_ratio_x96),
+        profiler.state.current_tick
+    );
+
+    assert_eq!(
+        compare_pool_profiler_detailed(&profiler, &snapshot),
+        PoolProfilerComparison::SqrtPriceMismatch
+    );
+    assert!(PoolProfilerComparison::SqrtPriceMismatch.is_valid_for_snapshot());
+    assert!(!compare_pool_profiler(&profiler, &snapshot));
+}
+
+#[rstest]
+fn test_compare_pool_profiler_reports_structural_mismatch(mut profiler: PoolProfiler) {
+    let min_tick = PoolTick::get_min_tick(TICK_SPACING);
+    let max_tick = PoolTick::get_max_tick(TICK_SPACING);
+    let mint_event = create_mint_event(lp_address(), min_tick, max_tick, 10000);
+    profiler
+        .process(&DexPoolData::LiquidityUpdate(mint_event))
+        .unwrap();
+
+    let mut snapshot = profiler.extract_snapshot();
+    snapshot.state.liquidity += 1;
+
+    assert_eq!(
+        compare_pool_profiler_detailed(&profiler, &snapshot),
+        PoolProfilerComparison::Mismatch
+    );
+    assert!(!PoolProfilerComparison::Mismatch.is_valid_for_snapshot());
+}
+
+#[rstest]
+fn test_extract_snapshot_uses_last_processed_event_timestamp(mut profiler: PoolProfiler) {
+    let min_tick = PoolTick::get_min_tick(TICK_SPACING);
+    let max_tick = PoolTick::get_max_tick(TICK_SPACING);
+    let mut mint_event = create_mint_event(lp_address(), min_tick, max_tick, 10000);
+    let event_ts = UnixNanos::from(profiler.pool.ts_init.as_u64() + 1_000_000_000);
+    mint_event.ts_event = event_ts;
+    profiler
+        .process(&DexPoolData::LiquidityUpdate(mint_event))
+        .unwrap();
+
+    let snapshot = profiler.extract_snapshot();
+
+    assert_eq!(snapshot.ts_event, event_ts);
+    assert_eq!(snapshot.ts_init, event_ts);
+    assert_ne!(snapshot.ts_event, profiler.pool.ts_init);
+}
+
 // Follow Uniswapv3 official tests
 // Initialize pool profiler here https://github.com/Uniswap/v3-core/blob/main/test/UniswapV3Pool.spec.ts#L194
 #[fixture]
 fn uni_pool_profiler() -> PoolProfiler {
     let pool_definition = pool_definition(None, None, None);
     let mut profiler = PoolProfiler::new(Arc::new(pool_definition));
-    profiler.initialize(sqrt_price_x98());
+    profiler.initialize(sqrt_price_x98()).unwrap();
     let min_tick = PoolTick::get_min_tick(TICK_SPACING);
     let max_tick = PoolTick::get_max_tick(TICK_SPACING);
     let mint_event = create_mint_event(lp_address(), min_tick, max_tick, 3161);
@@ -654,7 +845,7 @@ fn low_fee_pool_profiler() -> PoolProfiler {
 
     let pool_definition = pool_definition(Some(500), Some(10), Some(encode_sqrt_ratio_x96(1, 1)));
     let mut profiler = PoolProfiler::new(Arc::new(pool_definition));
-    profiler.initialize(encode_sqrt_ratio_x96(1, 1)); // Initialize at 1:1 price (tick 0)
+    profiler.initialize(encode_sqrt_ratio_x96(1, 1)).unwrap(); // Initialize at 1:1 price (tick 0)
 
     // Mint initial liquidity to match Solidity test setup (initializeLiquidityAmount = 2e18)
     let min_tick = PoolTick::get_min_tick(LOW_FEE_TICK_SPACING);
@@ -682,7 +873,7 @@ fn medium_fee_pool_profiler() -> PoolProfiler {
 
     let pool_definition = pool_definition(Some(3000), Some(60), Some(encode_sqrt_ratio_x96(1, 1)));
     let mut profiler = PoolProfiler::new(Arc::new(pool_definition));
-    profiler.initialize(encode_sqrt_ratio_x96(1, 1)); // Initialize at 1:1 price (tick 0)
+    profiler.initialize(encode_sqrt_ratio_x96(1, 1)).unwrap(); // Initialize at 1:1 price (tick 0)
 
     // Mint initial liquidity to match Solidity test setup (initializeLiquidityAmount = 2e18)
     let min_tick = PoolTick::get_min_tick(MEDIUM_FEE_TICK_SPACING);
@@ -708,7 +899,7 @@ fn medium_fee_pool_profiler() -> PoolProfiler {
 fn empty_low_fee_pool_profiler() -> PoolProfiler {
     let pool_definition = pool_definition(Some(500), Some(10), Some(encode_sqrt_ratio_x96(1, 1)));
     let mut profiler = PoolProfiler::new(Arc::new(pool_definition));
-    profiler.initialize(encode_sqrt_ratio_x96(1, 1)); // Initialize at 1:1 price (tick 0)
+    profiler.initialize(encode_sqrt_ratio_x96(1, 1)).unwrap(); // Initialize at 1:1 price (tick 0)
     profiler
 }
 
@@ -768,7 +959,7 @@ fn test_mint_above_current_price(mut uni_pool_profiler: PoolProfiler) {
     active_tick_values.sort_unstable();
     assert_eq!(
         active_tick_values,
-        vec![-887220, lower_tick, upper_tick, 887220]
+        vec![-887_220, lower_tick, upper_tick, 887_220]
     );
     assert!(
         uni_pool_profiler
@@ -800,7 +991,10 @@ fn test_max_tick_with_high_leverage(mut uni_pool_profiler: PoolProfiler) {
     assert_eq!(position.liquidity, liquidity);
     assert_eq!(position.tick_lower, lower_tick);
     assert_eq!(position.tick_upper, upper_tick);
-    assert_eq!(position.total_amount0_deposited, U256::from(828011525u32));
+    assert_eq!(
+        position.total_amount0_deposited,
+        U256::from(828_011_525_u32)
+    );
     assert_eq!(position.total_amount1_deposited, U256::ZERO);
     // We have only three active ticks, and max_tick is updated two times (from init mint and this mint)
     assert_eq!(uni_pool_profiler.get_active_tick_count(), 3);
@@ -812,7 +1006,7 @@ fn test_max_tick_with_high_leverage(mut uni_pool_profiler: PoolProfiler) {
     );
     let mut active_tick_values = uni_pool_profiler.get_active_tick_values();
     active_tick_values.sort_unstable();
-    assert_eq!(active_tick_values, vec![-887220, lower_tick, max_tick]);
+    assert_eq!(active_tick_values, vec![-887_220, lower_tick, max_tick]);
 }
 
 #[rstest]
@@ -850,7 +1044,7 @@ fn test_minting_works_for_max_tick(mut uni_pool_profiler: PoolProfiler) {
     );
     let mut active_tick_values = uni_pool_profiler.get_active_tick_values();
     active_tick_values.sort_unstable();
-    assert_eq!(active_tick_values, vec![-887220, lower_tick, max_tick]);
+    assert_eq!(active_tick_values, vec![-887_220, lower_tick, max_tick]);
 }
 
 #[rstest]
@@ -1391,7 +1585,7 @@ fn test_mint_below_current_price_when_really_high_leverage(mut uni_pool_profiler
     assert_eq!(position.tick_lower, lower_tick);
     assert_eq!(position.tick_upper, upper_tick);
     assert_eq!(position.total_amount0_deposited, 0);
-    assert_eq!(position.total_amount1_deposited, 828011520);
+    assert_eq!(position.total_amount1_deposited, 828_011_520);
     assert_eq!(position.tokens_owed_0, 0);
     assert_eq!(position.tokens_owed_1, 0);
 }
@@ -1530,9 +1724,9 @@ fn test_collect_works_with_multiple_lps(mut empty_low_fee_pool_profiler: PoolPro
         .expect("Position 1 should exist");
 
     // Position 0 (full range, 1e18 liquidity) should get 1/3 of fees
-    assert_eq!(position0.tokens_owed_0, 166666666666667);
+    assert_eq!(position0.tokens_owed_0, 166_666_666_666_667);
     // Position 1 (narrower range, 2e18 liquidity) should get 2/3 of fees
-    assert_eq!(position1.tokens_owed_0, 333333333333334);
+    assert_eq!(position1.tokens_owed_0, 333_333_333_333_334);
 }
 
 // ---------- WORKS ACROSS LARGE FEE INCREASES ----------
@@ -1676,7 +1870,7 @@ fn test_overflow_boundary_token0(mut empty_low_fee_pool_profiler: PoolProfiler) 
 
     // When fee_growth wraps around from MaxUint256, the underflow-safe calculation
     // should still correctly compute fees
-    assert_eq!(position.tokens_owed_0, 499999999999999);
+    assert_eq!(position.tokens_owed_0, 499_999_999_999_999);
     assert_eq!(position.tokens_owed_1, 0);
 }
 
@@ -1714,7 +1908,7 @@ fn test_overflow_boundary_token1(mut empty_low_fee_pool_profiler: PoolProfiler) 
         .expect("Position should exist");
 
     assert_eq!(position.tokens_owed_0, 0);
-    assert_eq!(position.tokens_owed_1, 499999999999999);
+    assert_eq!(position.tokens_owed_1, 499_999_999_999_999);
 }
 
 #[rstest]
@@ -1757,8 +1951,8 @@ fn test_overflow_boundary_token0_and_token1(mut empty_low_fee_pool_profiler: Poo
         .expect("Position should exist");
 
     // Both tokens should have fees from their respective swaps
-    assert_eq!(position.tokens_owed_0, 499999999999999);
-    assert_eq!(position.tokens_owed_1, 500000000000000);
+    assert_eq!(position.tokens_owed_0, 499_999_999_999_999);
+    assert_eq!(position.tokens_owed_1, 500_000_000_000_000);
 }
 
 #[rstest]
@@ -2141,7 +2335,7 @@ fn format_price(sqrt_price_x96: U160) -> String {
     let remainder = price_squared % divisor;
 
     // Calculate 5 decimal places for rounding to 4
-    let decimal_part = (remainder * U256::from(100000u64) + divisor / U256::from(2u64)) / divisor;
+    let decimal_part = (remainder * U256::from(100_000_u64) + divisor / U256::from(2u64)) / divisor;
 
     // Round to 4 decimal places
     let rounded_decimal = decimal_part / U256::from(10u64);
@@ -2162,7 +2356,10 @@ fn test_pool_swaps(pool_test_case: PoolTestCase) {
         Some(pool_test_case.starting_price),
     );
     let mut initial_profiler = PoolProfiler::new(Arc::new(pool_definition));
-    initial_profiler.initialize(pool_test_case.starting_price);
+    initial_profiler
+        .initialize(pool_test_case.starting_price)
+        .unwrap();
+
     for mint in &pool_test_case.positions {
         initial_profiler
             .execute_mint(
@@ -2218,8 +2415,8 @@ fn test_pool_swaps(pool_test_case: PoolTestCase) {
                     expected_result.execution_price
                 );
             }
-            Err(_) => {
-                panic!("Add error testing for failed swap")
+            Err(e) => {
+                panic!("Add error testing for failed swap: {e}")
             }
         }
     }
@@ -2268,4 +2465,200 @@ fn test_size_for_impact_bps_validation(medium_fee_pool_profiler: PoolProfiler) {
             );
         }
     }
+}
+
+#[rstest]
+fn test_process_mint_overflow_leaves_state_unchanged() {
+    use crate::defi::pool_analysis::error::{PoolEventKind, PoolProfilerError};
+
+    let pool_definition = pool_definition(Some(500), Some(10), Some(encode_sqrt_ratio_x96(1, 1)));
+    let expected_instrument_id = pool_definition.instrument_id;
+    let expected_pool_identifier = pool_definition.pool_identifier;
+    let mut profiler = PoolProfiler::new(Arc::new(pool_definition));
+    profiler.initialize(encode_sqrt_ratio_x96(1, 1)).unwrap();
+
+    // Drive active liquidity near u128::MAX so an in-range mint overflows.
+    profiler.tick_map.liquidity = u128::MAX - 10;
+
+    let tick_lower = -10;
+    let tick_upper = 10;
+    let mint_liquidity: u128 = 100;
+    let owner = lp_address();
+    let mint = create_mint_event(owner, tick_lower, tick_upper, mint_liquidity);
+    let expected_block = mint.block;
+    let expected_tx_index = mint.transaction_index;
+    let expected_log_index = mint.log_index;
+
+    let pre_active = profiler.tick_map.liquidity;
+    let pre_tick_lower = profiler.get_tick(tick_lower).copied();
+    let pre_tick_upper = profiler.get_tick(tick_upper).copied();
+    let pre_total_mints = profiler.analytics.total_mints;
+
+    let err = profiler
+        .process(&DexPoolData::LiquidityUpdate(mint))
+        .unwrap_err();
+    let profiler_err = err
+        .downcast_ref::<PoolProfilerError>()
+        .expect("expected PoolProfilerError");
+
+    match profiler_err {
+        PoolProfilerError::LiquidityOverflow {
+            location,
+            current,
+            delta,
+        } => {
+            assert_eq!(*current, pre_active);
+            assert_eq!(*delta, mint_liquidity);
+            assert_eq!(location.instrument_id, expected_instrument_id);
+            assert_eq!(location.pool_identifier, expected_pool_identifier);
+            assert_eq!(location.block, expected_block);
+            assert_eq!(location.transaction_index, expected_tx_index);
+            assert_eq!(location.log_index, expected_log_index);
+            assert_eq!(location.event_kind, PoolEventKind::Mint);
+        }
+        other => panic!("expected LiquidityOverflow, was {other:?}"),
+    }
+
+    assert_eq!(profiler.tick_map.liquidity, pre_active);
+    assert_eq!(profiler.get_tick(tick_lower).copied(), pre_tick_lower);
+    assert_eq!(profiler.get_tick(tick_upper).copied(), pre_tick_upper);
+    assert_eq!(profiler.analytics.total_mints, pre_total_mints);
+    if let Some(pos) = profiler.get_position(&owner, tick_lower, tick_upper) {
+        assert_eq!(pos.liquidity, 0);
+    }
+}
+
+#[rstest]
+fn test_process_burn_underflow_leaves_state_unchanged() {
+    use crate::defi::pool_analysis::error::{PoolEventKind, PoolProfilerError};
+
+    let pool_definition = pool_definition(Some(500), Some(10), Some(encode_sqrt_ratio_x96(1, 1)));
+    let expected_instrument_id = pool_definition.instrument_id;
+    let expected_pool_identifier = pool_definition.pool_identifier;
+    let mut profiler = PoolProfiler::new(Arc::new(pool_definition));
+    profiler.initialize(encode_sqrt_ratio_x96(1, 1)).unwrap();
+
+    let tick_lower = -10;
+    let tick_upper = 10;
+    let position_liquidity: u128 = 1_000;
+    let owner = lp_address();
+
+    // Mint legally so the position holds enough to pass the position-vs-burn guard.
+    let mint = create_mint_event(owner, tick_lower, tick_upper, position_liquidity);
+    profiler
+        .process(&DexPoolData::LiquidityUpdate(mint))
+        .unwrap();
+
+    // Simulate tick-map drift: active liquidity below the position's contribution.
+    profiler.tick_map.liquidity = position_liquidity / 2;
+
+    let burn = create_burn_event(owner, tick_lower, tick_upper, position_liquidity);
+    let expected_block = burn.block;
+    let expected_tx_index = burn.transaction_index;
+    let expected_log_index = burn.log_index;
+
+    let pre_active = profiler.tick_map.liquidity;
+    let pre_tick_lower = profiler.get_tick(tick_lower).copied();
+    let pre_tick_upper = profiler.get_tick(tick_upper).copied();
+    let pre_position_liquidity = profiler
+        .get_position(&owner, tick_lower, tick_upper)
+        .map(|p| p.liquidity)
+        .unwrap();
+    let pre_total_burns = profiler.analytics.total_burns;
+
+    let err = profiler
+        .process(&DexPoolData::LiquidityUpdate(burn))
+        .unwrap_err();
+    let profiler_err = err
+        .downcast_ref::<PoolProfilerError>()
+        .expect("expected PoolProfilerError");
+
+    match profiler_err {
+        PoolProfilerError::LiquidityUnderflow {
+            location,
+            current,
+            delta,
+        } => {
+            assert_eq!(*current, pre_active);
+            assert_eq!(*delta, position_liquidity);
+            assert_eq!(location.instrument_id, expected_instrument_id);
+            assert_eq!(location.pool_identifier, expected_pool_identifier);
+            assert_eq!(location.block, expected_block);
+            assert_eq!(location.transaction_index, expected_tx_index);
+            assert_eq!(location.log_index, expected_log_index);
+            assert_eq!(location.event_kind, PoolEventKind::Burn);
+        }
+        other => panic!("expected LiquidityUnderflow, was {other:?}"),
+    }
+
+    assert_eq!(profiler.tick_map.liquidity, pre_active);
+    assert_eq!(profiler.get_tick(tick_lower).copied(), pre_tick_lower);
+    assert_eq!(profiler.get_tick(tick_upper).copied(), pre_tick_upper);
+    assert_eq!(
+        profiler
+            .get_position(&owner, tick_lower, tick_upper)
+            .unwrap()
+            .liquidity,
+        pre_position_liquidity
+    );
+    assert_eq!(profiler.analytics.total_burns, pre_total_burns);
+}
+
+#[rstest]
+fn test_wrap_liquidity_error_rewraps_math_overflow() {
+    use crate::defi::pool_analysis::error::{
+        LiquidityMathError, PoolEventKind, PoolEventLocation, PoolProfilerError,
+    };
+
+    let location = PoolEventLocation {
+        instrument_id: pool_definition(None, None, None).instrument_id,
+        pool_identifier: pool_definition(None, None, None).pool_identifier,
+        block: 555,
+        transaction_index: 3,
+        log_index: 11,
+        event_kind: PoolEventKind::Mint,
+    };
+    let math_err = anyhow::Error::from(LiquidityMathError::Overflow {
+        current: 1,
+        delta: 2,
+    });
+
+    let wrapped = PoolProfiler::wrap_liquidity_error(math_err, location.clone());
+    let profiler_err = wrapped
+        .downcast_ref::<PoolProfilerError>()
+        .expect("expected PoolProfilerError after wrap");
+
+    match profiler_err {
+        PoolProfilerError::LiquidityOverflow {
+            location: out_loc,
+            current,
+            delta,
+        } => {
+            assert_eq!(*current, 1);
+            assert_eq!(*delta, 2);
+            assert_eq!(out_loc.block, location.block);
+            assert_eq!(out_loc.event_kind, location.event_kind);
+        }
+        other => panic!("expected LiquidityOverflow, was {other:?}"),
+    }
+}
+
+#[rstest]
+fn test_wrap_liquidity_error_passes_through_unrelated_anyhow() {
+    use crate::defi::pool_analysis::error::{PoolEventKind, PoolEventLocation, PoolProfilerError};
+
+    let location = PoolEventLocation {
+        instrument_id: pool_definition(None, None, None).instrument_id,
+        pool_identifier: pool_definition(None, None, None).pool_identifier,
+        block: 0,
+        transaction_index: 0,
+        log_index: 0,
+        event_kind: PoolEventKind::Swap,
+    };
+    let unrelated = anyhow::anyhow!("totally unrelated failure");
+
+    let wrapped = PoolProfiler::wrap_liquidity_error(unrelated, location);
+
+    assert!(wrapped.downcast_ref::<PoolProfilerError>().is_none());
+    assert!(wrapped.to_string().contains("totally unrelated failure"));
 }

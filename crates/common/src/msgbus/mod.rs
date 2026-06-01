@@ -48,11 +48,9 @@ pub mod typed_endpoints;
 pub mod typed_handler;
 pub mod typed_router;
 
-use std::{
-    cell::{OnceCell, RefCell},
-    rc::Rc,
-};
+use std::{any::Any, cell::RefCell, rc::Rc};
 
+use nautilus_core::UUID4;
 #[cfg(feature = "defi")]
 use nautilus_model::defi::{Block, Pool, PoolFeeCollect, PoolFlash, PoolLiquidityUpdate, PoolSwap};
 use nautilus_model::{
@@ -61,7 +59,8 @@ use nautilus_model::{
         OrderBookDepth10, QuoteTick, TradeTick,
         option_chain::{OptionChainSlice, OptionGreeks},
     },
-    events::{AccountState, OrderEventAny, PositionEvent},
+    events::{AccountState, OrderEventAny, PortfolioSnapshot, PositionEvent},
+    instruments::InstrumentAny,
     orderbook::OrderBook,
 };
 use smallvec::SmallVec;
@@ -79,6 +78,7 @@ pub use self::{
     },
     typed_router::{TopicRouter, TypedSubscription},
 };
+use crate::timer::TimeEvent;
 
 /// Inline capacity for handler buffers before heap allocation.
 pub(super) const HANDLER_BUFFER_CAP: usize = 64;
@@ -92,7 +92,7 @@ pub(super) const HANDLER_BUFFER_CAP: usize = 64;
 // Publish functions use move-out/move-back to avoid holding RefCell borrows
 // during handler calls (enabling re-entrant publishes).
 thread_local! {
-    pub(super) static MESSAGE_BUS: OnceCell<Rc<RefCell<MessageBus>>> = const { OnceCell::new() };
+    pub(super) static MESSAGE_BUS: RefCell<Option<Rc<RefCell<MessageBus>>>> = const { RefCell::new(None) };
 
     pub(super) static ANY_HANDLERS: RefCell<SmallVec<[ShareableMessageHandler; HANDLER_BUFFER_CAP]>> =
         RefCell::new(SmallVec::new());
@@ -123,9 +123,13 @@ thread_local! {
         RefCell::new(SmallVec::new());
     pub(super) static ACCOUNT_STATE_HANDLERS: RefCell<SmallVec<[TypedHandler<AccountState>; HANDLER_BUFFER_CAP]>> =
         RefCell::new(SmallVec::new());
+    pub(super) static PORTFOLIO_SNAPSHOT_HANDLERS: RefCell<SmallVec<[TypedHandler<PortfolioSnapshot>; HANDLER_BUFFER_CAP]>> =
+        RefCell::new(SmallVec::new());
     pub(super) static ORDER_EVENT_HANDLERS: RefCell<SmallVec<[TypedHandler<OrderEventAny>; HANDLER_BUFFER_CAP]>> =
         RefCell::new(SmallVec::new());
     pub(super) static POSITION_EVENT_HANDLERS: RefCell<SmallVec<[TypedHandler<PositionEvent>; HANDLER_BUFFER_CAP]>> =
+        RefCell::new(SmallVec::new());
+    pub(super) static INSTRUMENT_HANDLERS: RefCell<SmallVec<[TypedHandler<InstrumentAny>; HANDLER_BUFFER_CAP]>> =
         RefCell::new(SmallVec::new());
 
     #[cfg(feature = "defi")]
@@ -148,17 +152,10 @@ thread_local! {
         RefCell::new(SmallVec::new());
 }
 
-/// Sets the thread-local message bus.
-///
-/// # Panics
-///
-/// Panics if a message bus has already been set for this thread.
+/// Sets the thread-local message bus, replacing any existing one.
 pub fn set_message_bus(msgbus: Rc<RefCell<MessageBus>>) {
     MESSAGE_BUS.with(|bus| {
-        assert!(
-            bus.set(msgbus).is_ok(),
-            "Failed to set MessageBus: already initialized for this thread"
-        );
+        *bus.borrow_mut() = Some(msgbus);
     });
 }
 
@@ -167,10 +164,83 @@ pub fn set_message_bus(msgbus: Rc<RefCell<MessageBus>>) {
 /// If no message bus has been set for this thread, a default one is created and initialized.
 pub fn get_message_bus() -> Rc<RefCell<MessageBus>> {
     MESSAGE_BUS.with(|bus| {
-        bus.get_or_init(|| {
-            let msgbus = MessageBus::default();
-            Rc::new(RefCell::new(msgbus))
-        })
-        .clone()
+        let mut slot = bus.borrow_mut();
+        let rc = slot.get_or_insert_with(|| Rc::new(RefCell::new(MessageBus::default())));
+        rc.clone()
     })
+}
+
+/// Observes dispatched bus traffic for the durable event store.
+///
+/// The bus invokes the registered tap (when present) before each publish, send, or
+/// correlation response fanout, so subscribers cannot observe a message that has not
+/// yet been handed to the tap. The tap callback runs on the engine thread and must be
+/// cheap; it must not re-enter the bus (the bus is single-threaded and the call site
+/// holds no live borrow of the bus, so any re-entrant publish would deadlock through
+/// downstream `RefCell::borrow_mut` calls inside the registered tap).
+pub trait BusTap: 'static {
+    /// Invoked before a publish fanout dispatches to subscribers on `topic`.
+    fn on_publish(&self, topic: MStr<Topic>, message: &dyn Any);
+
+    /// Invoked before a send dispatch reaches the endpoint handler.
+    fn on_send(&self, endpoint: MStr<Endpoint>, message: &dyn Any);
+
+    /// Invoked before a correlation response dispatch reaches the response handler.
+    fn on_response(&self, _correlation_id: &UUID4, _message: &dyn Any) {}
+}
+
+thread_local! {
+    pub(super) static BUS_TAP: RefCell<Option<Rc<dyn BusTap>>> = const { RefCell::new(None) };
+}
+
+/// Registers `tap` as the thread-local bus tap, replacing any previously installed tap.
+///
+/// The tap fires before each publish, send, and correlation response fanout. Callers
+/// are responsible for clearing the tap on shutdown via [`clear_bus_tap`] so a stale
+/// adapter does not outlive the writer it captures into.
+pub fn set_bus_tap(tap: Rc<dyn BusTap>) {
+    BUS_TAP.with(|slot| {
+        *slot.borrow_mut() = Some(tap);
+    });
+}
+
+/// Clears the registered bus tap on this thread.
+///
+/// A no-op when no tap is installed.
+pub fn clear_bus_tap() {
+    BUS_TAP.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+#[inline]
+pub(super) fn dispatch_tap_publish(topic: MStr<Topic>, message: &dyn Any) {
+    // Clone the Rc so the cell borrow is released before the tap runs. The tap is
+    // single-threaded with the bus; a re-entrant `set_bus_tap` during dispatch would
+    // otherwise panic on RefCell.
+    let tap = BUS_TAP.with(|slot| slot.borrow().clone());
+    if let Some(tap) = tap {
+        tap.on_publish(topic, message);
+    }
+}
+
+#[inline]
+pub(super) fn dispatch_tap_send(endpoint: MStr<Endpoint>, message: &dyn Any) {
+    let tap = BUS_TAP.with(|slot| slot.borrow().clone());
+    if let Some(tap) = tap {
+        tap.on_send(endpoint, message);
+    }
+}
+
+#[inline]
+pub(super) fn dispatch_tap_response(correlation_id: &UUID4, message: &dyn Any) {
+    let tap = BUS_TAP.with(|slot| slot.borrow().clone());
+    if let Some(tap) = tap {
+        tap.on_response(correlation_id, message);
+    }
+}
+
+#[inline]
+pub(crate) fn dispatch_tap_time_event(event: &TimeEvent) {
+    dispatch_tap_publish(MessagingSwitchboard::time_event_topic(), event);
 }

@@ -15,6 +15,11 @@
 
 //! Python bindings from [PyO3](https://pyo3.rs).
 
+#![expect(
+    clippy::missing_errors_doc,
+    reason = "errors documented on underlying Rust methods"
+)]
+
 use pyo3::prelude::*;
 
 pub mod account;
@@ -85,7 +90,10 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::data::trade::TradeTick>()?;
     m.add_class::<crate::data::close::InstrumentClose>()?;
     m.add_class::<crate::data::funding::FundingRateUpdate>()?;
+    m.add_class::<crate::data::greeks::OptionGreekValues>()?;
     m.add_class::<crate::data::greeks::BlackScholesGreeksResult>()?;
+    m.add_class::<crate::data::greeks::GreeksData>()?;
+    m.add_class::<crate::data::greeks::PortfolioGreeks>()?;
     m.add_class::<crate::data::option_chain::OptionGreeks>()?;
     m.add_class::<crate::data::option_chain::OptionChainSlice>()?;
     m.add_class::<crate::data::option_chain::OptionStrikeData>()?;
@@ -113,11 +121,14 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::enums::AggressorSide>()?;
     m.add_class::<crate::enums::AssetClass>()?;
     m.add_class::<crate::enums::BarAggregation>()?;
+    m.add_class::<crate::enums::BarIntervalType>()?;
     m.add_class::<crate::enums::BetSide>()?;
     m.add_class::<crate::enums::BookAction>()?;
     m.add_class::<crate::enums::BookType>()?;
     m.add_class::<crate::enums::ContingencyType>()?;
+    m.add_class::<crate::enums::ContinuousFutureAdjustmentType>()?;
     m.add_class::<crate::enums::CurrencyType>()?;
+    m.add_class::<crate::enums::GreeksConvention>()?;
     m.add_class::<crate::enums::InstrumentClass>()?;
     m.add_class::<crate::enums::InstrumentCloseType>()?;
     m.add_class::<crate::enums::LiquiditySide>()?;
@@ -156,6 +167,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Orders
     m.add_class::<crate::orders::LimitOrder>()?;
     m.add_class::<crate::orders::LimitIfTouchedOrder>()?;
+    m.add_class::<crate::orders::MarketIfTouchedOrder>()?;
     m.add_class::<crate::orders::MarketOrder>()?;
     m.add_class::<crate::orders::MarketToLimitOrder>()?;
     m.add_class::<crate::orders::StopLimitOrder>()?;
@@ -169,13 +181,19 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::reports::mass_status::ExecutionMassStatus>()?;
     // Position
     m.add_class::<crate::position::Position>()?;
+    m.add_function(wrap_pyfunction!(
+        crate::python::position::py_fold_net_position,
+        m
+    )?)?;
     // Instruments
     m.add_class::<crate::instruments::BettingInstrument>()?;
     m.add_class::<crate::instruments::BinaryOption>()?;
     m.add_class::<crate::instruments::Cfd>()?;
     m.add_class::<crate::instruments::Commodity>()?;
     m.add_class::<crate::instruments::CryptoFuture>()?;
+    m.add_class::<crate::instruments::CryptoFuturesSpread>()?;
     m.add_class::<crate::instruments::CryptoOption>()?;
+    m.add_class::<crate::instruments::CryptoOptionSpread>()?;
     m.add_class::<crate::instruments::CryptoPerpetual>()?;
     m.add_class::<crate::instruments::CurrencyPair>()?;
     m.add_class::<crate::instruments::Equity>()?;
@@ -186,6 +204,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::instruments::OptionSpread>()?;
     m.add_class::<crate::instruments::PerpetualContract>()?;
     m.add_class::<crate::instruments::SyntheticInstrument>()?;
+    m.add_class::<crate::instruments::TokenizedAsset>()?;
     // Order book
     m.add_class::<crate::orderbook::book::OrderBook>()?;
     m.add_class::<crate::orderbook::level::BookLevel>()?;
@@ -223,11 +242,17 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::events::PositionClosed>()?;
     m.add_class::<crate::events::PositionAdjusted>()?;
     m.add_class::<crate::events::PositionSnapshot>()?;
+    m.add_class::<crate::events::PortfolioSnapshot>()?;
     // Accounts
+    m.add_class::<crate::accounts::BettingAccount>()?;
     m.add_class::<crate::accounts::CashAccount>()?;
     m.add_class::<crate::accounts::MarginAccount>()?;
     m.add_class::<crate::accounts::margin_model::StandardMarginModel>()?;
     m.add_class::<crate::accounts::margin_model::LeveragedMarginModel>()?;
+    m.add_function(wrap_pyfunction!(
+        crate::python::account::transformer::betting_account_from_account_events,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(
         crate::python::account::transformer::cash_account_from_account_events,
         m
@@ -264,7 +289,9 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<crate::defi::data::PoolFlash>()?;
         m.add_class::<crate::defi::data::Transaction>()?;
         m.add_class::<crate::defi::data::Block>()?;
+        m.add_class::<crate::defi::data::DefiData>()?;
         m.add_class::<crate::defi::dex::DexType>()?;
+        m.add_class::<crate::defi::pool_analysis::PoolSnapshot>()?;
         m.add_class::<crate::defi::pool_analysis::PoolProfiler>()?;
     }
     Ok(())

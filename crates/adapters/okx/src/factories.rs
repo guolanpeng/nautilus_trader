@@ -18,19 +18,22 @@
 use std::{any::Any, cell::RefCell, rc::Rc};
 
 use nautilus_common::{
-    cache::Cache,
+    cache::CacheView,
     clients::{DataClient, ExecutionClient},
     clock::Clock,
+    factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
 };
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     enums::{AccountType, OmsType},
     identifiers::ClientId,
 };
-use nautilus_system::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 
 use crate::{
-    common::{consts::OKX_VENUE, enums::OKXInstrumentType},
+    common::{
+        consts::{OKX, OKX_VENUE},
+        enums::OKXInstrumentType,
+    },
     config::{OKXDataClientConfig, OKXExecClientConfig},
     data::OKXDataClient,
     execution::OKXExecutionClient,
@@ -54,6 +57,10 @@ impl ClientConfig for OKXExecClientConfig {
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.okx", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.okx")
+)]
 pub struct OKXDataClientFactory;
 
 impl OKXDataClientFactory {
@@ -75,7 +82,7 @@ impl DataClientFactory for OKXDataClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        _cache: Rc<RefCell<Cache>>,
+        _cache: CacheView,
         _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn DataClient>> {
         let okx_config = config
@@ -94,7 +101,7 @@ impl DataClientFactory for OKXDataClientFactory {
     }
 
     fn name(&self) -> &'static str {
-        "OKX"
+        OKX
     }
 
     fn config_type(&self) -> &'static str {
@@ -107,6 +114,10 @@ impl DataClientFactory for OKXDataClientFactory {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.okx", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.okx")
 )]
 pub struct OKXExecutionClientFactory;
 
@@ -129,7 +140,7 @@ impl ExecutionClientFactory for OKXExecutionClientFactory {
         &self,
         name: &str,
         config: &dyn ClientConfig,
-        cache: Rc<RefCell<Cache>>,
+        cache: CacheView,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let okx_config = config
             .as_any()
@@ -178,7 +189,7 @@ impl ExecutionClientFactory for OKXExecutionClientFactory {
     }
 
     fn name(&self) -> &'static str {
-        "OKX"
+        OKX
     }
 
     fn config_type(&self) -> &'static str {
@@ -190,9 +201,11 @@ impl ExecutionClientFactory for OKXExecutionClientFactory {
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use nautilus_common::cache::Cache;
+    use nautilus_common::{
+        cache::Cache,
+        factories::{ClientConfig, ExecutionClientFactory},
+    };
     use nautilus_model::identifiers::{AccountId, TraderId};
-    use nautilus_system::factories::{ClientConfig, ExecutionClientFactory};
     use rstest::rstest;
 
     use super::*;
@@ -201,14 +214,14 @@ mod tests {
     #[rstest]
     fn test_okx_execution_client_factory_creation() {
         let factory = OKXExecutionClientFactory::new();
-        assert_eq!(factory.name(), "OKX");
+        assert_eq!(factory.name(), OKX);
         assert_eq!(factory.config_type(), "OKXExecClientConfig");
     }
 
     #[rstest]
     fn test_okx_execution_client_factory_default() {
         let factory = OKXExecutionClientFactory::new();
-        assert_eq!(factory.name(), "OKX");
+        assert_eq!(factory.name(), OKX);
     }
 
     #[rstest]
@@ -241,7 +254,7 @@ mod tests {
 
         let cache = Rc::new(RefCell::new(Cache::default()));
 
-        let result = factory.create("OKX-TEST", &config, cache);
+        let result = factory.create("OKX-TEST", &config, cache.into());
         assert!(result.is_ok());
 
         let client = result.unwrap();
@@ -263,8 +276,8 @@ mod tests {
 
         let cache = Rc::new(RefCell::new(Cache::default()));
 
-        let result = factory.create("OKX-DERIV", &config, cache);
-        assert!(result.is_ok());
+        let result = factory.create("OKX-DERIV", &config, cache.into());
+        result.unwrap();
     }
 
     #[rstest]
@@ -274,7 +287,7 @@ mod tests {
 
         let cache = Rc::new(RefCell::new(Cache::default()));
 
-        let result = factory.create("OKX-TEST", &wrong_config, cache);
+        let result = factory.create("OKX-TEST", &wrong_config, cache.into());
         assert!(result.is_err());
         assert!(
             result

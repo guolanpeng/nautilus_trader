@@ -15,7 +15,7 @@
 
 //! Example demonstrating live execution testing with the Kraken adapter.
 //!
-//! Run with: `cargo run -p nautilus-kraken --example kraken-exec-tester`
+//! Run with: `cargo run -p nautilus-kraken --example kraken-exec-tester --features examples`
 //!
 //! Environment variables (for Spot):
 //! - KRAKEN_SPOT_API_KEY: Your Kraken Spot API key
@@ -23,16 +23,17 @@
 
 use nautilus_common::enums::Environment;
 use nautilus_kraken::{
-    common::{credential::KrakenCredential, enums::KrakenProductType},
+    common::{consts::KRAKEN_CLIENT_ID, credential::KrakenCredential, enums::KrakenProductType},
     config::{KrakenDataClientConfig, KrakenExecClientConfig},
     factories::{KrakenDataClientFactory, KrakenExecutionClientFactory},
 };
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
-    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId},
+    identifiers::{AccountId, InstrumentId, StrategyId, TraderId},
     types::Quantity,
 };
 use nautilus_testkit::testers::{ExecTester, ExecTesterConfig};
+use nautilus_trading::strategy::StrategyConfig;
 
 // *** THIS IS A TEST STRATEGY WITH NO ALPHA ADVANTAGE WHATSOEVER. ***
 // *** IT IS NOT INTENDED TO BE USED TO TRADE LIVE WITH REAL MONEY. ***
@@ -66,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("KRAKEN-001");
     let node_name = "KRAKEN-EXEC-TESTER-001".to_string();
-    let client_id = ClientId::new("KRAKEN");
+    let client_id = *KRAKEN_CLIENT_ID;
 
     let credential = match product_type {
         KrakenProductType::Spot => KrakenCredential::resolve_spot(None, None),
@@ -105,22 +106,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_delay_post_stop_secs(5)
         .build()?;
 
-    let mut tester_config = ExecTesterConfig::new(
-        StrategyId::from("EXEC_TESTER-001"),
-        instrument_id,
-        client_id,
-        order_qty,
-    )
-    .with_subscribe_trades(true)
-    .with_subscribe_quotes(true)
-    .with_use_post_only(true)
-    .with_open_position_on_start(order_qty.as_decimal())
-    // .with_tob_offset_ticks(0)
-    .with_test_reject_post_only(true)
-    .with_log_data(false);
-
-    // Use UUIDs for unique client order IDs across restarts
-    tester_config.base.use_uuid_client_order_ids = true;
+    let tester_config = ExecTesterConfig::builder()
+        .base(StrategyConfig {
+            strategy_id: Some(StrategyId::from("EXEC_TESTER-001")),
+            external_order_claims: Some(vec![instrument_id]),
+            // Kraken truncates non-UUID client order IDs to 18 chars,
+            // which can cause collisions across sessions at the same time of day.
+            use_uuid_client_order_ids: true,
+            ..Default::default()
+        })
+        .instrument_id(instrument_id)
+        .client_id(client_id)
+        .order_qty(order_qty)
+        .use_post_only(true)
+        .open_position_on_start_qty(order_qty.as_decimal())
+        // .tob_offset_ticks(0)
+        .log_data(false)
+        .build();
 
     let tester = ExecTester::new(tester_config);
 

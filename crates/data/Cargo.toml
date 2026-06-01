@@ -18,7 +18,7 @@ workspace = true
 
 [lib]
 name = "nautilus_data"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [features]
 default = []
@@ -41,6 +41,7 @@ python = [
   "nautilus-model/python",
   "nautilus-persistence?/python",
   "pyo3",
+  "pyo3-stub-gen",
 ]
 defi = ["nautilus-common/defi", "nautilus-model/defi", "alloy-primitives"]
 
@@ -57,15 +58,29 @@ nautilus-persistence = { workspace = true, optional = true }
 ahash = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+bon = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
 log = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 ustr = { workspace = true }
 
 alloy-primitives = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-serialization = { workspace = true, features = ["arrow"] }
+
+criterion = { workspace = true }
+proptest = { workspace = true }
 rstest = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+
+# Run with `cargo bench -p nautilus-data --bench engine`
+[[bench]]
+name = "engine"
+harness = false

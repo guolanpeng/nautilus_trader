@@ -19,7 +19,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -34,19 +34,28 @@ use axum::{
     response::Response,
     routing::get,
 };
-use dashmap::DashSet;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::testing::wait_until_async;
-use nautilus_core::UnixNanos;
-use nautilus_deribit::websocket::{
-    auth::DERIBIT_DATA_SESSION_NAME, client::DeribitWebSocketClient, enums::DeribitUpdateInterval,
-    messages::NautilusWsMessage,
+use nautilus_core::{AtomicSet, UnixNanos};
+use nautilus_deribit::{
+    common::{consts::DERIBIT_VENUE, enums::DeribitEnvironment},
+    data_types::DeribitVolatilityIndex,
+    websocket::{
+        auth::DERIBIT_DATA_SESSION_NAME,
+        client::DeribitWebSocketClient,
+        enums::DeribitUpdateInterval,
+        handler::{DeribitWsFeedHandler, HandlerCommand},
+        messages::{DeribitOrderParams, NautilusWsMessage},
+    },
 };
 use nautilus_model::{
-    identifiers::{InstrumentId, Symbol, Venue},
+    data::Data,
+    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, Symbol, TraderId},
     instruments::{CryptoPerpetual, InstrumentAny},
     types::{Currency, Price, Quantity},
 };
+use nautilus_network::websocket::{AuthTracker, SubscriptionState, TransportBackend};
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 // ------------------------------------------------------------------------------------------------
@@ -66,7 +75,7 @@ fn load_json(filename: &str) -> Value {
 /// Creates a mock BTC-PERPETUAL instrument for testing.
 fn create_btc_perpetual() -> InstrumentAny {
     InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-        InstrumentId::new(Symbol::from("BTC-PERPETUAL"), Venue::from("DERIBIT")),
+        InstrumentId::new(Symbol::from("BTC-PERPETUAL"), *DERIBIT_VENUE),
         Symbol::from("BTC-PERPETUAL"),
         Currency::BTC(),
         Currency::USD(),
@@ -159,6 +168,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<TestServerState>) {
     let ticker_payload = load_json("ws_ticker.json");
     let quote_payload = load_json("ws_quote.json");
     let chart_payload = load_json("ws_chart.json");
+    let volatility_index_payload = load_json("ws_volatility_index.json");
 
     // Create a second chart payload with a later timestamp for emit-on-next pattern
     let mut chart_payload_next = chart_payload.clone();
@@ -268,6 +278,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<TestServerState>) {
                                         break;
                                     }
                                     Some(&chart_payload_next)
+                                } else if channel.starts_with("deribit_volatility_index.") {
+                                    Some(&volatility_index_payload)
                                 } else {
                                     None
                                 };
@@ -295,6 +307,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<TestServerState>) {
                                 params.get("channels").and_then(|c| c.as_array())
                         {
                             let mut unsubscribed = Vec::new();
+
                             for channel in channels {
                                 if let Some(channel_str) = channel.as_str() {
                                     state
@@ -530,6 +543,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<TestServerState>) {
                                 params.get("channels").and_then(|c| c.as_array())
                         {
                             let mut unsubscribed = Vec::new();
+
                             for channel in channels {
                                 if let Some(channel_str) = channel.as_str() {
                                     state
@@ -560,6 +574,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<TestServerState>) {
                     _ => {}
                 }
             }
+            // Inner if consumes `data`, cannot hoist into a match guard
+            #[allow(clippy::collapsible_match)]
             Message::Ping(data) => {
                 if socket.send(Message::Pong(data)).await.is_err() {
                     break;
@@ -598,10 +614,12 @@ async fn start_ws_server(state: Arc<TestServerState>) -> SocketAddr {
 fn create_test_client(ws_url: &str) -> DeribitWebSocketClient {
     DeribitWebSocketClient::new(
         Some(ws_url.to_string()),
-        None,     // api_key
-        None,     // api_secret
-        Some(30), // heartbeat_interval
-        true,     // is_testnet
+        None,                        // api_key
+        None,                        // api_secret
+        30,                          // heartbeat_interval
+        DeribitEnvironment::Testnet, // environment,
+        TransportBackend::default(),
+        None, // proxy_url
     )
     .expect("failed to construct deribit websocket client")
 }
@@ -610,8 +628,12 @@ fn create_test_client(ws_url: &str) -> DeribitWebSocketClient {
 ///
 /// Does NOT fall back to environment variables.
 fn create_test_client_without_credentials(ws_url: &str) -> DeribitWebSocketClient {
-    DeribitWebSocketClient::new_unauthenticated(Some(ws_url.to_string()), Some(30), true)
-        .expect("failed to construct deribit websocket client")
+    DeribitWebSocketClient::new_unauthenticated(
+        Some(ws_url.to_string()),
+        30,
+        DeribitEnvironment::Testnet,
+    )
+    .expect("failed to construct deribit websocket client")
 }
 
 #[tokio::test]
@@ -623,7 +645,7 @@ async fn test_websocket_connection() {
     let instruments = load_test_instruments();
 
     let mut client = create_test_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
 
     wait_until_async(
@@ -653,15 +675,80 @@ async fn test_websocket_connection() {
 async fn test_wait_until_active_timeout() {
     let client = DeribitWebSocketClient::new(
         Some("ws://127.0.0.1:0/ws/api/v2".to_string()),
-        None,     // api_key
-        None,     // api_secret
-        Some(30), // heartbeat_interval
-        true,     // is_testnet
+        None,                        // api_key
+        None,                        // api_secret
+        30,                          // heartbeat_interval
+        DeribitEnvironment::Testnet, // environment,
+        TransportBackend::default(),
+        None, // proxy_url
     )
     .expect("construct client");
 
     let result = client.wait_until_active(0.1).await;
     assert!(result.is_err(), "expected timeout error");
+}
+
+#[tokio::test]
+async fn test_order_command_send_failure_does_not_emit_rejection() {
+    let signal = Arc::new(AtomicBool::new(false));
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut handler = DeribitWsFeedHandler::new(
+        signal.clone(),
+        cmd_rx,
+        raw_rx,
+        out_tx,
+        AuthTracker::new(),
+        SubscriptionState::new('.'),
+        Arc::new(AtomicSet::new()),
+        Arc::new(AtomicSet::new()),
+        Arc::new(AtomicSet::new()),
+        Some(AccountId::from("DERIBIT-001")),
+        true,
+        Arc::new(Mutex::new(Vec::new())),
+    );
+
+    let handle = tokio::spawn(async move { handler.next().await });
+    cmd_tx
+        .send(HandlerCommand::Buy {
+            params: DeribitOrderParams {
+                instrument_name: "BTC-PERPETUAL".to_string(),
+                amount: Decimal::new(1, 0),
+                order_type: "limit".to_string(),
+                label: Some("ws-send-fail-test-001".to_string()),
+                price: Some(Decimal::new(50_000, 0)),
+                time_in_force: Some("good_til_cancelled".to_string()),
+                post_only: Some(true),
+                reject_post_only: Some(true),
+                reduce_only: None,
+                trigger_price: None,
+                trigger: None,
+                max_show: None,
+                valid_until: None,
+            },
+            client_order_id: ClientOrderId::new("ws-send-fail-test-001"),
+            trader_id: TraderId::from("TESTER-001"),
+            strategy_id: StrategyId::from("S-001"),
+            instrument_id: InstrumentId::from("BTC-PERPETUAL.DERIBIT"),
+        })
+        .unwrap();
+
+    let message = tokio::time::timeout(Duration::from_millis(300), out_rx.recv()).await;
+    if let Ok(Some(message)) = message {
+        assert!(
+            !matches!(
+                message,
+                NautilusWsMessage::OrderRejected(_)
+                    | NautilusWsMessage::OrderCancelRejected(_)
+                    | NautilusWsMessage::OrderModifyRejected(_)
+            ),
+            "send failure emitted rejection: {message:?}"
+        );
+    }
+
+    signal.store(true, Ordering::Relaxed);
+    assert!(handle.await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -713,7 +800,7 @@ async fn test_trades_subscription_flow() {
     let instruments = load_test_instruments();
 
     let mut client = create_test_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -769,7 +856,7 @@ async fn test_book_subscription_snapshot() {
     let instruments = load_test_instruments();
 
     let mut client = create_test_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -825,11 +912,11 @@ async fn test_ticker_subscription_flow() {
     let instruments = load_test_instruments();
 
     let mut client = create_test_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
 
     // Set mark price subs so handler emits MarkPriceUpdate from ticker
     let instrument_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
-    let mark_price_subs = Arc::new(DashSet::new());
+    let mark_price_subs = Arc::new(AtomicSet::new());
     mark_price_subs.insert(instrument_id);
     client.set_mark_price_subs(mark_price_subs);
 
@@ -879,6 +966,68 @@ async fn test_ticker_subscription_flow() {
 }
 
 #[tokio::test]
+async fn test_ticker_subscription_emits_index_price_update() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let ws_url = format!("ws://{addr}/ws/api/v2");
+
+    let instruments = load_test_instruments();
+
+    let mut client = create_test_client(&ws_url);
+    client.cache_instruments(&instruments);
+
+    // Set index price subs so handler emits IndexPriceUpdate from ticker
+    let instrument_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+    let index_price_subs = Arc::new(AtomicSet::new());
+    index_price_subs.insert(instrument_id);
+    client.set_index_price_subs(index_price_subs);
+
+    client.connect().await.expect("connect failed");
+    client
+        .wait_until_active(5.0)
+        .await
+        .expect("client inactive");
+
+    client
+        .subscribe_ticker(instrument_id, None)
+        .await
+        .expect("subscribe failed");
+
+    // Verify subscription event recorded
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move {
+                state
+                    .subscription_events()
+                    .await
+                    .iter()
+                    .any(|(ch, ok)| ch.starts_with("ticker.") && *ok)
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Receive ticker data from stream
+    let stream = client.stream().unwrap();
+    pin_mut!(stream);
+    let message = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("no message received")
+        .expect("stream ended unexpectedly");
+
+    match message {
+        NautilusWsMessage::Data(data) => {
+            assert!(!data.is_empty(), "expected index price payload");
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+
+    client.close().await.expect("close failed");
+}
+
+#[tokio::test]
 async fn test_quote_subscription_flow() {
     let state = Arc::new(TestServerState::default());
     let addr = start_ws_server(state.clone()).await;
@@ -887,7 +1036,7 @@ async fn test_quote_subscription_flow() {
     let instruments = load_test_instruments();
 
     let mut client = create_test_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -935,6 +1084,84 @@ async fn test_quote_subscription_flow() {
 }
 
 #[tokio::test]
+async fn test_volatility_index_subscription_flow() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let ws_url = format!("ws://{addr}/ws/api/v2");
+
+    let instruments = load_test_instruments();
+
+    let mut client = create_test_client(&ws_url);
+    client.cache_instruments(&instruments);
+    client.connect().await.expect("connect failed");
+    client
+        .wait_until_active(5.0)
+        .await
+        .expect("client inactive");
+
+    client
+        .subscribe_volatility_index("btc_usd")
+        .await
+        .expect("subscribe failed");
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move {
+                state
+                    .subscription_events()
+                    .await
+                    .iter()
+                    .any(|(ch, ok)| ch.starts_with("deribit_volatility_index.") && *ok)
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let stream = client.stream().unwrap();
+    pin_mut!(stream);
+    let message = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("no message received")
+        .expect("stream ended unexpectedly");
+
+    match message {
+        NautilusWsMessage::Data(data) => {
+            let custom = data
+                .iter()
+                .find_map(|item| {
+                    if let Data::Custom(custom) = item {
+                        Some(custom)
+                    } else {
+                        None
+                    }
+                })
+                .expect("expected custom data payload");
+            let dvol = custom
+                .data
+                .as_any()
+                .downcast_ref::<DeribitVolatilityIndex>()
+                .expect("expected DeribitVolatilityIndex");
+            assert_eq!(dvol.index_name, "btc_usd");
+            assert_eq!(dvol.volatility, 129.36);
+            assert_eq!(
+                custom
+                    .data_type
+                    .metadata()
+                    .as_ref()
+                    .and_then(|m| m.get("index_name"))
+                    .and_then(|v| v.as_str()),
+                Some("btc_usd"),
+            );
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+
+    client.close().await.expect("close failed");
+}
+
+#[tokio::test]
 async fn test_chart_subscription_flow() {
     let state = Arc::new(TestServerState::default());
     let addr = start_ws_server(state.clone()).await;
@@ -943,7 +1170,7 @@ async fn test_chart_subscription_flow() {
     let instruments = load_test_instruments();
 
     let mut client = create_test_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -999,7 +1226,7 @@ async fn test_multiple_subscriptions() {
     let instruments = load_test_instruments();
 
     let mut client = create_test_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -1048,7 +1275,7 @@ async fn test_unsubscribe() {
     let instruments = load_test_instruments();
 
     let mut client = create_test_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -1109,7 +1336,7 @@ async fn test_heartbeat_enable() {
     let instruments = load_test_instruments();
 
     let mut client = create_test_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -1143,7 +1370,7 @@ async fn test_heartbeat_test_request_response() {
     let instruments = load_test_instruments();
 
     let mut client = create_test_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -1209,7 +1436,7 @@ async fn test_subscription_failure_handling() {
     let instruments = load_test_instruments();
 
     let mut client = create_test_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -1252,7 +1479,7 @@ async fn test_reconnection_after_disconnect() {
     let instruments = load_test_instruments();
 
     let mut client = create_test_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -1310,7 +1537,7 @@ async fn test_instrument_cache_usage() {
     let mut client = create_test_client(&ws_url);
 
     // Cache instruments before connect
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
 
     client.connect().await.expect("connect failed");
     client
@@ -1390,8 +1617,10 @@ fn create_authenticated_client(ws_url: &str) -> DeribitWebSocketClient {
         Some(ws_url.to_string()),
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
-        Some(30), // heartbeat_interval
-        true,     // is_testnet
+        30,                          // heartbeat_interval
+        DeribitEnvironment::Testnet, // environment,
+        TransportBackend::default(),
+        None, // proxy_url
     )
     .expect("failed to construct authenticated deribit websocket client")
 }
@@ -1405,7 +1634,7 @@ async fn test_authentication_success() {
     let instruments = load_test_instruments();
 
     let mut client = create_authenticated_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -1437,7 +1666,7 @@ async fn test_authentication_session_scope() {
     let instruments = load_test_instruments();
 
     let mut client = create_authenticated_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -1474,7 +1703,7 @@ async fn test_authentication_without_credentials_fails() {
 
     // Create client explicitly without credentials (bypasses env var resolution)
     let mut client = create_test_client_without_credentials(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -1500,7 +1729,7 @@ async fn test_raw_subscription_requires_authentication() {
     let instruments = load_test_instruments();
 
     let mut client = create_authenticated_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -1531,7 +1760,7 @@ async fn test_raw_subscription_after_authentication() {
     let instruments = load_test_instruments();
 
     let mut client = create_authenticated_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -1582,7 +1811,7 @@ async fn test_100ms_subscription_without_authentication() {
 
     // Create client without credentials (public only)
     let mut client = create_test_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)
@@ -1627,7 +1856,7 @@ async fn test_reconnection_with_reauthentication() {
     let instruments = load_test_instruments();
 
     let mut client = create_authenticated_client(&ws_url);
-    client.cache_instruments(instruments);
+    client.cache_instruments(&instruments);
     client.connect().await.expect("connect failed");
     client
         .wait_until_active(5.0)

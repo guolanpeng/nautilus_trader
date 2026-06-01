@@ -40,9 +40,9 @@ use crate::{
 /// - `address` = pool contract address
 /// - `pool_identifier` = same as address (hex string)
 ///
-/// **UniswapV4**: All pools share a singleton PoolManager contract. Pools are distinguished
+/// **`UniswapV4`**: All pools share a singleton `PoolManager` contract. Pools are distinguished
 /// by a unique Pool ID (keccak256 hash of currencies, fee, tick spacing, and hooks).
-/// - `address` = PoolManager contract address (shared by all pools)
+/// - `address` = `PoolManager` contract address (shared by all pools)
 /// - `pool_identifier` = Pool ID (bytes32 as hex string)
 ///
 /// ## Instrument ID Format
@@ -97,6 +97,9 @@ pub struct Pool {
     /// The hooks contract address for Uniswap V4 pools.
     /// For V2/V3 pools, this will be None. For V4, it contains the hooks contract address.
     pub hooks: Option<Address>,
+    /// UNIX timestamp (nanoseconds) when the pool event occurred.
+    #[serde(default)]
+    pub ts_event: UnixNanos,
     /// UNIX timestamp (nanoseconds) when the instance was created.
     pub ts_init: UnixNanos,
 }
@@ -107,7 +110,7 @@ pub type SharedPool = Arc<Pool>;
 impl Pool {
     /// Creates a new [`Pool`] instance with the specified properties.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         chain: SharedChain,
         dex: SharedDex,
@@ -136,11 +139,13 @@ impl Pool {
             initial_tick: None,
             initial_sqrt_price_x96: None,
             hooks: None,
+            ts_event: ts_init,
             ts_init,
         }
     }
 
     /// Returns a formatted string representation of the pool for display purposes.
+    #[must_use]
     pub fn to_full_spec_string(&self) -> String {
         format!(
             "{}/{}-{}.{}",
@@ -158,7 +163,7 @@ impl Pool {
     ///
     /// # Panics
     ///
-    /// Panics if the provided tick does not match the tick calculated from sqrt_price_x96.
+    /// Panics if the provided tick does not match the tick calculated from `sqrt_price_x96`.
     pub fn initialize(&mut self, sqrt_price_x96: U160, tick: i32) {
         let calculated_tick = get_tick_at_sqrt_ratio(sqrt_price_x96);
 
@@ -178,6 +183,7 @@ impl Pool {
         self.hooks = Some(hooks);
     }
 
+    #[must_use]
     pub fn create_instrument_id(
         chain: Blockchain,
         dex: &Dex,
@@ -194,6 +200,7 @@ impl Pool {
     /// which token becomes base vs quote:
     /// - Lower priority number (1=stablecoin, 2=native, 3=other) = quote token
     /// - Higher priority number = base token
+    #[must_use]
     pub fn get_base_token(&self) -> &Token {
         let priority0 = self.token0.get_token_priority();
         let priority1 = self.token1.get_token_priority();
@@ -210,6 +217,7 @@ impl Pool {
     /// The quote token is the pricing currency. Token priority determines
     /// which token becomes quote:
     /// - Lower priority number (1=stablecoin, 2=native, 3=other) = quote token
+    #[must_use]
     pub fn get_quote_token(&self) -> &Token {
         let priority0 = self.token0.get_token_priority();
         let priority1 = self.token1.get_token_priority();
@@ -230,6 +238,7 @@ impl Pool {
     /// # Use Case
     /// This is useful for knowing whether prices need to be inverted when
     /// converting from pool convention (token1/token0) to market convention (base/quote).
+    #[must_use]
     pub fn is_base_quote_inverted(&self) -> bool {
         let priority0 = self.token0.get_token_priority();
         let priority1 = self.token1.get_token_priority();
@@ -319,7 +328,7 @@ mod tests {
             Arc::new(dex),
             pool_address,
             pool_identifier,
-            12345678,
+            12_345_678,
             token0,
             token1,
             Some(3000),
@@ -330,7 +339,7 @@ mod tests {
         assert_eq!(pool.chain.chain_id, chain.chain_id);
         assert_eq!(pool.dex.name, DexType::UniswapV3);
         assert_eq!(pool.address, pool_address);
-        assert_eq!(pool.creation_block, 12345678);
+        assert_eq!(pool.creation_block, 12_345_678);
         assert_eq!(pool.token0.symbol, "WETH");
         assert_eq!(pool.token1.symbol, "USDT");
         assert_eq!(pool.fee.unwrap(), 3000);

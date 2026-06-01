@@ -105,11 +105,11 @@ Build the low-level networking and parsing foundation.
 
 | Step | Component                  | Description                                                                                  |
 |------|----------------------------|----------------------------------------------------------------------------------------------|
-| 1.1  | HTTP error types           | Define HTTP-specific error enum with retryable/non-retryable variants (`http/error.rs`).     |
+| 1.1  | HTTP error types           | Define HTTP‑specific error enum with retryable/non‑retryable variants (`http/error.rs`).     |
 | 1.2  | HTTP client                | Implement credentials, request signing, rate limiting, and retry logic.                      |
 | 1.3  | HTTP API models            | Define request/response structs for REST endpoints (`http/models.rs`, `http/query.rs`).      |
 | 1.4  | HTTP parsing               | Convert venue responses to Nautilus domain models (`http/parse.rs`, `common/parse.rs`).      |
-| 1.5  | WebSocket error types      | Define WebSocket-specific error enum (`websocket/error.rs`).                                 |
+| 1.5  | WebSocket error types      | Define WebSocket‑specific error enum (`websocket/error.rs`).                                 |
 | 1.6  | WebSocket client           | Implement connection lifecycle, authentication, heartbeat, and reconnection.                 |
 | 1.7  | WebSocket messages         | Define streaming payload types (`websocket/messages.rs`).                                    |
 | 1.8  | WebSocket parsing          | Convert stream messages to Nautilus domain models (`websocket/parse.rs`).                    |
@@ -125,7 +125,7 @@ Instruments are the foundation: both data and execution clients depend on them.
 |------|----------------------------|----------------------------------------------------------------------------------------------|
 | 2.1  | Instrument parsing         | Parse venue instrument definitions into Nautilus types (spot, perpetual, future, option).    |
 | 2.2  | Instrument provider        | Implement `InstrumentProvider` to load, filter, and cache instruments.                       |
-| 2.3  | Symbol mapping             | Handle venue-specific symbol formats and Nautilus `InstrumentId` conversion.                 |
+| 2.3  | Symbol mapping             | Handle venue‑specific symbol formats and Nautilus `InstrumentId` conversion.                 |
 
 **Milestone**: `InstrumentProvider.load_all_async()` returns valid Nautilus instruments.
 
@@ -161,9 +161,9 @@ Extend coverage based on venue capabilities.
 
 | Step | Component                  | Description                                                                                  |
 |------|----------------------------|----------------------------------------------------------------------------------------------|
-| 5.1  | Advanced order types       | Conditional orders, stop-loss, take-profit, trailing stops, iceberg, etc.                    |
+| 5.1  | Advanced order types       | Conditional orders, stop‑loss, take‑profit, trailing stops, iceberg, etc.                    |
 | 5.2  | Batch operations           | Batch order submission, batch cancellation, mass cancel.                                     |
-| 5.3  | Venue-specific features    | Options chains, funding rates, liquidations, or other venue-specific data.                   |
+| 5.3  | Venue‑specific features    | Options chains, funding rates, liquidations, or other venue‑specific data.                   |
 
 ### Phase 6: Configuration and factories
 
@@ -200,6 +200,29 @@ for fixtures, providing a single place for cross-cutting pieces.
 When an adapter has multiple environments or product categories, add a dedicated `common::urls` helper so
 REST/WebSocket base URLs stay in sync with the Python layer.
 
+### Symbol normalization (`common/symbol.rs`)
+
+When a venue uses a different symbol format than Nautilus `InstrumentId`, place bidirectional
+conversion helpers in `common/symbol.rs`. Two functions form the standard interface:
+
+- `format_instrument_id(venue_symbol, product_type)` converts a venue symbol string to a
+  Nautilus `InstrumentId`, appending or transforming product-type suffixes as needed
+  (e.g., `"BTCUSDT"` + `Linear` becomes `"BTCUSDT-LINEAR.BYBIT"`).
+- `format_venue_symbol(instrument_id)` strips Nautilus suffixes to recover the venue-native
+  symbol for API calls.
+
+Common patterns across adapters:
+
+- **Suffix-based product types**: Bybit appends `-SPOT`, `-LINEAR`, `-INVERSE`, `-OPTION`.
+  A `BybitSymbol` wrapper validates the suffix and normalizes to uppercase on construction.
+- **Implicit product mapping**: Binance USD-M futures append `-PERP` at the Nautilus layer
+  while COIN-M keeps the venue's existing `_PERP` suffix.
+- **Case normalization**: Convert to uppercase on input when venues are case-insensitive.
+- **`Ustr` interning**: Store normalized symbols as `Ustr` for zero-cost comparison.
+
+For venues where the raw symbol maps 1:1 to an `InstrumentId` (no suffix gymnastics), inline
+helpers in `common/parse.rs` are sufficient and a dedicated `symbol.rs` is not needed.
+
 ### URL resolution
 
 Define URL constants and resolution functions in `common/urls.rs`:
@@ -221,24 +244,115 @@ to these defaults when unset.
 Expose typed config structs in `src/config.rs` so Python callers toggle venue-specific behaviour
 (see how OKX wires demo URLs, retries, and channel flags).
 Keep defaults minimal and delegate URL selection to helpers in `common::urls`.
+For the user-facing design rationale, see the [Configuration](../concepts/configuration.md)
+concept guide.
 
-All config structs (data and execution) must implement `Default`. This enables the
-`..Default::default()` pattern in examples and tests, keeping only the fields that differ
-from defaults visible:
+#### Builder and Default
+
+Config structs derive `bon::Builder` and implement `Default`. The builder owns all default
+values via `#[builder(default = value)]` annotations. The `Default` impl delegates to the
+builder so defaults are defined in exactly one place:
 
 ```rust
-let exec_config = VenueExecClientConfig {
+#[derive(Clone, Debug, bon::Builder)]
+pub struct VenueDataClientConfig {
+    pub api_key: Option<String>,
+    #[builder(default = 60)]
+    pub http_timeout_secs: u64,
+    #[builder(default = 3)]
+    pub max_retries: u32,
+}
+
+impl Default for VenueDataClientConfig {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+```
+
+This prevents drift between builder defaults and `Default` output. Never duplicate
+default values in the `Default` impl body.
+
+Bon always defaults `Option<T>` fields to `None`. For the rare case where an
+`Option<T>` field should default to `Some(value)`, override it in the `Default` impl
+and delegate everything else to the builder:
+
+```rust
+impl Default for VenueDataClientConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_secs: Some(60),
+            ..Self::builder().build()
+        }
+    }
+}
+```
+
+#### Field type rules
+
+Use plain `T` with `#[builder(default = value)]` when a field always has a sensible
+default and downstream code consumes the value directly:
+
+```rust
+#[builder(default = 60)]
+pub http_timeout_secs: u64,
+```
+
+Use `Option<T>` (no builder annotation) when `None` carries distinct meaning such as
+"feature disabled", "unbounded", or "inherit from environment":
+
+```rust
+/// Interval in seconds between open order checks.
+/// When `None`, open order polling is disabled.
+pub open_check_interval_secs: Option<f64>,
+```
+
+Choose the type based on the config's own semantics, not downstream function
+signatures. If `None` means "this feature is off" at the config level, use
+`Option<T>`. If the field always resolves to a concrete value, use plain `T`
+even when a downstream constructor still accepts `Option<T>` and the call site
+wraps with `Some(config.field)`.
+
+#### Python constructors
+
+The `py_new` constructor accepts `Option<T>` for all configurable fields (Python callers
+pass `None` to mean "use default"). For plain `T` fields, unwrap against the default:
+
+```rust
+fn py_new(http_timeout_secs: Option<u64>) -> Self {
+    let defaults = Self::default();
+    Self {
+        http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
+        ..
+    }
+}
+```
+
+For `Option<T>` fields, use `.or()` to fall back to the default option value.
+When the default is `None`, this preserves the caller's `None`. When the default
+is `Some(value)`, this fills in the default if the caller passed `None`:
+
+```rust
+open_check_interval_secs: open_check_interval_secs.or(defaults.open_check_interval_secs),
+```
+
+#### Default values
+
+Use sensible production defaults: credentials as `None` (resolved from environment at
+runtime), mainnet URLs, standard timeouts. For `trader_id` and `account_id`, use
+placeholder values like `TraderId::from("TRADER-001")` and `AccountId::from("VENUE-001")`.
+
+The `..Default::default()` pattern keeps examples and tests focused on fields that
+differ from defaults:
+
+```rust
+let config = VenueExecClientConfig {
     trader_id,
     account_id,
     environment: VenueEnvironment::Testnet,
     ..Default::default()
 };
 ```
-
-Default values should use sensible production defaults: credentials as `None` (resolved
-from environment at runtime), mainnet URLs, standard timeouts. For `trader_id` and
-`account_id`, use placeholder values like `TraderId::from("TRADER-001")` and
-`AccountId::from("VENUE-001")`.
 
 ### Error taxonomy (`common/error.rs`)
 
@@ -318,7 +432,7 @@ Follow the pattern established in other adapters: prefixing Python-facing method
 
 When delivering instruments from WebSocket to Python, use `instrument_any_to_pyobject()` which returns PyO3 types
 for caching.
-For the reverse direction (Python→Rust), use `pyobject_to_instrument_any()` in `cache_instrument()` methods.
+For the reverse direction (Python->Rust), use `pyobject_to_instrument_any()` in `cache_instrument()` methods.
 Never call `.into_py_any()` directly on `InstrumentAny` as it doesn't implement the required trait.
 
 ### Type qualification
@@ -345,6 +459,32 @@ thread-safe access across clones.
 
 Store shared fixtures and payload loaders in `src/common/testing.rs` for use across HTTP and WebSocket unit tests.
 This keeps `#[cfg(test)]` helpers out of production modules and encourages reuse.
+
+### Instrument status diffing (`common/status.rs`)
+
+When a data client polls instrument status via REST, place the diff logic in `common/status.rs`
+rather than inlining it in the data client. The standard function signature is:
+
+```rust
+pub fn diff_and_emit_statuses(
+    new_statuses: &AHashMap<InstrumentId, MarketStatusAction>,
+    cached_statuses: &mut AHashMap<InstrumentId, MarketStatusAction>,
+    subscriptions: Option<&DashSet<InstrumentId>>,
+    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+)
+```
+
+The function compares each entry in `new_statuses` against `cached_statuses`, emitting an
+`InstrumentStatus` event for any instrument whose `MarketStatusAction` changed. Instruments
+present in the cache but absent from the new snapshot are treated as removed and emit
+`NotAvailableForTrading`. The cache always reflects the full API state.
+
+Pass `subscriptions` as `Some(&set)` to restrict emissions to subscribed instruments, or
+`None` to emit all changes unconditionally. The data client stores the cache in an
+`Arc<RwLock<AHashMap<InstrumentId, MarketStatusAction>>>` and calls this function on each
+poll cycle.
 
 ### Factory module (`factories.rs`)
 
@@ -376,6 +516,29 @@ race conditions with reconciliation and strategy startup. The platform waits for
 signal connected before running reconciliation or starting strategies, so all initialization must
 complete within `connect()`.
 
+#### Data event emission
+
+Data clients emit events to the platform through an unbounded channel obtained at
+construction:
+
+```rust
+let data_sender = get_data_event_sender();
+```
+
+The `DataEvent` enum carries all data types the client produces:
+
+| Variant                       | Usage                                                 |
+|-------------------------------|-------------------------------------------------------|
+| `DataEvent::Instrument`       | Instrument definitions during bootstrap and updates.  |
+| `DataEvent::InstrumentStatus` | Market status changes from polling or WS streams.     |
+| `DataEvent::Data`             | Market data (trades, quotes, book deltas, bars).      |
+| `DataEvent::Response`         | Responses to historical data requests.                |
+| `DataEvent::FundingRate`      | Funding rate updates for derivatives.                 |
+
+Send events with `self.data_sender.send(DataEvent::Instrument(instrument))`. Log warnings
+on send failure but do not propagate the error since a closed receiver means the system
+is shutting down. Clone the sender for spawned tasks that emit data from async work.
+
 #### Data client
 
 1. **Fetch instruments via REST** - call `bootstrap_instruments()` or equivalent.
@@ -397,14 +560,20 @@ async fn connect(&mut self) -> anyhow::Result<()> {
 
 #### Execution client
 
-1. **Initialize instruments** - fetch via REST if not already cached. Cache to HTTP, WebSocket,
-   and broadcaster clients.
+1. **Initialize instruments** - call `ensure_instruments_initialized_async()` which checks
+   `self.core.instruments_initialized()` and returns early if instruments are already cached.
+   Otherwise it fetches instruments via REST and caches them to the HTTP client, WebSocket
+   client, and any broadcaster clients.
 2. **Connect WebSocket** - establish the private streaming connection.
 3. **Subscribe to channels** - orders, executions, positions, wallet/margin.
 4. **Start WebSocket stream handler** - begin processing incoming messages.
-5. **Fetch account state** - request account state via REST and emit via `emitter.send_account_state()`.
-6. **Await account registered** - poll the cache until the account is registered (30s timeout).
-   This ensures the portfolio can process orders during reconciliation.
+5. **Fetch account state** - call `refresh_account_state()` which requests balances and
+   margins via REST, builds an `AccountState`, and emits it through the
+   `ExecutionEventEmitter`.
+6. **Await account registered** - call `await_account_registered(timeout_secs)` which polls
+   `self.core.cache().account(&account_id)` at 10ms intervals until the account appears or
+   the timeout expires. This step blocks connect so the portfolio can process orders during
+   reconciliation.
 7. **Signal connected** - call `self.core.set_connected()`.
 
 ```rust
@@ -423,8 +592,15 @@ async fn connect(&mut self) -> anyhow::Result<()> {
 }
 ```
 
-The `await_account_registered` method polls `self.core.cache().account(&account_id)` at 10ms
-intervals until the account appears or the timeout expires.
+#### Account state emission
+
+The `ExecutionEventEmitter` provides two methods for emitting account state:
+
+- `emit_account_state(balances, margins, reported, ts_event)` builds an `AccountState`
+  from raw parameters using the internal `OrderEventFactory`, then dispatches it. Use
+  this when the adapter has individual balance and margin values to combine.
+- `send_account_state(state)` dispatches a pre-built `AccountState`. Use this when the
+  adapter already has a fully constructed state from parsing an HTTP or WebSocket payload.
 
 ## HTTP client patterns
 
@@ -488,6 +664,13 @@ instrument references) and returns a Nautilus domain type wrapped in `Result`.
 - Use descriptive function names: `parse_position_status_report`, `parse_order_status_report`, `parse_trade_tick`.
 
 Place parsing helpers (`parse_price_with_precision`, `parse_timestamp`) in the same module as private functions when they're reused across multiple parsers.
+
+### Timestamp conventions
+
+Nautilus uses `UnixNanos` (nanoseconds since epoch). Most venues deliver `ms`. Convert at the
+parser boundary using `nautilus_core::datetime::millis_to_nanos`; document the wire unit on the
+struct field. `ts_event` is the converted venue timestamp; `ts_init` is `clock.get_time_ns()`.
+For records with no venue timestamp (instruments), use `clock.get_time_ns()` for both.
 
 ### Method naming and organization
 
@@ -705,8 +888,8 @@ The underlying `WebSocketClient` sends a `RECONNECTED` sentinel message when rec
 
 - Runs in dedicated Tokio task as stateless I/O boundary.
 - Owns `WebSocketClient` exclusively (no `RwLock` needed).
-- Processes commands from `cmd_rx` → serializes to JSON → sends via WebSocket.
-- Receives raw WebSocket messages → deserializes into `{Venue}WsFrame` → converts to `{Venue}WsMessage` → emits via `out_tx`.
+- Processes commands from `cmd_rx` -> serializes to JSON -> sends via WebSocket.
+- Receives raw WebSocket messages -> deserializes into `{Venue}WsFrame` -> converts to `{Venue}WsMessage` -> emits via `out_tx`.
 - Owns pending request state using `AHashMap<K, V>` (single-threaded, no locking).
 - Uses `VecDeque<{Venue}WsMessage>` to buffer multi-message yields from a single frame parse.
 
@@ -733,7 +916,7 @@ flowchart LR
 
     cmd_tx --> cmd_rx
     cmd_rx -->|"serialize"| ws
-    ws -->|"parse → transform"| out_tx
+    ws -->|"parse -> transform"| out_tx
     out_tx --> out_rx
 ```
 
@@ -746,19 +929,170 @@ flowchart LR
 - **Message buffering**: Handler uses `VecDeque<{Venue}WsMessage>` for frames that produce multiple output messages. The `next()` method drains the queue before polling channels.
 - **Python constraint**: Client uses `Arc<DashMap>` only for state Python might query; handler uses `AHashMap` for internal matching.
 
+#### Handler initialization handshake (`SetClient`)
+
+The handler does not own its `WebSocketClient` at construction time.
+`WebSocketClient` is not `Clone` and is awkward to move into an already-spawned
+task constructor; several adapters use a deferred handoff through the command
+channel. Lighter uses this stricter ordering:
+
+1. The outer client calls `WebSocketClient::connect(...)` and obtains the
+   live client.
+2. The outer client creates the local `cmd_tx`/`cmd_rx` and `out_tx`/`out_rx`
+   channels. The connection-mode atomic is captured into a local before
+   `client` is moved.
+3. The outer client sends `HandlerCommand::SetClient(client)` on the local
+   `cmd_tx` first, followed by any cache-replay commands
+   (e.g. `InitializeInstruments`).
+4. Only after `SetClient` is queued does the outer client publish the new
+   command channel (swap `self.cmd_tx`) and store the captured connection
+   mode (transition `is_active()` to true). Doing this in the opposite
+   order races: a clone observing `is_active()` could enqueue a Subscribe
+   on the published `cmd_tx` before SetClient lands, and the handler would
+   drop it because `inner == None`.
+5. The outer client spawns the handler task with `cmd_rx`. The handler
+   constructor takes `inner: Option<WebSocketClient>` initialized to
+   `None`; the first command it processes is `SetClient`, which moves the
+   client into `self.inner`.
+6. Any subscribe/order commands queued by clones after step 4 land behind
+   `SetClient` and `InitializeInstruments` in `cmd_rx`, so they reach a
+   fully wired handler in queue order.
+
+```rust
+pub enum HandlerCommand {
+    SetClient(WebSocketClient),
+    Disconnect,
+    Subscribe { /* ... */ },
+    // ... other commands
+}
+
+pub(super) struct {Venue}WsFeedHandler {
+    inner: Option<WebSocketClient>,  // None until SetClient
+    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
+    // ...
+}
+
+// In the cmd_rx match arm:
+HandlerCommand::SetClient(client) => {
+    self.inner = Some(client);
+}
+```
+
+BitMEX, OKX, Bybit, Hyperliquid, and Lighter all use `SetClient` to hand the
+connected `WebSocketClient` to the handler. Lighter queues `SetClient` before it
+publishes the new `cmd_tx` or marks the connection active; older adapters may
+publish the command channel first.
+
 ### Authentication
 
 Authentication state is managed through events:
 
-- Handler processes `Login` response → **returns** `{Venue}WsMessage::Authenticated` immediately.
-- Client receives event → updates local auth state → proceeds with subscriptions.
-- `AuthTracker` may be shared via `Arc` for state queries, but handler returns events directly (no blocking).
+- Handler processes `Login` response -> **returns** `{Venue}WsMessage::Authenticated` immediately.
+- Client receives event -> updates local auth state -> proceeds with subscriptions.
+- `AuthTracker` (from `nautilus_network::websocket::auth`) tracks auth state across threads.
+
+The `AuthTracker` struct from `nautilus_network` provides thread-safe authentication state:
+
+```rust
+pub struct AuthTracker {
+    tx: Arc<Mutex<Option<AuthResultSender>>>,
+    authenticated: Arc<AtomicBool>,
+}
+```
+
+`AuthTracker` is internally `Arc`-based, so cloning shares state. Both client and handler
+store `auth_tracker: AuthTracker` and receive a `.clone()` of the same instance. The tracker
+exposes a four-method lifecycle: `begin()` starts an attempt and returns a one-shot receiver,
+`succeed()` sets the authenticated flag and notifies the receiver, `fail(message)` clears
+the flag with an error, and `invalidate()` clears the flag on disconnect. Downstream
+consumers query `is_authenticated()` for lock-free reads via the internal `AtomicBool`.
 
 **Note**: The `Authenticated` message is consumed in the client's spawn loop for reconnection
 flow coordination and is not forwarded to downstream consumers (data/execution clients).
 Downstream consumers can query authentication state via `AuthTracker` if needed. The execution
 client's `Authenticated` handler only logs at debug level with no important logic depending
 on this event.
+
+#### Auth-token rotation (single-endpoint mixed-trust adapters)
+
+Some venues run public market data and authenticated account channels through a
+single WebSocket endpoint, gated by a short-lived bearer token attached to each
+subscribe request. Lighter is the canonical example: the token is a Schnorr
+signature over `(deadline, account_index, api_key_index)` with a venue-imposed
+hard cap of 8 hours (`LIGHTER_AUTH_TOKEN_MAX_TTL`). `build_auth_token_for(...)`
+currently emits a 7-hour token, and the execution client refreshes account
+channel subscriptions every 6 hours.
+
+This contrasts with the per-message-signature pattern (Hyperliquid) and the
+session-login pattern (BitMEX, Bybit); neither needs in-session token rotation.
+
+**Token lifecycle**
+
+The outer client owns the schedule; the handler owns the wire send. The
+flow is:
+
+1. **Mint before account subscribes**: The execution client calls
+   `build_auth_token_for(...)` after the WebSocket reaches active state, then
+   uses that token for the initial account-channel subscriptions.
+2. **Distribute on subscribe**: `subscribe_account(...)` attaches the token to
+   `HandlerCommand::Subscribe`. The WebSocket client stores the exact
+   `(channel, auth)` pair in `subscription_args` for reconnect replay.
+3. **Schedule refresh**: After the execution WebSocket consumer starts, the
+   execution client spawns a refresh task on `get_runtime()`. The task sleeps
+   for `AUTH_TOKEN_REFRESH_INTERVAL` (6 hours), mints a new token, and re-issues
+   `subscribe_account(...)` for every account channel.
+4. **Stop on disconnect**: The refresh task observes the execution client's
+   cancellation token and exits when the client stops or disconnects.
+
+**Where the schedule lives**
+
+Place the rotation timer in the outer client, not the handler. The execution
+client owns the credential and decides when to mint; the handler remains an I/O
+boundary that sends the supplied token and signs nothing on its own.
+
+```rust
+fn spawn_auth_token_refresh(&self, credential: Credential) {
+    let ws_client = self.ws_client.clone();
+    let cancellation_token = self.cancellation_token.clone();
+    let account_index = credential.account_index();
+    let channels = [
+        LighterWsChannel::AccountAllOrders(account_index),
+        LighterWsChannel::AccountAllTrades(account_index),
+        LighterWsChannel::AccountAllPositions(account_index),
+        LighterWsChannel::AccountAllAssets(account_index),
+    ];
+
+    get_runtime().spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancellation_token.cancelled() => break,
+                () = tokio::time::sleep(AUTH_TOKEN_REFRESH_INTERVAL) => {
+                    if let Ok(token) = build_auth_token_for(&credential) {
+                        for channel in channels.clone() {
+                            let _ = ws_client
+                                .subscribe_account(channel, token.clone())
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+```
+
+**Reconnect interaction**
+
+On `Reconnected`, the Lighter WebSocket client replays the tracked
+`subscription_args` through `HandlerCommand::Subscribe`. It does not mint a
+fresh token on reconnect; fresh account-channel tokens come from the scheduled
+execution-client refresh task.
+
+**Failure handling**
+
+Subscription send failures call `mark_failure(topic)` so reconnect replay keeps
+the topic pending. Lighter does not currently implement an immediate auth-token
+refresh path on a mid-session venue rejection.
 
 ### Subscription management
 
@@ -783,7 +1117,7 @@ State transitions follow this lifecycle:
 
 | Trigger           | Method Called        | From State | To State  | Notes |
 |-------------------|----------------------|------------|-----------|-------|
-| User subscribes   | `mark_subscribe()`   | —          | Pending   | Topic added to pending set. |
+| User subscribes   | `mark_subscribe()`   |            | Pending   | Topic added to pending set. |
 | Venue confirms    | `confirm()`          | Pending    | Confirmed | Moved from pending to confirmed. |
 | Venue rejects     | `mark_failure()`     | Pending    | Pending   | Stays pending for retry on reconnect. |
 | User unsubscribes | `mark_unsubscribe()` | Confirmed  | Pending   | Temporarily pending until ack. |
@@ -796,17 +1130,81 @@ State transitions follow this lifecycle:
 - Both confirmed and pending subscriptions are restored after reconnection.
 - Unsubscribe operations must check the `op` field in acknowledgments to avoid re-confirming topics.
 
+#### Confirmation timing
+
+The handler is responsible for transitioning topics from Pending to Confirmed.
+Two patterns are established, chosen per venue based on what the wire format
+provides:
+
+**Explicit ack (preferred when the venue supports it)**: used by BitMEX, OKX,
+Bybit, and Lighter. The venue sends a dedicated subscribe/unsubscribe
+acknowledgment frame (typically
+`{ "event": "subscribe", "arg": ..., "code": ... }` or similar). The handler
+matches that frame, derives the topic from its `arg`/`req_id` field, and
+dispatches:
+
+- success -> `confirm_subscribe(topic)` / `confirm_unsubscribe(topic)`.
+- failure -> `mark_failure(topic)` (stays pending; retried on reconnect).
+- unsubscribe failures should be treated as still-subscribed and reconfirmed.
+
+Keep the ack handling in one branch or function invoked from the wire-frame
+match arm so the lifecycle is auditable in one place.
+
+**Implicit-on-first-frame (fallback)**: used by Lighter as a backstop and by any
+venue that either omits subscribe acks or makes them unreliable. The handler calls
+`confirm_subscribe(topic)` when the first inbound data frame for that topic
+arrives. The topic is recovered from the frame's `channel` field. This
+doubles as a backstop when an explicit ack is dropped or arrives after the
+first data frame.
+
+```rust
+// Inside the data-frame match arm:
+let topic = frame_topic(&frame);
+self.subscriptions.confirm_subscribe(&topic);
+// ... then parse and emit
+```
+
+The two patterns can coexist: a venue that sometimes sends acks and sometimes
+doesn't can use the explicit handler for ack frames and the implicit
+backstop on data frames; `confirm_subscribe()` is idempotent.
+
+Failure paths must call `mark_failure(topic)` (not silently drop the
+subscription). `mark_failure()` keeps the topic pending so the reconnect
+replay restores it.
+
 #### Topic format patterns
 
 Adapters use venue-specific delimiters to structure subscription topics:
 
-| Adapter    | Delimiter | Example                | Pattern                      |
-|------------|-----------|------------------------|------------------------------|
-| **BitMEX** | `:`       | `trade:XBTUSD`         | `{channel}:{symbol}`         |
-| **OKX**    | `:`       | `trades:BTC-USDT-SWAP` | `{channel}:{symbol}`         |
-| **Bybit**  | `.`       | `orderbook.50.BTCUSDT` | `{channel}.{depth}.{symbol}` |
+| Adapter      | Delimiter | Example                | Pattern                      |
+|--------------|-----------|------------------------|------------------------------|
+| **BitMEX**   | `:`       | `trade:XBTUSD`         | `{channel}:{symbol}`         |
+| **OKX**      | `:`       | `trades:BTC-USDT-SWAP` | `{channel}:{symbol}`         |
+| **Bybit**    | `.`       | `orderbook.50.BTCUSDT` | `{channel}.{depth}.{symbol}` |
+| **Lighter**  | `:` / `/` | `order_book:0`         | `{channel}:{market_index}`   |
 
 Parse topics using `split_once()` with the appropriate delimiter to extract channel and symbol components.
+
+##### Asymmetric inbound vs outbound delimiters
+
+Some venues use different separators for outbound subscribe payloads versus
+inbound frame `channel` fields. Lighter is the canonical example: outbound
+subscribe uses `order_book/0` (slash), inbound frames carry
+`"channel": "order_book:0"` (colon).
+
+Established workaround:
+
+- Pick the inbound separator for `SubscriptionState::new(delimiter)` so the
+  handler can confirm subscriptions directly against the `channel` field of
+  every received frame.
+- Expose two methods on the venue's channel/subscription enum:
+  - `subscription_channel()` returns the outbound-formatted payload (used
+    when serializing the subscribe/unsubscribe request).
+  - `topic_key()` returns the canonical topic key (matching the inbound
+    form) used to key `SubscriptionState` and the reconnection replay map.
+
+This keeps a single canonical topic identity throughout the handler while
+honoring the venue's wire format on the way out.
 
 ### Reconnection logic
 
@@ -818,6 +1216,15 @@ On reconnection, restore authentication and subscriptions:
    - Receive `{Venue}WsMessage::Reconnected` from handler.
    - If authenticated: Re-authenticate and wait for confirmation.
    - Restore all tracked subscriptions via handler commands.
+   - Forward `{Venue}WsMessage::Reconnected` to downstream consumers via
+     `out_tx` when those consumers need to reset local state. BitMEX, OKX,
+     Bybit, and Lighter forward this event after restore is initiated;
+     Hyperliquid currently consumes it in the WebSocket client after
+     resubscribing.
+
+For adapters with an `Authenticated` event, the client spawn loop can consume it
+for reconnection coordination instead of forwarding it. Downstream consumers can
+query `AuthTracker` when they need authentication state.
 
 **Preserving subscription arguments:**
 
@@ -827,7 +1234,7 @@ replay without parsing topics back into arguments:
 ```rust
 pub struct MyWebSocketClient {
     subscription_state: Arc<SubscriptionState>,
-    subscription_args: Arc<DashMap<String, SubscriptionArgs>>,  // topic → original args
+    subscription_args: Arc<DashMap<String, SubscriptionArgs>>,  // topic -> original args
     // ...
 }
 
@@ -960,7 +1367,7 @@ Define handler-specific tuning constants for consistent behavior:
 
 | Constant                   | Purpose                                          | Typical value |
 |----------------------------|--------------------------------------------------|---------------|
-| `DEFAULT_HEARTBEAT_SECS`   | Interval for sending keep-alive messages.        | 15-30         |
+| `DEFAULT_HEARTBEAT_SECS`   | Interval for sending keep‑alive messages.        | 15-30         |
 | `WEBSOCKET_AUTH_WINDOW_MS` | Maximum age for authentication timestamps.       | 5000-30000    |
 | `BATCH_PROCESSING_LIMIT`   | Maximum messages processed per event loop cycle. | 100-1000      |
 
@@ -1027,15 +1434,18 @@ deserialization. The output enum drops shapes the handler consumes internally an
 variants (`Authenticated`, `SendFailed`) that originate in handler logic, not on the wire.
 
 Include `OrderResponse` for venue acknowledgements (place, cancel, amend) and `SendFailed` for
-WebSocket send failures after retries are exhausted. The execution client dispatch layer converts
-these into Nautilus rejection events (`OrderRejected`, `OrderCancelRejected`, etc.).
+WebSocket send failures after retries are exhausted. The execution client dispatch layer may
+convert `OrderResponse` into Nautilus rejection events when the venue explicitly rejects the
+command. It must treat `SendFailed` as an unknown outcome and leave the order state open to
+reconciliation.
 
 **Conversion in data/exec client:**
 
 The data client's message loop matches on `{Venue}WsMessage` variants and calls parse functions
 to produce Nautilus domain types (`Data`, `OrderBookDeltas`, etc.). The execution client's
-dispatch layer handles `OrderResponse`, `SendFailed`, and `Orders` variants. This keeps
-the handler focused on I/O and deserialization while the client layers own domain conversion.
+dispatch layer handles `OrderResponse`, `SendFailed`, and `Orders` variants. `SendFailed`
+records that the venue outcome is unknown; it is not a rejection. This keeps the handler focused
+on I/O and deserialization while the client layers own domain conversion.
 
 The execution dispatch converts order and fill messages using a two-tier routing contract:
 
@@ -1080,11 +1490,86 @@ The `dispatch_ws_message()` free function in the same module routes `{Venue}WsMe
 variants to the appropriate order event builders, using `WsDispatchState` for dedup
 and `OrderIdentity` for tracked-vs-external classification.
 
+#### Cross-source fill deduplication
+
+`WsDispatchState` prevents duplicate lifecycle events within a single stream. When an
+adapter receives fills from multiple sources (WebSocket user data and HTTP reconciliation),
+a separate trade-ID-level dedup is needed to prevent the same fill from being emitted twice.
+
+The `BoundedDedup<T>` pattern addresses this with a fixed-capacity set backed by a
+`VecDeque` for insertion order and an `AHashSet` for O(1) lookup. When the set reaches
+capacity, the oldest entry is evicted (FIFO). The `insert()` method returns `true` if the
+value was already present, signaling a duplicate:
+
+```rust
+struct BoundedDedup<T> {
+    order: VecDeque<T>,
+    set: AHashSet<T>,
+    capacity: usize,
+}
+```
+
+Use this in the execution client to track trade IDs (typically as `(Ustr, i64)` tuples
+of symbol and trade ID). A capacity of 10,000 provides sufficient coverage for most
+venues without unbounded memory growth.
+
+#### Cancel-replace modifies and in-flight fills
+
+Some venues (e.g. Hyperliquid) implement a modify as a cancel-replace: the venue assigns a new
+venue order ID and emits `ACCEPTED(new_voi)` with `CANCELED(old_voi)`. The dispatch promotes the
+new leg to `OrderUpdated` and suppresses the stale cancel. Fills on the old venue order ID count
+separately, so the replacement is sized at the remaining (`target - filled`), not the total.
+
+That subtraction runs when the modify is dispatched, so a fill landing after the request is sent
+leaves the replacement oversized and the venue can overfill the order. To prevent this, the
+cancel-replace promotion:
+
+- re-reads the cumulative filled quantity;
+- queues a corrective reduce of the new venue order to the true remaining when oversized;
+- re-arms the in-flight marker on the new venue order ID to suppress the corrective's cancel leg.
+
+The reduce posts off the receive loop. It narrows but does not close the race: if the replacement
+fills before the reduce lands, the engine's overfill guard is the backstop.
+
 ### Error handling
+
+#### Order command outcome policy
+
+Adapters must emit these rejection events only from venue-originating signals:
+
+- `OrderRejected`.
+- `OrderModifyRejected`.
+- `OrderCancelRejected`.
+
+Positive venue evidence includes structured order responses, per-order batch responses, or order
+status messages that explicitly report a rejection.
+
+Local validation is not a venue rejection:
+
+- Validate submit commands before `OrderSubmitted` and emit `OrderDenied` when validation fails.
+- If submit validation fails after `OrderSubmitted`, log the failure and leave the order in flight.
+- If cancel or modify validation fails locally, log a warning and do not emit a rejection event.
+
+Do not emit rejection events for errors that leave the venue outcome unknown. Unknown outcomes
+include transport errors, WebSocket send failures, request timeouts, disconnects, canceled local
+tasks, missing acknowledgements, HTTP 5xx responses, rate limits, retry exhaustion, parse failures
+after a request may have reached the venue, and whole-batch request failures without per-order
+venue results.
+
+When the outcome is unknown, leave the order in its current in-flight state and let WebSocket
+updates, in-flight checks, open-order polling, startup reconciliation, or explicit query commands
+resolve the final state. For batch commands, emit rejection events only for per-order venue
+results that unambiguously reject the command; a whole-request failure must not become one
+rejection per order.
+
+Cancel and modify errors need venue-specific allowlists. A generic venue error such as "not
+found", "already closed", or "unknown order" can mean the order filled or canceled before the
+request was processed. Emit `OrderCancelRejected` or `OrderModifyRejected` only when the venue
+semantics make the command rejection unambiguous.
 
 #### Client-side error propagation
 
-Channel send failures (client → handler) should propagate loudly as `Result<(), Error>`:
+Channel send failures (client -> handler) should propagate loudly as `Result<(), Error>`:
 
 ```rust
 impl MyWebSocketClient {
@@ -1102,7 +1587,7 @@ impl MyWebSocketClient {
 
 #### Handler-side retry logic
 
-WebSocket send failures (handler → network) should be retried by the handler using `RetryManager`:
+WebSocket send failures (handler -> network) should be retried by the handler using `RetryManager`:
 
 ```rust
 pub struct MyWsFeedHandler {
@@ -1135,7 +1620,7 @@ impl MyWsFeedHandler {
         match self.send_with_retry(payload, Some(vec![RATE_LIMIT_KEY])).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                // Emit SendFailed so the exec client dispatch can produce OrderRejected
+                // Emit SendFailed so dispatch can record an unknown outcome.
                 let _ = self.out_tx.send(MyWsMessage::SendFailed {
                     request_id: request_id.clone(),
                     client_order_id: Some(client_order_id),
@@ -1160,22 +1645,22 @@ fn should_retry_error(error: &MyWsError) -> bool {
 
 - Client propagates channel failures immediately (handler unavailable).
 - Handler retries transient WebSocket failures (network issues, timeouts).
-- Handler emits `SendFailed` when retries are exhausted; the exec client dispatch converts
-  these into Nautilus rejection events (`OrderRejected`, `OrderCancelRejected`).
+- Handler emits `SendFailed` when retries are exhausted; the exec client dispatch records an
+  unknown outcome and waits for reconciliation or a later venue update.
 - Use `RetryManager` from `nautilus_network::retry` for consistent backoff.
 
 ### Naming conventions
 
 Adapters follow standardized naming conventions for consistency across all venue integrations.
 
-#### Channel naming: `raw` → `msg` → `out`
+#### Channel naming: `raw` -> `out`
 
 WebSocket message channels follow a two-stage transformation pipeline within the handler:
 
 | Stage | Type | Description | Example |
 |-------|------|-------------|---------|
 | `raw` | Raw WebSocket frames | Bytes/text from the network layer. | `raw_rx: UnboundedReceiver<Message>` |
-| `out` | Venue-specific messages | Parsed venue message types. | `out_tx: UnboundedSender<MyWsMessage>` |
+| `out` | Venue‑specific messages | Parsed venue message types. | `out_tx: UnboundedSender<MyWsMessage>` |
 
 The handler deserializes raw frames into venue-specific types and emits them on `out_tx`.
 The data and execution client layers then convert venue types into Nautilus domain types.
@@ -1213,7 +1698,7 @@ Structs holding references to lower-level components follow these conventions:
 
 | Field         | Type                                                | Description |
 |---------------|-----------------------------------------------------|-------------|
-| `inner`       | `Option<WebSocketClient>`                           | Network-level WebSocket client (handler only, exclusively owned). |
+| `inner`       | `Option<WebSocketClient>`                           | Network‑level WebSocket client (handler only, exclusively owned). |
 | `cmd_tx`      | `Arc<tokio::sync::RwLock<UnboundedSender<...>>>`   | Command channel to handler (client side). |
 | `cmd_rx`      | `UnboundedReceiver<HandlerCommand>`                 | Command channel from client (handler side). |
 | `out_tx`      | `UnboundedSender<{Venue}WsMessage>`                 | Output channel to client (handler side). |
@@ -1289,6 +1774,91 @@ similarly-named types from other crates. Never import `mpsc` directly at module 
 let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<MyMessage>();
 ```
 
+### Split WebSocket architectures
+
+Some venues expose multiple WebSocket endpoints with distinct protocols or encodings.
+When a venue requires separate connections for market data and order management, split
+the `websocket/` module into submodules that mirror the connection boundaries:
+
+```
+src/
+├── websocket/
+│   ├── mod.rs              # Re-exports from submodules
+│   ├── streams/            # Market data pub/sub connection
+│   │   ├── client.rs       # Streams client
+│   │   ├── handler.rs      # Streams feed handler
+│   │   ├── messages.rs     # Streams message types
+│   │   └── mod.rs
+│   └── trading/            # Order management + user data (authenticated WS API)
+│       ├── client.rs       # Trading client
+│       ├── handler.rs      # Trading handler
+│       ├── messages.rs     # Trading message types
+│       ├── user_data.rs    # User data stream venue types (execution reports, etc.)
+│       ├── parse.rs        # Parse functions for user data -> Nautilus types
+│       ├── error.rs        # Trading error types
+│       └── mod.rs
+```
+
+Each submodule follows the same two-layer client/handler pattern described above. The
+parent `websocket/mod.rs` re-exports the public client types.
+
+The `trading/` module handles both order operations (place, cancel, modify) and the
+user data stream (execution reports, account updates). When the venue's authenticated
+WebSocket API supports `session.logon` and inline user data subscriptions, both
+concerns share a single authenticated connection. This avoids a separate `execution/`
+module and the deprecated REST listenKey lifecycle.
+
+For venues where user data events arrive on a separate stream connection (e.g.,
+futures APIs that return a listenKey for a dedicated stream URL), the `streams/`
+handler dispatches both market data and user data events from the combined connection.
+
+#### Naming conventions for split architectures
+
+Type names include the submodule qualifier to avoid ambiguity:
+
+| Submodule    | Command type                         | Message type                        |
+|--------------|--------------------------------------|-------------------------------------|
+| `streams/`   | `{Venue}WsStreamsCommand`            | `{Venue}WsMessage` (venue types)    |
+| `trading/`   | `{Venue}WsTradingCommand`            | `{Venue}WsTradingMessage`           |
+
+The `{Venue}Ws` prefix follows the standard type naming convention. The qualifier
+(`Streams`, `Trading`) distinguishes types that would otherwise collide across
+submodules.
+
+#### When to split
+
+Split the WebSocket module when the venue has:
+
+- Different endpoints with different protocols (e.g., SBE binary for market data, JSON
+  for trading)
+- A dedicated order management WebSocket API (`ws-api` style) alongside pub/sub streams
+- User data delivered inline on the authenticated trading connection rather than via a
+  separate listenKey stream
+
+Do not split when a single connection handles all message types through channel-based
+multiplexing (the common pattern for OKX, Bybit, and similar venues).
+
+### Multi-product WebSocket management
+
+Some venues use the same WebSocket protocol for all product types but serve them on
+separate endpoints (e.g., Bybit provides distinct URLs for Linear, Spot, and Inverse).
+In this case the data client creates one WebSocket client per product type and manages
+them in a map:
+
+```rust
+pub struct MyDataClient {
+    ws_clients: AHashMap<MyProductType, MyWebSocketClient>,
+}
+```
+
+Each client follows the same two-layer client/handler pattern. Subscription routing
+inspects the instrument's product type to select the correct client. On connect, the
+data client iterates the map to connect all clients; on disconnect, it closes them all.
+
+This differs from the split architecture (`streams/` vs `trading/`) which separates by
+protocol or purpose. Multi-product management separates by product type while sharing
+the same protocol.
+
 ## Modeling venue payloads
 
 Use the following conventions when mirroring upstream schemas in Rust.
@@ -1304,6 +1874,104 @@ Use the following conventions when mirroring upstream schemas in Rust.
 - Define streaming payload types in `src/websocket/messages.rs`, giving each venue topic a struct or enum that mirrors the upstream JSON.
 - Apply the same naming guidance as REST models: rely on blanket casing renames and keep field names aligned with the venue unless syntax forces a change; consider serde helpers such as `#[serde(tag = "op")]` or `#[serde(flatten)]` and document the choice.
 - Note any intentional deviations from the upstream schema in code comments and module docs so other contributors can follow the mapping quickly.
+
+### Enum hardening for open venue value sets
+
+A strict enum with no fallback hard-fails the whole message the first time the venue sends a value it does not model. Choose the behavior by what the field drives:
+
+- Reference/descriptive (instrument or product type, market status, ticker type, public trade type): add an `Unknown` fallback so a new value degrades gracefully. Use `#[serde(other)] Unknown`, or a `deserialize_{field}_or_unknown` shim (see `coinbase/src/common/parse.rs`) when the enum also derives `strum::EnumString`. Warn and map `Unknown` to a skip or safe default; never fabricate a value.
+- Order/fill/position state (order/position status, order/fill type, liquidity, time-in-force, trigger fields): keep strict, no catch-all. An unmodeled value must fail deserialization so the handler logs it loudly rather than let the engine run out of sync with the venue.
+
+Model known values explicitly instead of via a catch-all: a documented `"unknown"` sentinel becomes one variant mapped to a safe default with a warning (see `kraken/src/common/enums.rs`); a changelog-named value like `FillOrKill` becomes a real variant.
+
+---
+
+## Task management
+
+### Spawning async tasks (`spawn_task`)
+
+Data and execution clients spawn background tasks for WebSocket stream processing,
+periodic polling, and order submission. Wrap all spawned work with a `spawn_task()`
+method that provides error logging and handle tracking:
+
+```rust
+fn spawn_task<F>(&self, description: &'static str, fut: F)
+where
+    F: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let runtime = get_runtime();
+    let handle = runtime.spawn(async move {
+        if let Err(e) = fut.await {
+            log::warn!("{description} failed: {e:?}");
+        }
+    });
+
+    let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
+    tasks.retain(|handle| !handle.is_finished());
+    tasks.push(handle);
+}
+```
+
+Store task handles in `pending_tasks: Mutex<Vec<JoinHandle<()>>>`. Each call to
+`spawn_task` prunes finished handles before pushing the new one, preventing unbounded
+growth. On disconnect, abort all remaining handles.
+
+### Never use `block_on` in trait methods
+
+The live runner calls sync `ExecutionClient` and `DataClient` trait methods from within a
+tokio runtime. Using `runtime.block_on()` in these methods panics with
+*"Cannot start a runtime from within a runtime"*. Use `spawn_task` instead:
+
+```rust
+// Wrong: panics at runtime
+fn query_order(&self, cmd: &QueryOrder) -> anyhow::Result<()> {
+    get_runtime().block_on(async { self.http_client.get_order(&id).await })
+}
+
+// Correct: clone what you need, spawn, return immediately
+fn query_order(&self, cmd: &QueryOrder) -> anyhow::Result<()> {
+    let http_client = self.http_client.clone();
+    let emitter = self.emitter.clone();
+
+    self.spawn_task("query_order", async move {
+        let report = http_client.get_order(&id).await?;
+        emitter.send_order_status_report(report);
+        Ok(())
+    });
+    Ok(())
+}
+```
+
+`block_on` is valid in contexts that run outside a tokio runtime:
+
+| Context                      | Why safe                                       |
+|------------------------------|------------------------------------------------|
+| PyO3 `#[pymethods]`         | Called from Python, no ambient runtime          |
+| Binary `main()` functions   | Top‑level entry point, runtime not yet started  |
+| Dedicated background threads | Thread created outside tokio's worker pool     |
+| `block_in_place` wrapper    | Moves the thread out of the worker pool first   |
+| Test code with own runtime  | `Runtime::new()` creates an isolated runtime    |
+
+### Graceful shutdown with `CancellationToken`
+
+Use `tokio_util::sync::CancellationToken` to coordinate shutdown across multiple spawned
+tasks. The client creates a token at construction and passes clones to each spawned task.
+Tasks select on the token alongside their primary work:
+
+```rust
+tokio::select! {
+    msg = stream.next() => { /* process */ }
+    _ = cancellation_token.cancelled() => { break; }
+}
+```
+
+On disconnect, the client cancels the token, which signals all tasks to exit their loops.
+This complements the handler-level `signal: Arc<AtomicBool>` pattern: `AtomicBool` gates
+the handler's I/O loop, while `CancellationToken` coordinates shutdown of tasks the client
+spawned outside the handler (polling loops, reconciliation tasks, stream consumers).
+
+Reset the token on reconnect by replacing it with a fresh `CancellationToken::new()` so
+subsequent tasks are not born cancelled.
 
 ---
 
@@ -1344,7 +2012,7 @@ crates/adapters/your_adapter/
 |----------------------|---------------------------------------------------------------------------------------------------------------------------|
 | `tests/data_client.rs` | Integration tests for the data client. Validates data subscriptions, historical data requests, and market data parsing.    |
 | `tests/exec_client.rs` | Integration tests for the execution client. Validates order submission, modification, cancellation, and execution reports. |
-| `tests/http.rs`      | Low-level HTTP client tests. Validates request signing, error handling, and response parsing against mock Axum servers.    |
+| `tests/http.rs`      | Low‑level HTTP client tests. Validates request signing, error handling, and response parsing against mock Axum servers.    |
 | `tests/websocket.rs` | WebSocket client tests. Validates connection lifecycle, authentication, subscriptions, and message routing.                |
 
 **Guidelines:**
@@ -1463,7 +2131,7 @@ Data (`tests/data_client.rs`) and execution (`tests/exec_client.rs`) client inte
 |------------------------------|------------------------------------------------------------------------------------|
 | Mock Axum server             | Serves HTTP endpoints (instruments, fee rates, positions) and WebSocket channels.  |
 | `TestServerState`            | Tracks connections, subscriptions, and authentication state for assertions.        |
-| Thread-local event channels  | `set_data_event_sender()` / `set_exec_event_sender()` for capturing emitted events.|
+| Thread‑local event channels  | `set_data_event_sender()` / `set_exec_event_sender()` for capturing emitted events.|
 | `wait_until_async`           | Polls conditions with timeout for deterministic async assertions.                  |
 
 **Data client coverage:**
@@ -1808,7 +2476,7 @@ class TemplateLiveMarketDataClient(LiveMarketDataClient):
 | `_subscribe_instrument`            | Subscribes to market data for a single instrument.      |
 | `_subscribe_order_book_deltas`     | Subscribes to order book delta updates.                 |
 | `_subscribe_order_book_depth`      | Subscribes to order book depth updates.                 |
-| `_subscribe_quote_ticks`           | Subscribes to top-of-book quote updates.                |
+| `_subscribe_quote_ticks`           | Subscribes to top‑of‑book quote updates.                |
 | `_subscribe_trade_ticks`           | Subscribes to trade tick updates.                       |
 | `_subscribe_mark_prices`           | Subscribes to mark price updates.                       |
 | `_subscribe_index_prices`          | Subscribes to index price updates.                      |
@@ -1933,24 +2601,6 @@ class TemplateLiveExecutionClient(LiveExecutionClient):
     async def _disconnect(self) -> None:
         raise NotImplementedError("implement `_disconnect` in your adapter subclass")
 
-    async def _submit_order(self, command: SubmitOrder) -> None:
-        raise NotImplementedError("implement `_submit_order` in your adapter subclass")
-
-    async def _submit_order_list(self, command: SubmitOrderList) -> None:
-        raise NotImplementedError("implement `_submit_order_list` in your adapter subclass")
-
-    async def _modify_order(self, command: ModifyOrder) -> None:
-        raise NotImplementedError("implement `_modify_order` in your adapter subclass")
-
-    async def _cancel_order(self, command: CancelOrder) -> None:
-        raise NotImplementedError("implement `_cancel_order` in your adapter subclass")
-
-    async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
-        raise NotImplementedError("implement `_cancel_all_orders` in your adapter subclass")
-
-    async def _batch_cancel_orders(self, command: BatchCancelOrders) -> None:
-        raise NotImplementedError("implement `_batch_cancel_orders` in your adapter subclass")
-
     async def generate_order_status_report(
         self,
         command: GenerateOrderStatusReport,
@@ -1980,23 +2630,41 @@ class TemplateLiveExecutionClient(LiveExecutionClient):
         lookback_mins: int | None = None,
     ) -> ExecutionMassStatus | None:
         raise NotImplementedError("method `generate_mass_status` must be implemented in the subclass")
+
+    async def _submit_order(self, command: SubmitOrder) -> None:
+        raise NotImplementedError("implement `_submit_order` in your adapter subclass")
+
+    async def _submit_order_list(self, command: SubmitOrderList) -> None:
+        raise NotImplementedError("implement `_submit_order_list` in your adapter subclass")
+
+    async def _modify_order(self, command: ModifyOrder) -> None:
+        raise NotImplementedError("implement `_modify_order` in your adapter subclass")
+
+    async def _cancel_order(self, command: CancelOrder) -> None:
+        raise NotImplementedError("implement `_cancel_order` in your adapter subclass")
+
+    async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
+        raise NotImplementedError("implement `_cancel_all_orders` in your adapter subclass")
+
+    async def _batch_cancel_orders(self, command: BatchCancelOrders) -> None:
+        raise NotImplementedError("implement `_batch_cancel_orders` in your adapter subclass")
 ```
 
 | Method                             | Description                                               |
 |------------------------------------|-----------------------------------------------------------|
 | `_connect`                         | Establishes a connection to the venue APIs.               |
 | `_disconnect`                      | Closes the connection to the venue APIs.                  |
+| `generate_order_status_report`     | Generates a report for a specific order on the venue.     |
+| `generate_order_status_reports`    | Generates reports for all orders on the venue.            |
+| `generate_fill_reports`            | Generates reports for filled orders on the venue.         |
+| `generate_position_status_reports` | Generates reports for position status on the venue.       |
+| `generate_mass_status`             | Generates execution mass status reports.                  |
 | `_submit_order`                    | Submits a new order to the venue.                         |
 | `_submit_order_list`               | Submits a list of orders to the venue.                    |
 | `_modify_order`                    | Modifies an existing order on the venue.                  |
 | `_cancel_order`                    | Cancels a specific order on the venue.                    |
 | `_cancel_all_orders`               | Cancels all orders for an instrument on the venue.        |
 | `_batch_cancel_orders`             | Cancels a batch of orders for an instrument on the venue. |
-| `generate_order_status_report`     | Generates a report for a specific order on the venue.     |
-| `generate_order_status_reports`    | Generates reports for all orders on the venue.            |
-| `generate_fill_reports`            | Generates reports for filled orders on the venue.         |
-| `generate_position_status_reports` | Generates reports for position status on the venue.       |
-| `generate_mass_status`             | Generates execution mass status reports.                  |
 
 ### Configuration
 

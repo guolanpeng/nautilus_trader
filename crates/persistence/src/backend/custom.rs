@@ -28,8 +28,9 @@ use datafusion::arrow::{
 };
 use nautilus_core::UnixNanos;
 use nautilus_model::data::{
-    Bar, CustomData, CustomDataTrait, Data, IndexPriceUpdate, MarkPriceUpdate, OrderBookDelta,
-    OrderBookDepth10, QuoteTick, TradeTick, close::InstrumentClose, encode_custom_to_arrow,
+    Bar, CustomData, CustomDataTrait, Data, IndexPriceUpdate, MarkPriceUpdate, OptionGreeks,
+    OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick, close::InstrumentClose,
+    encode_custom_to_arrow,
 };
 use nautilus_serialization::arrow::DecodeDataFromRecordBatch;
 #[cfg(feature = "python")]
@@ -40,11 +41,7 @@ use nautilus_serialization::arrow::custom::CustomDataDecoder;
 #[must_use]
 pub fn schema_with_data_type_column(base_schema: &Schema, type_name: &str) -> Schema {
     let mut fields: Vec<_> = base_schema.fields().iter().cloned().collect();
-    fields.push(Arc::new(Field::new(
-        "data_type",
-        ArrowDataType::Utf8,
-        false,
-    )));
+    fields.push(Arc::new(Field::new("data_type", ArrowDataType::Utf8, true)));
     let mut meta = base_schema.metadata().clone();
     meta.insert("type_name".to_string(), type_name.to_string());
     Schema::new_with_metadata(fields, meta)
@@ -201,6 +198,7 @@ pub fn decode_batch_to_data(
         "IndexPriceUpdate" | "index_price_updates" => {
             Ok(IndexPriceUpdate::decode_data_batch(metadata, batch)?)
         }
+        "OptionGreeks" | "option_greeks" => Ok(OptionGreeks::decode_data_batch(metadata, batch)?),
         "InstrumentClose" | "instrument_closes" => {
             Ok(InstrumentClose::decode_data_batch(metadata, batch)?)
         }
@@ -237,6 +235,7 @@ pub fn decode_custom_batches_to_data(
     let schema = batches.first().map(|b| b.schema()).ok_or_else(|| {
         anyhow::anyhow!("decode_custom_batches_to_data called with empty batches")
     })?;
+
     for mut batch in batches {
         if use_ts_event_for_ts_init {
             let column_names: Vec<String> =

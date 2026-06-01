@@ -22,7 +22,9 @@ from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.instruments import Cfd
 from nautilus_trader.model.instruments import Commodity
 from nautilus_trader.model.instruments import CryptoFuture
+from nautilus_trader.model.instruments import CryptoFuturesSpread
 from nautilus_trader.model.instruments import CryptoOption
+from nautilus_trader.model.instruments import CryptoOptionSpread
 from nautilus_trader.model.instruments import CryptoPerpetual
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.instruments import Equity
@@ -33,6 +35,7 @@ from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.instruments import OptionContract
 from nautilus_trader.model.instruments import OptionSpread
 from nautilus_trader.model.instruments import PerpetualContract
+from nautilus_trader.model.instruments import TokenizedAsset
 
 
 SCHEMAS = {
@@ -157,6 +160,7 @@ SCHEMAS = {
             "price_increment": pa.dictionary(pa.int16(), pa.string()),
             "size_increment": pa.dictionary(pa.int16(), pa.string()),
             "multiplier": pa.dictionary(pa.int16(), pa.string()),
+            "lot_size": pa.dictionary(pa.int16(), pa.string()),
             "max_quantity": pa.dictionary(pa.int16(), pa.string()),
             "min_quantity": pa.dictionary(pa.int16(), pa.string()),
             "max_notional": pa.dictionary(pa.int16(), pa.string()),
@@ -189,6 +193,71 @@ SCHEMAS = {
             "price_increment": pa.dictionary(pa.int16(), pa.string()),
             "size_increment": pa.dictionary(pa.int16(), pa.string()),
             "multiplier": pa.dictionary(pa.int16(), pa.string()),
+            "lot_size": pa.dictionary(pa.int16(), pa.string()),
+            "max_quantity": pa.dictionary(pa.int16(), pa.string()),
+            "min_quantity": pa.dictionary(pa.int16(), pa.string()),
+            "max_notional": pa.dictionary(pa.int16(), pa.string()),
+            "min_notional": pa.dictionary(pa.int16(), pa.string()),
+            "max_price": pa.dictionary(pa.int16(), pa.string()),
+            "min_price": pa.dictionary(pa.int16(), pa.string()),
+            "margin_init": pa.string(),
+            "margin_maint": pa.string(),
+            "maker_fee": pa.string(),
+            "taker_fee": pa.string(),
+            "info": pa.binary(),
+            "ts_event": pa.uint64(),
+            "ts_init": pa.uint64(),
+        },
+    ),
+    CryptoFuturesSpread: pa.schema(
+        {
+            "id": pa.dictionary(pa.int64(), pa.string()),
+            "raw_symbol": pa.string(),
+            "underlying": pa.dictionary(pa.int16(), pa.string()),
+            "quote_currency": pa.dictionary(pa.int16(), pa.string()),
+            "settlement_currency": pa.dictionary(pa.int16(), pa.string()),
+            "is_inverse": pa.bool_(),
+            "strategy_type": pa.dictionary(pa.int16(), pa.string()),
+            "activation_ns": pa.uint64(),
+            "expiration_ns": pa.uint64(),
+            "price_precision": pa.uint8(),
+            "size_precision": pa.uint8(),
+            "price_increment": pa.dictionary(pa.int16(), pa.string()),
+            "size_increment": pa.dictionary(pa.int16(), pa.string()),
+            "multiplier": pa.dictionary(pa.int16(), pa.string()),
+            "lot_size": pa.dictionary(pa.int16(), pa.string()),
+            "max_quantity": pa.dictionary(pa.int16(), pa.string()),
+            "min_quantity": pa.dictionary(pa.int16(), pa.string()),
+            "max_notional": pa.dictionary(pa.int16(), pa.string()),
+            "min_notional": pa.dictionary(pa.int16(), pa.string()),
+            "max_price": pa.dictionary(pa.int16(), pa.string()),
+            "min_price": pa.dictionary(pa.int16(), pa.string()),
+            "margin_init": pa.string(),
+            "margin_maint": pa.string(),
+            "maker_fee": pa.string(),
+            "taker_fee": pa.string(),
+            "info": pa.binary(),
+            "ts_event": pa.uint64(),
+            "ts_init": pa.uint64(),
+        },
+    ),
+    CryptoOptionSpread: pa.schema(
+        {
+            "id": pa.dictionary(pa.int64(), pa.string()),
+            "raw_symbol": pa.string(),
+            "underlying": pa.dictionary(pa.int16(), pa.string()),
+            "quote_currency": pa.dictionary(pa.int16(), pa.string()),
+            "settlement_currency": pa.dictionary(pa.int16(), pa.string()),
+            "is_inverse": pa.bool_(),
+            "strategy_type": pa.dictionary(pa.int16(), pa.string()),
+            "activation_ns": pa.uint64(),
+            "expiration_ns": pa.uint64(),
+            "price_precision": pa.uint8(),
+            "size_precision": pa.uint8(),
+            "price_increment": pa.dictionary(pa.int16(), pa.string()),
+            "size_increment": pa.dictionary(pa.int16(), pa.string()),
+            "multiplier": pa.dictionary(pa.int16(), pa.string()),
+            "lot_size": pa.dictionary(pa.int16(), pa.string()),
             "max_quantity": pa.dictionary(pa.int16(), pa.string()),
             "min_quantity": pa.dictionary(pa.int16(), pa.string()),
             "max_notional": pa.dictionary(pa.int16(), pa.string()),
@@ -217,6 +286,7 @@ SCHEMAS = {
             "price_increment": pa.dictionary(pa.int16(), pa.string()),
             "size_increment": pa.dictionary(pa.int16(), pa.string()),
             "multiplier": pa.dictionary(pa.int16(), pa.string()),
+            "lot_size": pa.dictionary(pa.int16(), pa.string()),
             "max_quantity": pa.dictionary(pa.int16(), pa.string()),
             "min_quantity": pa.dictionary(pa.int16(), pa.string()),
             "max_notional": pa.dictionary(pa.int16(), pa.string()),
@@ -433,6 +503,35 @@ SCHEMAS = {
             "ts_init": pa.uint64(),
         },
     ),
+    TokenizedAsset: pa.schema(
+        {
+            "id": pa.dictionary(pa.int64(), pa.string()),
+            "raw_symbol": pa.string(),
+            "asset_class": pa.dictionary(pa.int8(), pa.string()),
+            "base_currency": pa.dictionary(pa.int16(), pa.string()),
+            "quote_currency": pa.dictionary(pa.int16(), pa.string()),
+            "isin": pa.string(),
+            "price_precision": pa.uint8(),
+            "size_precision": pa.uint8(),
+            "price_increment": pa.dictionary(pa.int16(), pa.string()),
+            "size_increment": pa.dictionary(pa.int16(), pa.string()),
+            "multiplier": pa.dictionary(pa.int16(), pa.string()),
+            "lot_size": pa.dictionary(pa.int16(), pa.string()),
+            "max_quantity": pa.dictionary(pa.int16(), pa.string()),
+            "min_quantity": pa.dictionary(pa.int16(), pa.string()),
+            "max_notional": pa.dictionary(pa.int16(), pa.string()),
+            "min_notional": pa.dictionary(pa.int16(), pa.string()),
+            "max_price": pa.dictionary(pa.int16(), pa.string()),
+            "min_price": pa.dictionary(pa.int16(), pa.string()),
+            "margin_init": pa.string(),
+            "margin_maint": pa.string(),
+            "maker_fee": pa.string(),
+            "taker_fee": pa.string(),
+            "info": pa.binary(),
+            "ts_event": pa.uint64(),
+            "ts_init": pa.uint64(),
+        },
+    ),
 }
 
 
@@ -454,7 +553,9 @@ def deserialize(batch: pa.RecordBatch) -> list[Instrument]:
         b"CurrencyPair": CurrencyPair,
         b"CryptoPerpetual": CryptoPerpetual,
         b"CryptoFuture": CryptoFuture,
+        b"CryptoFuturesSpread": CryptoFuturesSpread,
         b"CryptoOption": CryptoOption,
+        b"CryptoOptionSpread": CryptoOptionSpread,
         b"Equity": Equity,
         b"FuturesContract": FuturesContract,
         b"FuturesSpread": FuturesSpread,
@@ -462,6 +563,7 @@ def deserialize(batch: pa.RecordBatch) -> list[Instrument]:
         b"OptionContract": OptionContract,
         b"OptionSpread": OptionSpread,
         b"PerpetualContract": PerpetualContract,
+        b"TokenizedAsset": TokenizedAsset,
     }[ins_type]
 
     maps = batch.to_pylist()

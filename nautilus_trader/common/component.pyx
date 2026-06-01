@@ -61,6 +61,8 @@ from nautilus_trader.core.rust.common cimport component_state_to_cstr
 from nautilus_trader.core.rust.common cimport component_trigger_from_cstr
 from nautilus_trader.core.rust.common cimport component_trigger_to_cstr
 from nautilus_trader.core.rust.common cimport is_matching_ffi
+from nautilus_trader.core.rust.common cimport live_clock_cancel_callbacks
+from nautilus_trader.core.rust.common cimport live_clock_cancel_default_handler
 from nautilus_trader.core.rust.common cimport live_clock_cancel_timer
 from nautilus_trader.core.rust.common cimport live_clock_drop
 from nautilus_trader.core.rust.common cimport live_clock_new
@@ -84,11 +86,14 @@ from nautilus_trader.core.rust.common cimport logger_log
 from nautilus_trader.core.rust.common cimport logging_clock_set_realtime_mode
 from nautilus_trader.core.rust.common cimport logging_clock_set_static_mode
 from nautilus_trader.core.rust.common cimport logging_clock_set_static_time
-from nautilus_trader.core.rust.common cimport logging_init
+from nautilus_trader.core.rust.common cimport logging_init_with_options
 from nautilus_trader.core.rust.common cimport logging_is_initialized
 from nautilus_trader.core.rust.common cimport logging_log_header
 from nautilus_trader.core.rust.common cimport logging_log_sysinfo
+from nautilus_trader.core.rust.common cimport logging_sync_to_disk
 from nautilus_trader.core.rust.common cimport test_clock_advance_time
+from nautilus_trader.core.rust.common cimport test_clock_cancel_callbacks
+from nautilus_trader.core.rust.common cimport test_clock_cancel_default_handler
 from nautilus_trader.core.rust.common cimport test_clock_cancel_timer
 from nautilus_trader.core.rust.common cimport test_clock_cancel_timers
 from nautilus_trader.core.rust.common cimport test_clock_drop
@@ -265,6 +270,27 @@ cdef class Clock:
 
         """
         raise NotImplementedError("method `register_default_handler` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void cancel_default_handler(self):
+        """
+        Cancel the registered default handler (if any).
+
+        Releases the Python callback held by the clock so the bound method (and the
+        component that owns it) can be garbage collected. The clock stores the
+        callback as a Rust ``Py<PyAny>`` which Python's GC cannot trace, so any
+        cycle through it must be broken explicitly.
+        """
+        raise NotImplementedError("method `cancel_default_handler` must be implemented in the subclass")  # pragma: no cover
+
+    cpdef void cancel_callbacks(self):
+        """
+        Cancel all registered named callbacks.
+
+        Releases callbacks registered via ``set_time_alert`` or ``set_timer`` with an
+        explicit handler. Companion to ``cancel_default_handler`` for breaking reference
+        cycles between Python components and the clock during disposal.
+        """
+        raise NotImplementedError("method `cancel_callbacks` must be implemented in the subclass")  # pragma: no cover
 
     cpdef uint64_t next_time_ns(self, str name):
         """
@@ -640,6 +666,12 @@ cdef class TestClock(Clock):
 
         test_clock_register_default_handler(&self._mem, <PyObject *>callback)
 
+    cpdef void cancel_default_handler(self):
+        test_clock_cancel_default_handler(&self._mem)
+
+    cpdef void cancel_callbacks(self):
+        test_clock_cancel_callbacks(&self._mem)
+
     cpdef void set_time_alert_ns(
         self,
         str name,
@@ -855,6 +887,12 @@ cdef class LiveClock(Clock):
         callback = create_pyo3_conversion_wrapper(callback)
 
         live_clock_register_default_handler(&self._mem, <PyObject *>callback)
+
+    cpdef void cancel_default_handler(self):
+        live_clock_cancel_default_handler(&self._mem)
+
+    cpdef void cancel_callbacks(self):
+        live_clock_cancel_callbacks(&self._mem)
 
     cpdef void set_time_alert_ns(
         self,
@@ -1228,6 +1266,8 @@ cpdef LogGuard init_logging(
     bint print_config = False,
     uint64_t max_file_size = 0,
     uint32_t max_backup_count = 5,
+    bint fileout_sync_on_flush = True,
+    bint buffered_stdout = False,
 ):
     """
     Initialize the logging subsystem.
@@ -1277,6 +1317,10 @@ cpdef LogGuard init_logging(
         If set to 0, file rotation is disabled.
     max_backup_count : uint32_t, default 5
         The maximum number of backup log files to keep when rotating.
+    fileout_sync_on_flush : bool, default True
+        If file log flushes should also sync data to disk.
+    buffered_stdout : bool, default False
+        If stdout writes should be buffered until flush or buffer capacity.
 
     Returns
     -------
@@ -1298,7 +1342,7 @@ cpdef LogGuard init_logging(
     if logging_is_initialized():
         raise RuntimeError("Logging subsystem already initialized")
 
-    cdef LogGuard_API log_guard_api = logging_init(
+    cdef LogGuard_API log_guard_api = logging_init_with_options(
         trader_id._mem,
         instance_id._mem,
         level_stdout,
@@ -1313,6 +1357,8 @@ cpdef LogGuard init_logging(
         log_components_only,
         max_file_size,
         max_backup_count,
+        fileout_sync_on_flush,
+        buffered_stdout,
     )
 
     cdef LogGuard log_guard = LogGuard.__new__(LogGuard)
@@ -1341,6 +1387,10 @@ cpdef void set_logging_pyo3(bint value):
 
 cpdef void flush_logger():
     logger_flush()
+
+
+cpdef bint sync_logger_to_disk():
+    return <bint>logging_sync_to_disk()
 
 
 cdef class Logger:
@@ -2439,6 +2489,12 @@ cdef class MessageBus:
         """
         self._log.debug("Closing message bus")
 
+        self._endpoints.clear()
+        self._patterns.clear()
+        self._subscriptions.clear()
+        self._correlation_index.clear()
+        self._listeners.clear()
+
         if self._database is not None:
             self._database.close()
 
@@ -2678,7 +2734,8 @@ cdef class MessageBus:
         cdef list subs
 
         for pattern in patterns:
-            if is_matching(topic, pattern):
+            # Match each cached concrete topic against the new (possibly wildcard) subscription
+            if is_matching(pattern, topic):
                 subs = list(self._patterns[pattern])
                 subs.append(sub)
                 subs = sorted(subs, reverse=True)

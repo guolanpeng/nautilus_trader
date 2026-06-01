@@ -15,6 +15,9 @@
 
 //! Data types for the trading domain model.
 
+#[cfg(feature = "ffi")]
+use std::ffi::{CStr, CString};
+
 pub mod bar;
 pub mod bet;
 pub mod close;
@@ -44,19 +47,50 @@ use nautilus_core::python::{
 use pyo3::types::PyDict;
 use pyo3::{prelude::*, types::PyCapsule};
 
-#[cfg(feature = "cython-compat")]
+#[cfg(any(feature = "cython-compat", feature = "ffi"))]
 use crate::data::DataFFI;
 use crate::data::{
-    Bar, CustomData, Data, DataType, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate,
-    OrderBookDelta, QuoteTick, TradeTick, close::InstrumentClose,
+    Bar, CustomData, Data, DataType, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus,
+    MarkPriceUpdate, OptionGreeks, OrderBookDelta, QuoteTick, TradeTick, close::InstrumentClose,
     is_monotonically_increasing_by_init, register_python_data_class,
 };
 
 const ERROR_MONOTONICITY: &str = "`data` was not monotonically increasing by the `ts_init` field";
 
+#[cfg(feature = "ffi")]
+pub const DATA_FFI_CVEC_CAPSULE_NAME: &CStr = c"nautilus.DataFFI.CVec";
+
+#[cfg(feature = "ffi")]
+#[repr(transparent)]
+#[derive(Debug)]
+pub struct DataFfiCVec(CVec);
+
+#[cfg(feature = "ffi")]
+impl DataFfiCVec {
+    #[must_use]
+    pub fn capsule_name() -> CString {
+        DATA_FFI_CVEC_CAPSULE_NAME.to_owned()
+    }
+}
+
+#[cfg(feature = "ffi")]
+impl From<Vec<DataFFI>> for DataFfiCVec {
+    fn from(data: Vec<DataFFI>) -> Self {
+        Self(data.into())
+    }
+}
+
+#[cfg(feature = "ffi")]
+#[allow(unsafe_code)]
+// SAFETY: DataFfiCVec only wraps CVec allocations produced from Vec<DataFFI>.
+// DataFFI is the type-specific payload for these Python capsules, and the
+// capsule transfers ownership metadata without sharing mutable access.
+unsafe impl Send for DataFfiCVec {}
+
 #[pymethods]
 #[cfg_attr(feature = "python", pyo3_stub_gen::derive::gen_stub_pymethods)]
 impl DataType {
+    /// Represents a data type including metadata.
     #[new]
     #[pyo3(signature = (type_name, metadata=None, identifier=None))]
     fn py_new(
@@ -67,17 +101,33 @@ impl DataType {
     ) -> PyResult<Self> {
         let params = match metadata {
             None => None,
-            Some(d) => pydict_to_params(py, d)?,
+            Some(d) => pydict_to_params(py, &d)?,
         };
         Ok(Self::new(type_name, params, identifier))
     }
 
+    fn __richcmp__(&self, other: &Self, op: pyo3::pyclass::CompareOp, py: Python<'_>) -> Py<PyAny> {
+        use nautilus_core::python::IntoPyObjectNautilusExt;
+
+        match op {
+            pyo3::pyclass::CompareOp::Eq => (self.topic() == other.topic()).into_py_any_unwrap(py),
+            pyo3::pyclass::CompareOp::Ne => (self.topic() != other.topic()).into_py_any_unwrap(py),
+            _ => py.NotImplemented(),
+        }
+    }
+
+    fn __hash__(&self) -> isize {
+        self.precomputed_hash() as isize
+    }
+
+    /// Returns the type name for the data type.
     #[getter]
     #[pyo3(name = "type_name")]
     fn py_type_name(&self) -> &str {
         self.type_name()
     }
 
+    /// Returns the metadata for the data type.
     #[getter]
     #[pyo3(name = "metadata")]
     fn py_metadata(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -91,12 +141,14 @@ impl DataType {
         }
     }
 
+    /// Returns the messaging topic for the data type.
     #[getter]
     #[pyo3(name = "topic")]
     fn py_topic(&self) -> &str {
         self.topic()
     }
 
+    /// Returns the optional catalog path identifier (can contain subdirs, e.g. `"venue//symbol"`).
     #[getter]
     #[pyo3(name = "identifier")]
     fn py_identifier(&self) -> Option<&str> {
@@ -153,38 +205,76 @@ pub fn data_to_pycapsule(py: Python, data: Data) -> Py<PyAny> {
 /// single-`Data` capsule (e.g. for `Data::Custom`), the pointer is not a `CVec`, and
 /// calling this would be undefined behavior.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the capsule cannot be downcast to a `PyCapsule`, indicating a type
-/// mismatch or improper capsule handling.
+/// Returns a `PyErr` if the object is not a `PyCapsule`, has the wrong capsule
+/// name, or contains invalid `CVec` metadata.
 ///
 /// This function involves raw pointer dereferencing and manual memory
 /// management. The caller must ensure the `PyCapsule` contains a valid `CVec` pointer.
 #[cfg(feature = "ffi")]
-#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.model")]
 #[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.model")]
 #[allow(unsafe_code)]
-pub fn drop_cvec_pycapsule(capsule: &Bound<'_, PyAny>) {
+pub fn drop_cvec_pycapsule(capsule: &Bound<'_, PyAny>) -> PyResult<()> {
     let capsule: &Bound<'_, PyCapsule> = capsule
         .cast::<PyCapsule>()
-        .expect("Error on downcast to `&PyCapsule`");
-    let cvec: &CVec = unsafe { &*(capsule.pointer_checked(None).unwrap().as_ptr() as *const CVec) };
-    let data: Vec<crate::data::DataFFI> =
-        unsafe { Vec::from_raw_parts(cvec.ptr.cast::<crate::data::DataFFI>(), cvec.len, cvec.cap) };
+        .map_err(|e| to_pyvalue_err(format!("Expected DataFFI CVec PyCapsule: {e}")))?;
+    let cvec_ptr = capsule
+        .pointer_checked(Some(DATA_FFI_CVEC_CAPSULE_NAME))
+        .map_err(|e| to_pyvalue_err(format!("Invalid DataFFI CVec PyCapsule: {e}")))?
+        .as_ptr()
+        .cast::<CVec>();
+    // SAFETY: The capsule name check above verifies this is a DataFfiCVec, whose
+    // transparent representation starts with the CVec metadata.
+    let cvec = unsafe { *cvec_ptr };
+
+    if cvec.len == 0 && cvec.cap == 0 {
+        // SAFETY: The pointer targets the CVec metadata inside the checked capsule.
+        unsafe {
+            *cvec_ptr = CVec::empty();
+        }
+        return Ok(());
+    }
+
+    if cvec.len > cvec.cap {
+        return Err(to_pyvalue_err(format!(
+            "Invalid DataFFI CVec metadata: len ({}) > cap ({})",
+            cvec.len, cvec.cap
+        )));
+    }
+
+    if cvec.ptr.is_null() {
+        return Err(to_pyvalue_err(format!(
+            "Invalid DataFFI CVec metadata: null ptr with len ({}) and cap ({})",
+            cvec.len, cvec.cap
+        )));
+    }
+
+    // SAFETY: The pointer targets the CVec metadata inside the checked capsule.
+    // Reset it before reconstructing the Vec so repeated calls do not double free.
+    unsafe {
+        *cvec_ptr = CVec::empty();
+    }
+
+    // SAFETY: The metadata came from CVec::from(Vec<DataFFI>) and was validated above.
+    let data: Vec<DataFFI> =
+        unsafe { Vec::from_raw_parts(cvec.ptr.cast::<DataFFI>(), cvec.len, cvec.cap) };
     drop(data);
+    Ok(())
 }
 
 #[cfg(not(feature = "ffi"))]
-#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.model")]
 #[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.model")]
 /// Drops a Python `PyCapsule` containing a `CVec` when the `ffi` feature is not enabled.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Always panics with the message "`ffi` feature is not enabled" to indicate that
+/// Always returns a `PyErr` with the message "`ffi` feature is not enabled" to indicate that
 /// FFI functionality is unavailable.
-pub fn drop_cvec_pycapsule(_capsule: &Bound<'_, PyAny>) {
-    panic!("`ffi` feature is not enabled");
+pub fn drop_cvec_pycapsule(_capsule: &Bound<'_, PyAny>) -> PyResult<()> {
+    Err(to_pyruntime_err("`ffi` feature is not enabled"))
 }
 
 /// Transforms the given Python objects into a vector of [`OrderBookDelta`] objects.
@@ -301,6 +391,44 @@ pub fn pyobjects_to_index_prices(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<In
     Ok(index_prices)
 }
 
+/// Transforms the given Python objects into a vector of [`InstrumentStatus`] objects.
+///
+/// # Errors
+///
+/// Returns a `PyErr` if element conversion fails or the data is not monotonically increasing.
+pub fn pyobjects_to_instrument_statuses(
+    data: Vec<Bound<'_, PyAny>>,
+) -> PyResult<Vec<InstrumentStatus>> {
+    let statuses: Vec<InstrumentStatus> = data
+        .into_iter()
+        .map(|obj| InstrumentStatus::from_pyobject(&obj))
+        .collect::<PyResult<Vec<InstrumentStatus>>>()?;
+
+    if !is_monotonically_increasing_by_init(&statuses) {
+        return Err(to_pyvalue_err(ERROR_MONOTONICITY));
+    }
+
+    Ok(statuses)
+}
+
+/// Transforms the given Python objects into a vector of [`OptionGreeks`] objects.
+///
+/// # Errors
+///
+/// Returns a `PyErr` if element conversion fails or the data is not monotonically increasing.
+pub fn pyobjects_to_option_greeks(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<OptionGreeks>> {
+    let greeks: Vec<OptionGreeks> = data
+        .into_iter()
+        .map(|obj| OptionGreeks::from_pyobject(&obj))
+        .collect::<PyResult<Vec<OptionGreeks>>>()?;
+
+    if !is_monotonically_increasing_by_init(&greeks) {
+        return Err(to_pyvalue_err(ERROR_MONOTONICITY));
+    }
+
+    Ok(greeks)
+}
+
 /// Transforms the given Python objects into a vector of [`InstrumentClose`] objects.
 ///
 /// # Errors
@@ -322,7 +450,7 @@ pub fn pyobjects_to_instrument_closes(
     Ok(closes)
 }
 
-/// Deserializes custom data from JSON bytes into a PyO3 CustomData wrapper.
+/// Deserializes custom data from JSON bytes into a PyO3 `CustomData` wrapper.
 ///
 /// # Errors
 ///
@@ -343,7 +471,7 @@ pub fn deserialize_custom_from_json(type_name: &str, payload: &[u8]) -> PyResult
     Ok(custom)
 }
 
-/// Deserializes JSON value to CustomData via the data class's from_json.
+/// Deserializes JSON value to `CustomData` via the data class's `from_json`.
 #[cfg(feature = "python")]
 fn py_json_deserialize_custom_data(
     data_class: &pyo3::Py<pyo3::PyAny>,
@@ -374,9 +502,9 @@ fn py_json_deserialize_custom_data(
     })
 }
 
-/// Encodes CustomData items to RecordBatch via Python encode_record_batch_py.
+/// Encodes `CustomData` items to `RecordBatch` via Python `encode_record_batch_py`.
 #[allow(unsafe_code)]
-#[cfg(feature = "python")]
+#[cfg(all(feature = "python", feature = "arrow"))]
 fn py_encode_custom_data_to_record_batch(
     items: &[std::sync::Arc<dyn crate::data::CustomDataTrait>],
 ) -> Result<arrow::record_batch::RecordBatch, anyhow::Error> {
@@ -427,9 +555,19 @@ fn py_encode_custom_data_to_record_batch(
     })
 }
 
-/// Decodes RecordBatch to CustomData via Python decode_record_batch_py.
+#[cfg(all(feature = "python", feature = "arrow"))]
+fn pyarrow_schema_to_arrow_schema(
+    py_schema: &pyo3::Bound<'_, pyo3::PyAny>,
+) -> PyResult<arrow::datatypes::Schema> {
+    let mut ffi_schema = arrow::ffi::FFI_ArrowSchema::empty();
+    py_schema.call_method1("_export_to_c", ((&raw mut ffi_schema as usize),))?;
+    arrow::datatypes::Schema::try_from(&ffi_schema)
+        .map_err(|e| to_pyvalue_err(format!("Failed to import PyArrow schema: {e}")))
+}
+
+/// Decodes `RecordBatch` to `CustomData` via Python `decode_record_batch_py`.
 #[allow(unsafe_code)]
-#[cfg(feature = "python")]
+#[cfg(all(feature = "python", feature = "arrow"))]
 fn py_decode_record_batch_to_custom_data(
     data_class: &pyo3::Py<pyo3::PyAny>,
     metadata: &std::collections::HashMap<String, String>,
@@ -506,7 +644,7 @@ fn py_decode_record_batch_to_custom_data(
 ///
 /// ```python
 /// from nautilus_trader.model.custom import customdataclass_pyo3
-/// from nautilus_trader.core.nautilus_pyo3.model import register_custom_data_class
+/// from nautilus_trader.model import register_custom_data_class
 ///
 /// @customdataclass_pyo3()
 /// class MarketTickPython:
@@ -517,8 +655,8 @@ fn py_decode_record_batch_to_custom_data(
 /// register_custom_data_class(MarketTickPython)
 /// ```
 #[cfg(feature = "python")]
-#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.model")]
 #[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.model")]
 pub fn register_custom_data_class(data_class: &Bound<'_, PyAny>) -> PyResult<()> {
     use std::sync::Arc;
 
@@ -526,17 +664,18 @@ pub fn register_custom_data_class(data_class: &Bound<'_, PyAny>) -> PyResult<()>
 
     let _py = data_class.py();
 
-    if !data_class.hasattr("decode_record_batch_py")? {
-        return Err(to_pytype_err(
-            "Custom data class must have decode_record_batch_py(metadata, batch) class method",
-        ));
-    }
-
     let type_name: String = if data_class.hasattr("type_name_static")? {
         data_class.call_method0("type_name_static")?.extract()?
     } else {
         data_class.getattr("__name__")?.extract()?
     };
+
+    #[cfg(feature = "arrow")]
+    if !data_class.hasattr("decode_record_batch_py")? {
+        return Err(to_pytype_err(
+            "Custom data class must have decode_record_batch_py(metadata, batch) class method",
+        ));
+    }
 
     if !data_class.hasattr("from_json")? {
         return Err(to_pytype_err(
@@ -551,7 +690,6 @@ pub fn register_custom_data_class(data_class: &Bound<'_, PyAny>) -> PyResult<()>
     }
 
     let data_class_for_json = data_class.clone().unbind();
-    let data_class_for_decode = data_class.clone().unbind();
 
     let json_deserializer = Box::new(
         move |value: serde_json::Value| -> Result<Arc<dyn crate::data::CustomDataTrait>, anyhow::Error> {
@@ -567,34 +705,48 @@ pub fn register_custom_data_class(data_class: &Bound<'_, PyAny>) -> PyResult<()>
         ))
     })?;
 
-    let schema = Arc::new(arrow::datatypes::Schema::empty());
+    #[cfg(feature = "arrow")]
+    {
+        let data_class_for_decode = data_class.clone().unbind();
+        let pyarrow_schema = data_class
+            .getattr("_schema")
+            .ok()
+            .filter(|s| s.hasattr("_export_to_c").unwrap_or(false));
+        let schema = if let Some(py_schema) = pyarrow_schema {
+            Arc::new(pyarrow_schema_to_arrow_schema(&py_schema)?)
+        } else if let Some(schema) = registry::get_arrow_schema(&type_name) {
+            schema
+        } else {
+            Arc::new(arrow::datatypes::Schema::empty())
+        };
 
-    let encoder = Box::new(
-        move |items: &[Arc<dyn crate::data::CustomDataTrait>]| -> Result<
-            arrow::record_batch::RecordBatch,
-            anyhow::Error,
-        > { py_encode_custom_data_to_record_batch(items) },
-    );
+        let encoder = Box::new(
+            move |items: &[Arc<dyn crate::data::CustomDataTrait>]| -> Result<
+                arrow::record_batch::RecordBatch,
+                anyhow::Error,
+            > { py_encode_custom_data_to_record_batch(items) },
+        );
 
-    let decoder = Box::new(
-        move |metadata: &std::collections::HashMap<String, String>,
-              batch: arrow::record_batch::RecordBatch|
-              -> Result<Vec<crate::data::Data>, anyhow::Error> {
-            pyo3::Python::attach(|py| {
-                py_decode_record_batch_to_custom_data(
-                    &data_class_for_decode.clone_ref(py),
-                    metadata,
-                    batch,
-                )
-            })
-        },
-    );
+        let decoder = Box::new(
+            move |metadata: &std::collections::HashMap<String, String>,
+                  batch: arrow::record_batch::RecordBatch|
+                  -> Result<Vec<crate::data::Data>, anyhow::Error> {
+                pyo3::Python::attach(|py| {
+                    py_decode_record_batch_to_custom_data(
+                        &data_class_for_decode.clone_ref(py),
+                        metadata,
+                        batch,
+                    )
+                })
+            },
+        );
 
-    registry::ensure_arrow_registered(&type_name, schema, encoder, decoder).map_err(|e| {
-        to_pyruntime_err(format!(
-            "Failed to register Arrow encoder/decoder for {type_name}: {e}"
-        ))
-    })?;
+        registry::ensure_arrow_registered(&type_name, schema, encoder, decoder).map_err(|e| {
+            to_pyruntime_err(format!(
+                "Failed to register Arrow encoder/decoder for {type_name}: {e}"
+            ))
+        })?;
+    }
 
     Ok(())
 }
@@ -616,4 +768,108 @@ pub fn pyobjects_to_funding_rates(data: Vec<Bound<'_, PyAny>>) -> PyResult<Vec<F
     }
 
     Ok(funding_rates)
+}
+
+#[cfg(all(test, feature = "python", feature = "ffi"))]
+mod tests {
+    use std::{ffi::CString, ptr::NonNull};
+
+    use nautilus_core::ffi::cvec::CVec;
+    use pyo3::{prelude::*, types::PyCapsule};
+    use rstest::rstest;
+
+    use super::{DataFfiCVec, drop_cvec_pycapsule};
+    use crate::data::{DataFFI, stubs::stub_bar};
+
+    #[rstest]
+    fn test_drop_cvec_pycapsule_rejects_wrong_capsule_name() {
+        Python::initialize();
+        Python::attach(|py| {
+            let capsule = data_ffi_capsule(
+                py,
+                DataFfiCVec(CVec::empty()),
+                Some(CString::new("wrong.DataFFI.CVec").unwrap()),
+            );
+
+            let err = drop_cvec_pycapsule(capsule.as_any()).unwrap_err();
+
+            assert!(err.to_string().contains("Invalid DataFFI CVec PyCapsule"));
+        });
+    }
+
+    #[rstest]
+    fn test_drop_cvec_pycapsule_rejects_len_greater_than_cap() {
+        Python::initialize();
+        Python::attach(|py| {
+            let cvec = CVec {
+                ptr: NonNull::<u8>::dangling().as_ptr().cast(),
+                len: 2,
+                cap: 1,
+            };
+            let capsule =
+                data_ffi_capsule(py, DataFfiCVec(cvec), Some(DataFfiCVec::capsule_name()));
+
+            let err = drop_cvec_pycapsule(capsule.as_any()).unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("Invalid DataFFI CVec metadata: len (2) > cap (1)")
+            );
+        });
+    }
+
+    #[rstest]
+    fn test_drop_cvec_pycapsule_rejects_null_non_empty_pointer() {
+        Python::initialize();
+        Python::attach(|py| {
+            let cvec = CVec {
+                ptr: std::ptr::null_mut(),
+                len: 1,
+                cap: 1,
+            };
+            let capsule =
+                data_ffi_capsule(py, DataFfiCVec(cvec), Some(DataFfiCVec::capsule_name()));
+
+            let err = drop_cvec_pycapsule(capsule.as_any()).unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("Invalid DataFFI CVec metadata: null ptr with len (1) and cap (1)")
+            );
+        });
+    }
+
+    #[rstest]
+    fn test_drop_cvec_pycapsule_accepts_empty_cvec() {
+        Python::initialize();
+        Python::attach(|py| {
+            let capsule = data_ffi_capsule(
+                py,
+                DataFfiCVec(CVec::empty()),
+                Some(DataFfiCVec::capsule_name()),
+            );
+
+            drop_cvec_pycapsule(capsule.as_any()).unwrap();
+        });
+    }
+
+    #[rstest]
+    fn test_drop_cvec_pycapsule_allows_repeated_drop() {
+        Python::initialize();
+        Python::attach(|py| {
+            let cvec: DataFfiCVec = vec![DataFFI::Bar(stub_bar())].into();
+            let capsule = data_ffi_capsule(py, cvec, Some(DataFfiCVec::capsule_name()));
+
+            drop_cvec_pycapsule(capsule.as_any()).unwrap();
+            drop_cvec_pycapsule(capsule.as_any()).unwrap();
+        });
+    }
+
+    fn data_ffi_capsule(
+        py: Python<'_>,
+        cvec: DataFfiCVec,
+        name: Option<CString>,
+    ) -> Bound<'_, PyCapsule> {
+        PyCapsule::new_with_destructor::<DataFfiCVec, _>(py, cvec, name, |_, _| {}).unwrap()
+    }
 }

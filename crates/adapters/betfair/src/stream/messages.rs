@@ -23,13 +23,16 @@
 //!
 //! <https://docs.developer.betfair.com/display/1smk3cen4v3lu3yomq5qye0ni/Exchange+Stream+API>
 
+use std::str::FromStr;
+
 use ahash::AHashMap;
 use nautilus_core::serialization::{deserialize_decimal, deserialize_optional_decimal};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
 use ustr::Ustr;
 
 use crate::common::{
+    consts::{STREAM_OP_AUTHENTICATION, STREAM_OP_HEARTBEAT, STREAM_OP_RACE_SUBSCRIPTION},
     enums::{
         ChangeType, LapseStatusReasonCode, MarketBettingType, MarketDataFilterField, MarketStatus,
         PriceLadderType, RunnerStatus, SegmentType, StatusErrorCode, StreamingOrderStatus,
@@ -188,10 +191,10 @@ pub struct RunnerChange {
     /// Starting price lay.
     pub spl: Option<Vec<PV>>,
     /// Starting price near (projected SP).
-    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_lenient")]
     pub spn: Option<Decimal>,
     /// Starting price far (actual BSP).
-    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_lenient")]
     pub spf: Option<Decimal>,
     /// Traded volume by price level.
     pub trd: Option<Vec<PV>>,
@@ -201,6 +204,84 @@ pub struct RunnerChange {
     /// Total volume matched on this runner.
     #[serde(default, deserialize_with = "deserialize_optional_decimal")]
     pub tv: Option<Decimal>,
+}
+
+fn deserialize_optional_decimal_lenient<'de, D>(
+    deserializer: D,
+) -> Result<Option<Decimal>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct LenientOptionalDecimalVisitor;
+
+    impl Visitor<'_> for LenientOptionalDecimalVisitor {
+        type Value = Option<Decimal>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("null or a decimal number as string, integer, or float")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(parse_optional_decimal_lenient(value))
+        }
+
+        fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+            self.visit_str(&value)
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(Some(Decimal::from(value)))
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(Some(Decimal::from(value)))
+        }
+
+        fn visit_i128<E: serde::de::Error>(self, value: i128) -> Result<Self::Value, E> {
+            Ok(Some(Decimal::from(value)))
+        }
+
+        fn visit_u128<E: serde::de::Error>(self, value: u128) -> Result<Self::Value, E> {
+            Ok(Some(Decimal::from(value)))
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+            Ok(Decimal::try_from(value).ok())
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(LenientOptionalDecimalVisitor)
+}
+
+fn parse_optional_decimal_lenient(value: &str) -> Option<Decimal> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || is_non_finite_decimal(trimmed) {
+        return None;
+    }
+
+    if trimmed.contains('e') || trimmed.contains('E') {
+        Decimal::from_scientific(trimmed).ok()
+    } else {
+        Decimal::from_str(trimmed).ok()
+    }
+}
+
+fn is_non_finite_decimal(value: &str) -> bool {
+    value.eq_ignore_ascii_case("nan")
+        || value.eq_ignore_ascii_case("inf")
+        || value.eq_ignore_ascii_case("+inf")
+        || value.eq_ignore_ascii_case("-inf")
+        || value.eq_ignore_ascii_case("infinity")
+        || value.eq_ignore_ascii_case("+infinity")
+        || value.eq_ignore_ascii_case("-infinity")
 }
 
 /// Full market definition snapshot.
@@ -438,7 +519,10 @@ pub struct UnmatchedOrder {
     /// Order status (E=Executable, EC=ExecutionComplete).
     pub status: StreamingOrderStatus,
     /// Persistence type (L=Lapse, P=Persist, MOC=MarketOnClose).
-    pub pt: StreamingPersistenceType,
+    ///
+    /// Betfair can omit this on some BSP market-on-close order updates.
+    #[serde(default)]
+    pub pt: Option<StreamingPersistenceType>,
     /// Order type (L=Limit, LOC=LimitOnClose, MOC=MarketOnClose).
     pub ot: StreamingOrderType,
     /// Placed date (epoch millis).
@@ -497,7 +581,7 @@ impl Authentication {
     #[must_use]
     pub fn new(app_key: String, session: String) -> Self {
         Self {
-            op: "authentication".to_string(),
+            op: STREAM_OP_AUTHENTICATION.to_string(),
             id: None,
             app_key,
             session,
@@ -557,7 +641,7 @@ impl RaceSubscription {
     #[must_use]
     pub fn new(id: u64) -> Self {
         Self {
-            op: "raceSubscription".to_string(),
+            op: STREAM_OP_RACE_SUBSCRIPTION.to_string(),
             id: Some(id),
         }
     }
@@ -574,7 +658,7 @@ impl StreamHeartbeat {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            op: "heartbeat".to_string(),
+            op: STREAM_OP_HEARTBEAT.to_string(),
             id: None,
         }
     }
@@ -831,6 +915,37 @@ mod tests {
     }
 
     #[rstest]
+    fn test_stream_decode_lenient_sp_fields() {
+        let data = r#"{
+            "op":"mcm",
+            "pt":1773304044929,
+            "mc":[{
+                "id":"1.255095842",
+                "rc":[{
+                    "id":96146807,
+                    "spn":"Infinity",
+                    "spf":"NaN",
+                    "ltp":5.0,
+                    "tv":10.63
+                }]
+            }]
+        }"#;
+
+        let msg = stream_decode(data.as_bytes()).unwrap();
+
+        match msg {
+            StreamMessage::MarketChange(mcm) => {
+                let rc = &mcm.mc.as_ref().unwrap()[0].rc.as_ref().unwrap()[0];
+                assert_eq!(rc.spn, None);
+                assert_eq!(rc.spf, None);
+                assert_eq!(rc.ltp, Some(Decimal::new(50, 1)));
+                assert_eq!(rc.tv, Some(Decimal::new(1063, 2)));
+            }
+            other => panic!("Expected MarketChange, was {other:?}"),
+        }
+    }
+
+    #[rstest]
     fn test_market_definition_standalone() {
         let data = load_test_json("stream/market_definition.json");
         let _def: MarketDefinition = serde_json::from_str(&data).unwrap();
@@ -912,6 +1027,48 @@ mod tests {
                 assert_eq!(uo.sv.unwrap(), rust_decimal::Decimal::from(50));
                 assert_eq!(uo.sm.unwrap(), rust_decimal::Decimal::from(50));
                 assert_eq!(uo.s, rust_decimal::Decimal::from(100));
+            }
+            other => panic!("Expected OrderChange, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_stream_decode_ocm_missing_persistence_type_for_market_on_close() {
+        let data = r#"{
+            "op":"ocm",
+            "id":1,
+            "pt":1775175455685,
+            "clk":"clk-1",
+            "oc":[{
+                "id":"1.256134154",
+                "orc":[{
+                    "id":77465280,
+                    "uo":[{
+                        "id":"424009603606",
+                        "p":1.01,
+                        "s":2.00,
+                        "side":"B",
+                        "status":"E",
+                        "ot":"MOC",
+                        "pd":1775175455000,
+                        "sr":2.00
+                    }]
+                }]
+            }]
+        }"#;
+
+        let msg = stream_decode(data.as_bytes()).unwrap();
+
+        match msg {
+            StreamMessage::OrderChange(ocm) => {
+                let oc = ocm.oc.as_ref().unwrap();
+                let orc = oc[0].orc.as_ref().unwrap();
+                let uo = &orc[0].uo.as_ref().unwrap()[0];
+                assert_eq!(uo.pt, None);
+                assert_eq!(
+                    uo.ot,
+                    crate::common::enums::StreamingOrderType::MarketOnClose
+                );
             }
             other => panic!("Expected OrderChange, was {other:?}"),
         }

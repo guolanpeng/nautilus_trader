@@ -18,11 +18,50 @@
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use super::enums::OKXOptionType;
+use super::enums::{OKXOptionType, OKXTriggerType};
 use crate::common::{
-    enums::{OKXContractType, OKXInstrumentStatus, OKXInstrumentType},
-    parse::deserialize_optional_string_to_u64,
+    enums::{OKXContractType, OKXInstrumentCategory, OKXInstrumentStatus, OKXInstrumentType},
+    parse::{deserialize_empty_ustr_as_none, deserialize_optional_string_to_u64},
 };
+
+/// Attached TP/SL child order metadata returned by OKX on parent orders.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXAttachedAlgoOrd {
+    /// Attached algo order ID, if assigned by OKX.
+    #[serde(default)]
+    pub attach_algo_id: String,
+    /// Attached child client order ID.
+    #[serde(default)]
+    pub attach_algo_cl_ord_id: String,
+    /// Stop-loss trigger price.
+    #[serde(default)]
+    pub sl_trigger_px: String,
+    /// Stop-loss order price.
+    #[serde(default)]
+    pub sl_ord_px: String,
+    /// Stop-loss trigger price type.
+    #[serde(default)]
+    pub sl_trigger_px_type: Option<OKXTriggerType>,
+    /// Take-profit trigger price.
+    #[serde(default)]
+    pub tp_trigger_px: String,
+    /// Take-profit order price.
+    #[serde(default)]
+    pub tp_ord_px: String,
+    /// Take-profit trigger price type.
+    #[serde(default)]
+    pub tp_trigger_px_type: Option<OKXTriggerType>,
+    /// Callback ratio for attached trailing stop orders.
+    #[serde(default)]
+    pub callback_ratio: String,
+    /// Callback spread for attached trailing stop orders.
+    #[serde(default)]
+    pub callback_spread: String,
+    /// Activation price for attached trailing stop orders.
+    #[serde(default)]
+    pub active_px: String,
+}
 
 /// Represents an instrument on the OKX exchange.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -33,13 +72,20 @@ pub struct OKXInstrument {
     /// Instrument ID, e.g. "BTC-USD-SWAP".
     pub inst_id: Ustr,
     /// Instrument ID code (numeric). Required for WebSocket order operations.
-    /// E.g., 10458 for BTC-USD-SWAP. May not be present for SPOT instruments.
+    /// E.g., 10458 for BTC-USD-SWAP.
     #[serde(default)]
     pub inst_id_code: Option<u64>,
     /// Underlying of the instrument, e.g. "BTC-USD". Only applicable to FUTURES/SWAP/OPTION.
     pub uly: Ustr,
     /// Instrument family, e.g. "BTC-USD". Only applicable to FUTURES/SWAP/OPTION.
     pub inst_family: Ustr,
+    /// Event contract series ID. Only applicable to EVENTS.
+    #[serde(default, deserialize_with = "deserialize_empty_ustr_as_none")]
+    pub series_id: Option<Ustr>,
+    /// Instrument category (the OKX `instCategory` field; the deprecated, distinct
+    /// `category` field is intentionally ignored).
+    #[serde(default)]
+    pub inst_category: Option<OKXInstrumentCategory>,
     /// Base currency, e.g. "BTC" in BTC-USDT. Applicable to SPOT/MARGIN.
     pub base_ccy: Ustr,
     /// Quote currency, e.g. "USDT" in BTC-USDT.

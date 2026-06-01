@@ -24,12 +24,19 @@ use nautilus_common::{
     clients::ExecutionClient,
     clock::Clock,
     factories::OrderEventFactory,
-    messages::execution::{
-        BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-        GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+    live::try_get_exec_event_sender,
+    messages::{
+        ExecutionEvent,
+        execution::{
+            BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
+            GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
+            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        },
     },
-    msgbus::{self, MStr, MessagingSwitchboard, Pattern, TypedHandler},
+    msgbus::{
+        self, MStr, MessagingSwitchboard, Pattern, TypedHandler,
+        typed_handler::ShareableMessageHandler,
+    },
 };
 use nautilus_core::{UnixNanos, WeakCell};
 use nautilus_execution::{
@@ -42,8 +49,9 @@ use nautilus_execution::{
 };
 use nautilus_model::{
     accounts::AccountAny,
-    data::{Bar, OrderBookDeltas, QuoteTick, TradeTick},
+    data::{Bar, InstrumentClose, InstrumentStatus, OrderBookDeltas, QuoteTick, TradeTick},
     enums::OmsType,
+    events::OrderEventAny,
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
@@ -69,6 +77,91 @@ struct SandboxInner {
     next_engine_raw_id: u32,
     /// Current account balances.
     balances: AHashMap<String, Money>,
+    event_handler: Option<Rc<dyn Fn(OrderEventAny)>>,
+}
+
+fn check_quote_or_drop(context: &str, quote: &QuoteTick, instrument: &InstrumentAny) -> bool {
+    if quote_matches_instrument_precision(quote, instrument) {
+        return true;
+    }
+
+    log::warn!(
+        "Dropping {context} for {} due to precision mismatch \
+         (bid_px={}, ask_px={}, bid_sz={}, ask_sz={}, expected_price={}, expected_size={})",
+        instrument.id(),
+        quote.bid_price.precision,
+        quote.ask_price.precision,
+        quote.bid_size.precision,
+        quote.ask_size.precision,
+        instrument.price_precision(),
+        instrument.size_precision(),
+    );
+    false
+}
+
+fn check_trade_or_drop(context: &str, trade: &TradeTick, instrument: &InstrumentAny) -> bool {
+    if trade_matches_instrument_precision(trade, instrument) {
+        return true;
+    }
+
+    log::warn!(
+        "Dropping {context} for {} due to precision mismatch \
+         (px={}, sz={}, expected_price={}, expected_size={})",
+        instrument.id(),
+        trade.price.precision,
+        trade.size.precision,
+        instrument.price_precision(),
+        instrument.size_precision(),
+    );
+    false
+}
+
+fn check_bar_or_drop(context: &str, bar: &Bar, instrument: &InstrumentAny) -> bool {
+    if bar_matches_instrument_precision(bar, instrument) {
+        return true;
+    }
+
+    log::warn!(
+        "Dropping {context} for {} due to precision mismatch \
+         (open={}, high={}, low={}, close={}, volume={}, expected_price={}, expected_size={})",
+        instrument.id(),
+        bar.open.precision,
+        bar.high.precision,
+        bar.low.precision,
+        bar.close.precision,
+        bar.volume.precision,
+        instrument.price_precision(),
+        instrument.size_precision(),
+    );
+    false
+}
+
+fn quote_matches_instrument_precision(quote: &QuoteTick, instrument: &InstrumentAny) -> bool {
+    let price_precision = instrument.price_precision();
+    let size_precision = instrument.size_precision();
+
+    quote.bid_price.precision == price_precision
+        && quote.ask_price.precision == price_precision
+        && quote.bid_size.precision == size_precision
+        && quote.ask_size.precision == size_precision
+}
+
+fn trade_matches_instrument_precision(trade: &TradeTick, instrument: &InstrumentAny) -> bool {
+    let price_precision = instrument.price_precision();
+    let size_precision = instrument.size_precision();
+
+    trade.price.precision == price_precision && trade.size.precision == size_precision
+}
+
+fn bar_matches_instrument_precision(bar: &Bar, instrument: &InstrumentAny) -> bool {
+    let price_precision = instrument.price_precision();
+    let size_precision = instrument.size_precision();
+
+    bar.open.precision == price_precision
+        && bar.high.precision == price_precision
+        && bar.low.precision == price_precision
+        && bar.close.precision == price_precision
+        && bar.volume.precision == size_precision
 }
 
 impl SandboxInner {
@@ -96,6 +189,10 @@ impl SandboxInner {
                 engine_config,
             );
 
+            if let Some(handler) = &self.event_handler {
+                engine.get_engine_mut().set_event_handler(handler.clone());
+            }
+
             self.matching_engines.insert(instrument_id, engine);
         }
     }
@@ -107,6 +204,10 @@ impl SandboxInner {
         // Try to get instrument from cache, create engine if found
         let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
         if let Some(instrument) = instrument {
+            if !check_quote_or_drop("quote tick", quote, &instrument) {
+                return;
+            }
+
             self.ensure_matching_engine(&instrument);
 
             if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
@@ -125,6 +226,10 @@ impl SandboxInner {
 
         let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
         if let Some(instrument) = instrument {
+            if !check_trade_or_drop("trade tick", trade, &instrument) {
+                return;
+            }
+
             self.ensure_matching_engine(&instrument);
 
             if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
@@ -143,6 +248,10 @@ impl SandboxInner {
 
         let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
         if let Some(instrument) = instrument {
+            if !check_bar_or_drop("bar", bar, &instrument) {
+                return;
+            }
+
             self.ensure_matching_engine(&instrument);
 
             if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
@@ -165,6 +274,44 @@ impl SandboxInner {
             }
         }
     }
+
+    fn process_instrument_status(&mut self, status: &InstrumentStatus) {
+        let instrument_id = status.instrument_id;
+
+        if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+            engine.get_engine_mut().process_status(status.action);
+            return;
+        }
+
+        let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
+        if let Some(instrument) = instrument {
+            self.ensure_matching_engine(&instrument);
+
+            if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+                engine.get_engine_mut().process_status(status.action);
+            }
+        } else {
+            log::warn!(
+                "Ignoring instrument status for {instrument_id}: instrument missing from cache",
+            );
+        }
+    }
+
+    fn process_instrument_close(&mut self, close: &InstrumentClose) {
+        let instrument_id = close.instrument_id;
+
+        // A delayed close belongs to an existing exposure lifecycle. Unlike an
+        // instrument status update, it must not recreate execution state from
+        // cache after rotation/unsubscribe; pending-settlement ownership stays
+        // with the already-initialized matching engine.
+        if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+            engine.get_engine_mut().process_instrument_close(*close);
+        } else {
+            log::warn!(
+                "Ignoring instrument close for {instrument_id}: no existing matching engine",
+            );
+        }
+    }
 }
 
 /// Registered message handlers for later deregistration.
@@ -177,6 +324,10 @@ struct RegisteredHandlers {
     trade_handler: TypedHandler<TradeTick>,
     bar_pattern: MStr<Pattern>,
     bar_handler: TypedHandler<Bar>,
+    status_pattern: MStr<Pattern>,
+    status_handler: ShareableMessageHandler,
+    close_pattern: MStr<Pattern>,
+    close_handler: ShareableMessageHandler,
 }
 
 /// A sandbox execution client for paper trading against live market data.
@@ -236,6 +387,7 @@ impl SandboxExecutionClient {
             matching_engines: AHashMap::new(),
             next_engine_raw_id: 0,
             balances,
+            event_handler: None,
         }));
 
         let factory = OrderEventFactory::new(
@@ -266,6 +418,15 @@ impl SandboxExecutionClient {
     #[must_use]
     pub fn matching_engine_count(&self) -> usize {
         self.inner.borrow().matching_engines.len()
+    }
+
+    fn dispatch_order_event(&self, event: OrderEventAny) {
+        if let Some(handler) = &self.inner.borrow().event_handler {
+            handler(event);
+        } else {
+            let endpoint = MessagingSwitchboard::exec_engine_process();
+            msgbus::send_order_event(endpoint, event);
+        }
     }
 
     /// Registers message handlers for market data subscriptions.
@@ -319,7 +480,7 @@ impl SandboxExecutionClient {
 
         // Bar handler (topic is data.bars.{bar_type}, filter by venue in handler)
         let bar_handler = {
-            let inner = inner_weak;
+            let inner = inner_weak.clone();
             TypedHandler::from(move |bar: &Bar| {
                 if bar.bar_type.instrument_id().venue == venue
                     && let Some(inner_rc) = inner.upgrade()
@@ -329,16 +490,41 @@ impl SandboxExecutionClient {
             })
         };
 
+        let status_handler = {
+            let inner = inner_weak.clone();
+            ShareableMessageHandler::from_typed(move |status: &InstrumentStatus| {
+                if status.instrument_id.venue == venue
+                    && let Some(inner_rc) = inner.upgrade()
+                {
+                    inner_rc.borrow_mut().process_instrument_status(status);
+                }
+            })
+        };
+
+        let close_handler = {
+            ShareableMessageHandler::from_typed(move |close: &InstrumentClose| {
+                if close.instrument_id.venue == venue
+                    && let Some(inner_rc) = inner_weak.upgrade()
+                {
+                    inner_rc.borrow_mut().process_instrument_close(close);
+                }
+            })
+        };
+
         // Subscribe patterns
         let deltas_pattern: MStr<Pattern> = format!("data.book.deltas.{venue}.*").into();
         let quote_pattern: MStr<Pattern> = format!("data.quotes.{venue}.*").into();
         let trade_pattern: MStr<Pattern> = format!("data.trades.{venue}.*").into();
         let bar_pattern: MStr<Pattern> = "data.bars.*".into();
+        let status_pattern: MStr<Pattern> = format!("data.status.{venue}.*").into();
+        let close_pattern: MStr<Pattern> = format!("data.close.{venue}.*").into();
 
         msgbus::subscribe_book_deltas(deltas_pattern, deltas_handler.clone(), Some(10));
         msgbus::subscribe_quotes(quote_pattern, quote_handler.clone(), Some(10));
         msgbus::subscribe_trades(trade_pattern, trade_handler.clone(), Some(10));
         msgbus::subscribe_bars(bar_pattern, bar_handler.clone(), Some(10));
+        msgbus::subscribe_any(status_pattern, status_handler.clone(), Some(10));
+        msgbus::subscribe_instrument_close(close_pattern, close_handler.clone(), Some(10));
 
         // Store handlers for later deregistration
         *self.handlers.borrow_mut() = Some(RegisteredHandlers {
@@ -350,6 +536,10 @@ impl SandboxExecutionClient {
             trade_handler,
             bar_pattern,
             bar_handler,
+            status_pattern,
+            status_handler,
+            close_pattern,
+            close_handler,
         });
 
         log::info!(
@@ -365,6 +555,8 @@ impl SandboxExecutionClient {
             msgbus::unsubscribe_quotes(handlers.quote_pattern, &handlers.quote_handler);
             msgbus::unsubscribe_trades(handlers.trade_pattern, &handlers.trade_handler);
             msgbus::unsubscribe_bars(handlers.bar_pattern, &handlers.bar_handler);
+            msgbus::unsubscribe_any(handlers.status_pattern, &handlers.status_handler);
+            msgbus::unsubscribe_instrument_close(handlers.close_pattern, &handlers.close_handler);
 
             log::info!(
                 "Sandbox deregistered message handlers for venue={}",
@@ -401,6 +593,10 @@ impl SandboxExecutionClient {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Instrument not found: {instrument_id}"))?;
 
+        if !check_quote_or_drop("quote tick", quote, &instrument) {
+            return Ok(());
+        }
+
         let mut inner = self.inner.borrow_mut();
         inner.ensure_matching_engine(&instrument);
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
@@ -427,6 +623,10 @@ impl SandboxExecutionClient {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Instrument not found: {instrument_id}"))?;
 
+        if !check_trade_or_drop("trade tick", trade, &instrument) {
+            return Ok(());
+        }
+
         let mut inner = self.inner.borrow_mut();
         inner.ensure_matching_engine(&instrument);
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
@@ -452,6 +652,10 @@ impl SandboxExecutionClient {
             .instrument(&instrument_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Instrument not found: {instrument_id}"))?;
+
+        if !check_bar_or_drop("bar", bar, &instrument) {
+            return Ok(());
+        }
 
         let mut inner = self.inner.borrow_mut();
         inner.ensure_matching_engine(&instrument);
@@ -517,7 +721,7 @@ impl SandboxExecutionClient {
         self.cache
             .borrow()
             .order(client_order_id)
-            .cloned()
+            .map(|o| o.clone())
             .ok_or_else(|| anyhow::anyhow!("Order not found in cache for {client_order_id}"))
     }
 }
@@ -544,9 +748,19 @@ impl ExecutionClient for SandboxExecutionClient {
         self.config.oms_type
     }
 
+    fn on_instrument(&mut self, instrument: InstrumentAny) {
+        let instrument_id = instrument.id();
+        let mut inner = self.inner.borrow_mut();
+        if let Some(engine) = inner.matching_engines.get_mut(&instrument_id)
+            && let Err(e) = engine.get_engine_mut().update_instrument(instrument)
+        {
+            log::error!("Failed to update instrument {instrument_id} in sandbox engine: {e}");
+        }
+    }
+
     fn get_account(&self) -> Option<AccountAny> {
         let account_id = self.core.borrow().account_id;
-        self.cache.borrow().account(&account_id).cloned()
+        self.cache.borrow().account_owned(&account_id)
     }
 
     fn generate_account_state(
@@ -568,6 +782,19 @@ impl ExecutionClient for SandboxExecutionClient {
     fn start(&mut self) -> anyhow::Result<()> {
         if self.core.borrow().is_started() {
             return Ok(());
+        }
+
+        if let Some(sender) = try_get_exec_event_sender() {
+            let handler: Rc<dyn Fn(OrderEventAny)> = Rc::new(move |event: OrderEventAny| {
+                if let Err(e) = sender.send(ExecutionEvent::Order(event)) {
+                    log::warn!("Failed to send order event: {e}");
+                }
+            });
+            let mut inner = self.inner.borrow_mut();
+            inner.event_handler = Some(handler.clone());
+            for engine in inner.matching_engines.values_mut() {
+                engine.get_engine_mut().set_event_handler(handler.clone());
+            }
         }
 
         // Register message handlers to receive market data
@@ -632,7 +859,7 @@ impl ExecutionClient for SandboxExecutionClient {
         Ok(())
     }
 
-    fn submit_order(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
+    fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
         let mut order = self.get_order(&cmd.client_order_id)?;
 
         if order.is_closed() {
@@ -642,8 +869,7 @@ impl ExecutionClient for SandboxExecutionClient {
 
         let ts_init = self.clock.borrow().timestamp_ns();
         let event = self.factory.generate_order_submitted(&order, ts_init);
-        let endpoint = MessagingSwitchboard::exec_engine_process();
-        msgbus::send_order_event(endpoint, event);
+        self.dispatch_order_event(event);
 
         let instrument_id = order.instrument_id();
         let instrument = self
@@ -660,12 +886,15 @@ impl ExecutionClient for SandboxExecutionClient {
         let cache = self.cache.borrow();
 
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
-            if let Some(quote) = cache.quote(&instrument_id) {
+            if let Some(quote) = cache.quote(&instrument_id)
+                && check_quote_or_drop("cached quote tick", quote, &instrument)
+            {
                 engine.get_engine_mut().process_quote_tick(quote);
             }
 
             if self.config.trade_execution
                 && let Some(trade) = cache.trade(&instrument_id)
+                && check_trade_or_drop("cached trade tick", trade, &instrument)
             {
                 engine.get_engine_mut().process_trade_tick(trade);
             }
@@ -683,14 +912,13 @@ impl ExecutionClient for SandboxExecutionClient {
         Ok(())
     }
 
-    fn submit_order_list(&self, cmd: &SubmitOrderList) -> anyhow::Result<()> {
+    fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
         let ts_init = self.clock.borrow().timestamp_ns();
-        let endpoint = MessagingSwitchboard::exec_engine_process();
 
         let orders: Vec<OrderAny> = self
             .cache
             .borrow()
-            .orders_for_ids(&cmd.order_list.client_order_ids, cmd);
+            .orders_for_ids(&cmd.order_list.client_order_ids, &cmd);
 
         for order in &orders {
             if order.is_closed() {
@@ -699,10 +927,11 @@ impl ExecutionClient for SandboxExecutionClient {
             }
 
             let event = self.factory.generate_order_submitted(order, ts_init);
-            msgbus::send_order_event(endpoint, event);
+            self.dispatch_order_event(event);
         }
 
         let account_id = self.core.borrow().account_id;
+
         for order in &orders {
             if order.is_closed() {
                 continue;
@@ -719,12 +948,15 @@ impl ExecutionClient for SandboxExecutionClient {
                 let cache = self.cache.borrow();
 
                 if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
-                    if let Some(quote) = cache.quote(&instrument_id) {
+                    if let Some(quote) = cache.quote(&instrument_id)
+                        && check_quote_or_drop("cached quote tick", quote, &instrument)
+                    {
                         engine.get_engine_mut().process_quote_tick(quote);
                     }
 
                     if self.config.trade_execution
                         && let Some(trade) = cache.trade(&instrument_id)
+                        && check_trade_or_drop("cached trade tick", trade, &instrument)
                     {
                         engine.get_engine_mut().process_trade_tick(trade);
                     }
@@ -743,40 +975,40 @@ impl ExecutionClient for SandboxExecutionClient {
         Ok(())
     }
 
-    fn modify_order(&self, cmd: &ModifyOrder) -> anyhow::Result<()> {
+    fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let account_id = self.core.borrow().account_id;
 
         let mut inner = self.inner.borrow_mut();
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
-            engine.get_engine_mut().process_modify(cmd, account_id);
+            engine.get_engine_mut().process_modify(&cmd, account_id);
         }
         Ok(())
     }
 
-    fn cancel_order(&self, cmd: &CancelOrder) -> anyhow::Result<()> {
+    fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let account_id = self.core.borrow().account_id;
 
         let mut inner = self.inner.borrow_mut();
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
-            engine.get_engine_mut().process_cancel(cmd, account_id);
+            engine.get_engine_mut().process_cancel(&cmd, account_id);
         }
         Ok(())
     }
 
-    fn cancel_all_orders(&self, cmd: &CancelAllOrders) -> anyhow::Result<()> {
+    fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let account_id = self.core.borrow().account_id;
 
         let mut inner = self.inner.borrow_mut();
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
-            engine.get_engine_mut().process_cancel_all(cmd, account_id);
+            engine.get_engine_mut().process_cancel_all(&cmd, account_id);
         }
         Ok(())
     }
 
-    fn batch_cancel_orders(&self, cmd: &BatchCancelOrders) -> anyhow::Result<()> {
+    fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let account_id = self.core.borrow().account_id;
 
@@ -784,19 +1016,19 @@ impl ExecutionClient for SandboxExecutionClient {
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
             engine
                 .get_engine_mut()
-                .process_batch_cancel(cmd, account_id);
+                .process_batch_cancel(&cmd, account_id);
         }
         Ok(())
     }
 
-    fn query_account(&self, _cmd: &QueryAccount) -> anyhow::Result<()> {
+    fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
         let balances = self.get_current_account_balances();
         let ts_event = self.clock.borrow().timestamp_ns();
         self.generate_account_state(balances, vec![], false, ts_event)?;
         Ok(())
     }
 
-    fn query_order(&self, _cmd: &QueryOrder) -> anyhow::Result<()> {
+    fn query_order(&self, _cmd: QueryOrder) -> anyhow::Result<()> {
         // Orders are tracked in the cache, no external query needed for sandbox
         Ok(())
     }

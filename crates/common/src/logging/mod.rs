@@ -20,7 +20,7 @@
 //! active `LogGuard` instances, ensuring the logging thread completes all pending writes before
 //! termination.
 //!
-//! # LogGuard Reference Counting
+//! # `LogGuard` reference counting
 //!
 //! The logging system maintains a global count of active `LogGuard` instances using an atomic
 //! counter (`LOGGING_GUARDS_ACTIVE`). When a `LogGuard` is created, the counter is incremented,
@@ -129,6 +129,17 @@ pub fn logging_shutdown() {
     crate::logging::logger::shutdown_graceful();
 }
 
+/// Flushes and syncs file logs to disk.
+///
+/// This is a no-op when logging is not initialized or file logging is disabled.
+///
+/// # Errors
+///
+/// Returns an error if the sync request cannot be delivered or acknowledged.
+pub fn logging_sync_to_disk() -> anyhow::Result<()> {
+    crate::logging::logger::sync_to_disk()
+}
+
 /// Returns whether the core logger is using ANSI colors.
 pub fn logging_is_colored() -> bool {
     LOGGING_COLORED.load(Ordering::Relaxed)
@@ -209,6 +220,7 @@ pub fn parse_component_levels(
     match original_map {
         Some(map) => {
             let mut new_map = AHashMap::new();
+
             for (key, value) in map {
                 let ustr_key = Ustr::from(&key);
                 let s = value.as_str().ok_or_else(|| {

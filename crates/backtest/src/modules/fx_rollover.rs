@@ -26,9 +26,9 @@ use nautilus_model::{
     enums::{AssetClass, PriceType},
     identifiers::InstrumentId,
     instruments::Instrument,
-    position::Position,
     types::{Currency, Money},
 };
+use rust_decimal::prelude::ToPrimitive;
 
 use super::{ExchangeContext, SimulationModule};
 
@@ -53,6 +53,10 @@ const LOCATION_CURRENCY_MAP: &[(&str, &str)] = &[
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.backtest", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.backtest")
 )]
 pub struct InterestRateRecord {
     /// OECD location code (e.g., "AUS", "USA").
@@ -164,6 +168,10 @@ impl RolloverInterestCalculator {
         skip_from_py_object
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.backtest")
+)]
 pub struct FXRolloverInterestModule {
     calculator: RolloverInterestCalculator,
     rollover_time_ns: Cell<u64>,
@@ -218,7 +226,7 @@ impl FXRolloverInterestModule {
         }
 
         for (instrument_id, &mid) in &mid_prices {
-            let positions: Vec<&Position> =
+            let positions =
                 ctx.cache
                     .positions_open(Some(&ctx.venue), Some(instrument_id), None, None, None);
 
@@ -245,9 +253,11 @@ impl FXRolloverInterestModule {
 
             let instrument = &ctx.instruments[instrument_id];
             let currency = if let Some(base) = ctx.base_currency {
+                // Rollover math is still f64; convert the Decimal rate at the boundary
                 let xrate = ctx
                     .cache
                     .get_xrate(ctx.venue, instrument.quote_currency(), base, PriceType::Mid)
+                    .and_then(|rate| rate.to_f64())
                     .unwrap_or(0.0);
                 rollover *= xrate;
                 base

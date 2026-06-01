@@ -18,14 +18,19 @@ use serde_json;
 use ustr::Ustr;
 
 use crate::{
-    common::enums::{
-        BybitOrderSide, BybitOrderType, BybitProductType, BybitTimeInForce, BybitTriggerType,
+    common::{
+        enums::{
+            BybitBboSideType, BybitMarketUnit, BybitOrderSide, BybitOrderType, BybitPositionIdx,
+            BybitProductType, BybitTimeInForce, BybitTpSlMode, BybitTriggerType,
+        },
+        parse::parse_bbo_level,
     },
     websocket::{error::BybitWsError, messages},
 };
 
 /// Parameters for placing an order via WebSocket.
 #[pyclass(from_py_object)]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.bybit")]
 #[derive(Clone, Debug)]
 pub struct BybitWsPlaceOrderParams {
     #[pyo3(get, set)]
@@ -80,12 +85,57 @@ pub struct BybitWsPlaceOrderParams {
     pub sl_limit_price: Option<String>,
     #[pyo3(get, set)]
     pub tp_limit_price: Option<String>,
+    #[pyo3(get, set)]
+    pub order_iv: Option<String>,
+    #[pyo3(get, set)]
+    pub mmp: Option<bool>,
+    #[pyo3(get, set)]
+    pub position_idx: Option<BybitPositionIdx>,
+    #[pyo3(get, set)]
+    pub bbo_side_type: Option<String>,
+    #[pyo3(get, set)]
+    pub bbo_level: Option<String>,
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BybitWsPlaceOrderParams {
+    /// Parameters for placing an order via WebSocket.
     #[new]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        category,
+        symbol,
+        side,
+        order_type,
+        qty,
+        is_leverage=None,
+        market_unit=None,
+        price=None,
+        time_in_force=None,
+        order_link_id=None,
+        reduce_only=None,
+        close_on_trigger=None,
+        trigger_price=None,
+        trigger_by=None,
+        trigger_direction=None,
+        tpsl_mode=None,
+        take_profit=None,
+        stop_loss=None,
+        tp_trigger_by=None,
+        sl_trigger_by=None,
+        sl_trigger_price=None,
+        tp_trigger_price=None,
+        sl_order_type=None,
+        tp_order_type=None,
+        sl_limit_price=None,
+        tp_limit_price=None,
+        order_iv=None,
+        mmp=None,
+        position_idx=None,
+        bbo_side_type=None,
+        bbo_level=None,
+    ))]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         category: BybitProductType,
         symbol: String,
@@ -113,6 +163,11 @@ impl BybitWsPlaceOrderParams {
         tp_order_type: Option<String>,
         sl_limit_price: Option<String>,
         tp_limit_price: Option<String>,
+        order_iv: Option<String>,
+        mmp: Option<bool>,
+        position_idx: Option<BybitPositionIdx>,
+        bbo_side_type: Option<String>,
+        bbo_level: Option<String>,
     ) -> Self {
         Self {
             category,
@@ -141,6 +196,11 @@ impl BybitWsPlaceOrderParams {
             tp_order_type,
             sl_limit_price,
             tp_limit_price,
+            order_iv,
+            mmp,
+            position_idx,
+            bbo_side_type,
+            bbo_level,
         }
     }
 }
@@ -215,6 +275,43 @@ impl TryFrom<BybitWsPlaceOrderParams> for messages::BybitWsPlaceOrderParams {
             })
             .transpose()?;
 
+        let tpsl_mode = params
+            .tpsl_mode
+            .map(|v| {
+                serde_json::from_str::<BybitTpSlMode>(&format!("\"{v}\""))
+                    .map_err(|e| BybitWsError::ClientError(format!("Invalid tpsl_mode '{v}': {e}")))
+            })
+            .transpose()?;
+
+        let market_unit = params
+            .market_unit
+            .map(|v| {
+                serde_json::from_str::<BybitMarketUnit>(&format!("\"{v}\"")).map_err(|e| {
+                    BybitWsError::ClientError(format!("Invalid market_unit '{v}': {e}"))
+                })
+            })
+            .transpose()?;
+
+        let bbo_side_type = params
+            .bbo_side_type
+            .map(|v| {
+                serde_json::from_str::<BybitBboSideType>(&format!("\"{v}\"")).map_err(|e| {
+                    BybitWsError::ClientError(format!("Invalid bbo_side_type '{v}': {e}"))
+                })
+            })
+            .transpose()?;
+        let bbo_level = params
+            .bbo_level
+            .map(parse_bbo_level)
+            .transpose()
+            .map_err(|e| BybitWsError::ClientError(e.to_string()))?;
+
+        if bbo_side_type.is_some() != bbo_level.is_some() {
+            return Err(BybitWsError::ClientError(
+                "'bbo_side_type' and 'bbo_level' must be provided together".to_string(),
+            ));
+        }
+
         Ok(Self {
             category: params.category,
             symbol: Ustr::from(&params.symbol),
@@ -222,7 +319,7 @@ impl TryFrom<BybitWsPlaceOrderParams> for messages::BybitWsPlaceOrderParams {
             order_type,
             qty: params.qty,
             is_leverage: params.is_leverage,
-            market_unit: params.market_unit,
+            market_unit,
             price: params.price,
             time_in_force,
             order_link_id: params.order_link_id,
@@ -231,7 +328,7 @@ impl TryFrom<BybitWsPlaceOrderParams> for messages::BybitWsPlaceOrderParams {
             trigger_price: params.trigger_price,
             trigger_by,
             trigger_direction: params.trigger_direction,
-            tpsl_mode: params.tpsl_mode,
+            tpsl_mode,
             take_profit: params.take_profit,
             stop_loss: params.stop_loss,
             tp_trigger_by,
@@ -242,6 +339,11 @@ impl TryFrom<BybitWsPlaceOrderParams> for messages::BybitWsPlaceOrderParams {
             tp_order_type,
             sl_limit_price: params.sl_limit_price,
             tp_limit_price: params.tp_limit_price,
+            order_iv: params.order_iv,
+            mmp: params.mmp,
+            position_idx: params.position_idx,
+            bbo_side_type,
+            bbo_level,
         })
     }
 }
@@ -293,6 +395,25 @@ impl From<messages::BybitWsPlaceOrderParams> for BybitWsPlaceOrderParams {
                 .to_string()
         });
 
+        let tpsl_mode = params.tpsl_mode.map(|v| {
+            serde_json::to_string(&v)
+                .expect("Failed to serialize BybitTpSlMode")
+                .trim_matches('"')
+                .to_string()
+        });
+        let market_unit = params.market_unit.map(|v| {
+            serde_json::to_string(&v)
+                .expect("Failed to serialize BybitMarketUnit")
+                .trim_matches('"')
+                .to_string()
+        });
+        let bbo_side_type = params.bbo_side_type.map(|v| {
+            serde_json::to_string(&v)
+                .expect("Failed to serialize BybitBboSideType")
+                .trim_matches('"')
+                .to_string()
+        });
+
         Self {
             category: params.category,
             symbol: params.symbol.to_string(),
@@ -300,7 +421,7 @@ impl From<messages::BybitWsPlaceOrderParams> for BybitWsPlaceOrderParams {
             order_type,
             qty: params.qty,
             is_leverage: params.is_leverage,
-            market_unit: params.market_unit,
+            market_unit,
             price: params.price,
             time_in_force,
             order_link_id: params.order_link_id,
@@ -309,7 +430,7 @@ impl From<messages::BybitWsPlaceOrderParams> for BybitWsPlaceOrderParams {
             trigger_price: params.trigger_price,
             trigger_by,
             trigger_direction: params.trigger_direction,
-            tpsl_mode: params.tpsl_mode,
+            tpsl_mode,
             take_profit: params.take_profit,
             stop_loss: params.stop_loss,
             tp_trigger_by,
@@ -320,12 +441,92 @@ impl From<messages::BybitWsPlaceOrderParams> for BybitWsPlaceOrderParams {
             tp_order_type,
             sl_limit_price: params.sl_limit_price,
             tp_limit_price: params.tp_limit_price,
+            order_iv: params.order_iv,
+            mmp: params.mmp,
+            position_idx: params.position_idx,
+            bbo_side_type,
+            bbo_level: params.bbo_level,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    fn place_order_params(
+        bbo_side_type: Option<&str>,
+        bbo_level: Option<&str>,
+    ) -> BybitWsPlaceOrderParams {
+        BybitWsPlaceOrderParams {
+            category: BybitProductType::Linear,
+            symbol: "BTCUSDT".to_string(),
+            side: "Buy".to_string(),
+            order_type: "Limit".to_string(),
+            qty: "0.001".to_string(),
+            is_leverage: None,
+            market_unit: None,
+            price: None,
+            time_in_force: Some("GTC".to_string()),
+            order_link_id: Some("test-bbo-1".to_string()),
+            reduce_only: None,
+            close_on_trigger: None,
+            trigger_price: None,
+            trigger_by: None,
+            trigger_direction: None,
+            tpsl_mode: None,
+            take_profit: None,
+            stop_loss: None,
+            tp_trigger_by: None,
+            sl_trigger_by: None,
+            sl_trigger_price: None,
+            tp_trigger_price: None,
+            sl_order_type: None,
+            tp_order_type: None,
+            sl_limit_price: None,
+            tp_limit_price: None,
+            order_iv: None,
+            mmp: None,
+            position_idx: None,
+            bbo_side_type: bbo_side_type.map(str::to_string),
+            bbo_level: bbo_level.map(str::to_string),
+        }
+    }
+
+    #[rstest]
+    fn test_place_order_params_try_from_accepts_bbo_pair() {
+        let params = place_order_params(Some("Queue"), Some("2"));
+        let result = messages::BybitWsPlaceOrderParams::try_from(params).unwrap();
+
+        assert_eq!(result.bbo_side_type, Some(BybitBboSideType::Queue));
+        assert_eq!(result.bbo_level.as_deref(), Some("2"));
+    }
+
+    #[rstest]
+    fn test_place_order_params_try_from_rejects_unpaired_bbo() {
+        let params = place_order_params(Some("Queue"), None);
+        let err = messages::BybitWsPlaceOrderParams::try_from(params).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("'bbo_side_type' and 'bbo_level' must be provided together")
+        );
+    }
+
+    #[rstest]
+    fn test_place_order_params_try_from_rejects_invalid_bbo_level() {
+        let params = place_order_params(Some("Queue"), Some("6"));
+        let err = messages::BybitWsPlaceOrderParams::try_from(params).unwrap_err();
+
+        assert!(err.to_string().contains("invalid 'bbo_level'"));
     }
 }
 
 /// Parameters for amending an order via WebSocket.
 #[pyclass(from_py_object)]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.bybit")]
 #[derive(Clone, Debug)]
 pub struct BybitWsAmendOrderParams {
     #[pyo3(get, set)]
@@ -350,12 +551,16 @@ pub struct BybitWsAmendOrderParams {
     pub tp_trigger_by: Option<String>,
     #[pyo3(get, set)]
     pub sl_trigger_by: Option<String>,
+    #[pyo3(get, set)]
+    pub order_iv: Option<String>,
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BybitWsAmendOrderParams {
+    /// Parameters for amending an order via WebSocket.
     #[new]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         category: BybitProductType,
         symbol: String,
@@ -368,6 +573,7 @@ impl BybitWsAmendOrderParams {
         stop_loss: Option<String>,
         tp_trigger_by: Option<String>,
         sl_trigger_by: Option<String>,
+        order_iv: Option<String>,
     ) -> Self {
         Self {
             category,
@@ -381,6 +587,7 @@ impl BybitWsAmendOrderParams {
             stop_loss,
             tp_trigger_by,
             sl_trigger_by,
+            order_iv,
         }
     }
 }
@@ -419,6 +626,7 @@ impl TryFrom<BybitWsAmendOrderParams> for messages::BybitWsAmendOrderParams {
             stop_loss: params.stop_loss,
             tp_trigger_by,
             sl_trigger_by,
+            order_iv: params.order_iv,
         })
     }
 }
@@ -450,12 +658,14 @@ impl From<messages::BybitWsAmendOrderParams> for BybitWsAmendOrderParams {
             stop_loss: params.stop_loss,
             tp_trigger_by,
             sl_trigger_by,
+            order_iv: params.order_iv,
         }
     }
 }
 
 /// Parameters for canceling an order via WebSocket.
 #[pyclass(from_py_object)]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.bybit")]
 #[derive(Clone, Debug)]
 pub struct BybitWsCancelOrderParams {
     #[pyo3(get, set)]
@@ -469,7 +679,9 @@ pub struct BybitWsCancelOrderParams {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BybitWsCancelOrderParams {
+    /// Parameters for canceling an order via WebSocket.
     #[new]
     fn py_new(
         category: BybitProductType,
@@ -512,6 +724,7 @@ impl From<messages::BybitWsCancelOrderParams> for BybitWsCancelOrderParams {
 
 /// Parameters for fetching tickers via HTTP API.
 #[pyclass(from_py_object)]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.bybit")]
 #[derive(Clone, Debug)]
 pub struct BybitTickersParams {
     #[pyo3(get, set)]
@@ -525,7 +738,12 @@ pub struct BybitTickersParams {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BybitTickersParams {
+    /// Query parameters for `GET /v5/market/tickers`.
+    ///
+    /// # References
+    /// - <https://bybit-exchange.github.io/docs/v5/market/tickers>
     #[new]
     #[pyo3(signature = (category, symbol=None, base_coin=None, exp_date=None))]
     fn py_new(

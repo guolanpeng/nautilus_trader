@@ -22,27 +22,30 @@
 //! 4. Subscribes to OptionGreeks for each one
 //! 5. Logs received greeks in the `on_option_greeks` handler
 //!
-//! Run with: `cargo run --example deribit-greeks-tester --package nautilus-deribit`
+//! Run with: `cargo run --example deribit-greeks-tester --package nautilus-deribit --features examples`
 
-use std::{
-    fmt::Debug,
-    ops::{Deref, DerefMut},
-};
+use std::fmt::Debug;
 
 use nautilus_common::{
     actor::{DataActor, DataActorConfig, DataActorCore},
     enums::Environment,
+    nautilus_actor,
     timer::TimeEvent,
 };
 use nautilus_deribit::{
-    config::DeribitDataClientConfig, factories::DeribitDataClientFactory,
+    common::{
+        consts::{DERIBIT_CLIENT_ID, DERIBIT_VENUE},
+        enums::DeribitEnvironment,
+    },
+    config::DeribitDataClientConfig,
+    factories::DeribitDataClientFactory,
     http::models::DeribitProductType,
 };
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
     data::option_chain::OptionGreeks,
     enums::OptionKind,
-    identifiers::{ClientId, InstrumentId, TraderId, Venue},
+    identifiers::{ClientId, InstrumentId, TraderId},
     instruments::Instrument,
     stubs::TestDefault,
 };
@@ -59,18 +62,7 @@ struct GreeksTester {
     subscribed_instruments: Vec<InstrumentId>,
 }
 
-impl Deref for GreeksTester {
-    type Target = DataActorCore;
-    fn deref(&self) -> &Self::Target {
-        &self.core
-    }
-}
-
-impl DerefMut for GreeksTester {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.core
-    }
-}
+nautilus_actor!(GreeksTester);
 
 impl GreeksTester {
     fn new(client_id: ClientId) -> Self {
@@ -87,7 +79,7 @@ impl GreeksTester {
 
 impl DataActor for GreeksTester {
     fn on_start(&mut self) -> anyhow::Result<()> {
-        let venue = Venue::new("DERIBIT");
+        let venue = *DERIBIT_VENUE;
         let underlying_filter = Ustr::from("BTC");
 
         // Collect option instrument data from cache (owned copies to release borrow)
@@ -202,13 +194,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let environment = Environment::Live;
     let trader_id = TraderId::test_default();
-    let client_id = ClientId::new("DERIBIT");
+    let client_id = *DERIBIT_CLIENT_ID;
 
     let deribit_config = DeribitDataClientConfig {
         api_key: None,    // Will use 'DERIBIT_API_KEY' env var
         api_secret: None, // Will use 'DERIBIT_API_SECRET' env var
         product_types: vec![DeribitProductType::Option],
-        use_testnet: false,
+        environment: DeribitEnvironment::Mainnet,
         ..Default::default()
     };
 

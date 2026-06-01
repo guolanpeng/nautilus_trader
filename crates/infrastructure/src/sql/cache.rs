@@ -61,7 +61,10 @@ pub struct PostgresCacheDatabase {
     handle: tokio::task::JoinHandle<()>,
 }
 
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "variant sizes vary with feature unification; allow stays silent when the lint does not fire"
+)]
 #[derive(Debug, Clone)]
 pub enum DatabaseQuery {
     Close,
@@ -104,7 +107,11 @@ impl PostgresCacheDatabase {
 
         // Spawn a task to handle messages
         let handle = tokio::spawn(async move {
-            Self::process_commands(rx, pg_connect_options.clone().into()).await;
+            Box::pin(Self::process_commands(
+                rx,
+                pg_connect_options.clone().into(),
+            ))
+            .await;
         });
         Ok(Self { pool, tx, handle })
     }
@@ -133,12 +140,13 @@ impl PostgresCacheDatabase {
         loop {
             tokio::select! {
                 maybe_msg = rx.recv() => {
-                    let result = handle_query(
+                    let result = Box::pin(handle_query(
                         maybe_msg,
                         &mut buffer,
                         buffer_interval,
                         &pool,
-                    ).await;
+                    ))
+                    .await;
 
                     if result.is_break() {
                         break;
@@ -989,9 +997,25 @@ async fn drain_buffer(pool: &PgPool, buffer: &mut VecDeque<DatabaseQuery>) {
                     DatabaseQueries::add_instrument(pool, "CRYPTO_FUTURE", Box::new(instrument))
                         .await
                 }
+                InstrumentAny::CryptoFuturesSpread(instrument) => {
+                    DatabaseQueries::add_instrument(
+                        pool,
+                        "CRYPTO_FUTURES_SPREAD",
+                        Box::new(instrument),
+                    )
+                    .await
+                }
                 InstrumentAny::CryptoOption(instrument) => {
                     DatabaseQueries::add_instrument(pool, "CRYPTO_OPTION", Box::new(instrument))
                         .await
+                }
+                InstrumentAny::CryptoOptionSpread(instrument) => {
+                    DatabaseQueries::add_instrument(
+                        pool,
+                        "CRYPTO_OPTION_SPREAD",
+                        Box::new(instrument),
+                    )
+                    .await
                 }
                 InstrumentAny::CryptoPerpetual(instrument) => {
                     DatabaseQueries::add_instrument(pool, "CRYPTO_PERPETUAL", Box::new(instrument))
@@ -1037,6 +1061,10 @@ async fn drain_buffer(pool: &PgPool, buffer: &mut VecDeque<DatabaseQuery>) {
                         Box::new(instrument),
                     )
                     .await
+                }
+                InstrumentAny::TokenizedAsset(instrument) => {
+                    DatabaseQueries::add_instrument(pool, "TOKENIZED_ASSET", Box::new(instrument))
+                        .await
                 }
             },
             DatabaseQuery::AddOrder(order_any, client_id, updated) => match order_any {
@@ -1126,11 +1154,14 @@ async fn drain_buffer(pool: &PgPool, buffer: &mut VecDeque<DatabaseQuery>) {
                 DatabaseQueries::add_position_snapshot(pool, snapshot).await
             }
             DatabaseQuery::AddAccount(account_any, updated) => match account_any {
+                AccountAny::Margin(account) => {
+                    DatabaseQueries::add_account(pool, "MARGIN", updated, Box::new(account)).await
+                }
                 AccountAny::Cash(account) => {
                     DatabaseQueries::add_account(pool, "CASH", updated, Box::new(account)).await
                 }
-                AccountAny::Margin(account) => {
-                    DatabaseQueries::add_account(pool, "MARGIN", updated, Box::new(account)).await
+                AccountAny::Betting(account) => {
+                    DatabaseQueries::add_account(pool, "BETTING", updated, Box::new(account)).await
                 }
             },
             DatabaseQuery::AddSignal(signal) => DatabaseQueries::add_signal(pool, &signal).await,

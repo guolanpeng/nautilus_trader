@@ -54,7 +54,7 @@ pub struct MintEvent {
 impl MintEvent {
     /// Creates a new [`MintEvent`] instance with the specified parameters.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         dex: SharedDex,
         pool_identifier: PoolIdentifier,
@@ -88,14 +88,13 @@ impl MintEvent {
     }
 
     /// Converts a mint event into a `PoolLiquidityUpdate`.
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn to_pool_liquidity_update(
         &self,
         chain: SharedChain,
         dex: SharedDex,
         instrument_id: InstrumentId,
-        timestamp: Option<UnixNanos>,
+        timestamp: UnixNanos,
     ) -> PoolLiquidityUpdate {
         PoolLiquidityUpdate::new(
             chain,
@@ -114,7 +113,8 @@ impl MintEvent {
             self.amount1,
             self.tick_lower,
             self.tick_upper,
-            timestamp,
+            timestamp, // ts_event
+            timestamp, // ts_init (same block timestamp)
         )
     }
 }

@@ -16,14 +16,11 @@
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use crate::{
-    enums::TardisExchange,
-    parse::{deserialize_trade_id, deserialize_uppercase},
-};
+use crate::common::{enums::TardisExchange, parse::deserialize_uppercase};
 
 /// Represents a Tardis format order book update record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TardisBookUpdateRecord {
+pub(super) struct TardisBookUpdateRecord {
     /// The exchange ID.
     pub exchange: TardisExchange,
     /// The instrument symbol as provided by the exchange.
@@ -45,7 +42,7 @@ pub struct TardisBookUpdateRecord {
 
 /// Represents a Tardis format order book 5 level snapshot record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TardisOrderBookSnapshot5Record {
+pub(super) struct TardisOrderBookSnapshot5Record {
     /// The exchange ID.
     pub exchange: TardisExchange,
     /// The instrument symbol as provided by the exchange.
@@ -119,7 +116,7 @@ pub struct TardisOrderBookSnapshot5Record {
 
 /// Represents a Tardis format order book 25 level snapshot record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TardisOrderBookSnapshot25Record {
+pub(super) struct TardisOrderBookSnapshot25Record {
     /// The exchange ID.
     pub exchange: TardisExchange,
     /// The instrument symbol as provided by the exchange.
@@ -334,7 +331,7 @@ pub struct TardisOrderBookSnapshot25Record {
 
 /// Represents a Tardis format quote record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TardisQuoteRecord {
+pub(super) struct TardisQuoteRecord {
     /// The exchande ID.
     pub exchange: TardisExchange,
     /// The instrument symbol as provided by the exchange.
@@ -356,7 +353,7 @@ pub struct TardisQuoteRecord {
 
 /// Represents a Tardis format trade record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TardisTradeRecord {
+pub(super) struct TardisTradeRecord {
     /// The exchande ID.
     pub exchange: TardisExchange,
     /// The instrument symbol as provided by the exchange.
@@ -366,8 +363,9 @@ pub struct TardisTradeRecord {
     pub timestamp: u64,
     // UNIX microseconds timestamp of message received.
     pub local_timestamp: u64,
-    /// The trade ID provided by the exchange. If empty, a new `UUIDv4` string is generated.
-    #[serde(deserialize_with = "deserialize_trade_id")]
+    /// The trade ID provided by the exchange. May be empty; a deterministic ID
+    /// is derived from the trade fields when parsing.
+    #[serde(default)]
     pub id: String,
     /// The liquidity taker (aggressor) side provided by the exchange.
     pub side: String,
@@ -379,7 +377,7 @@ pub struct TardisTradeRecord {
 
 /// Represents a Tardis format derivative ticker record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TardisDerivativeTickerRecord {
+pub(super) struct TardisDerivativeTickerRecord {
     /// The exchange ID.
     pub exchange: TardisExchange,
     /// The instrument symbol as provided by the exchange.

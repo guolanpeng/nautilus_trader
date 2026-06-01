@@ -31,6 +31,10 @@ const MAX_PERIOD: usize = 1024;
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators", unsendable)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.indicators")
+)]
 pub struct CommodityChannelIndex {
     pub period: usize,
     pub ma_type: MovingAverageType,
@@ -45,7 +49,7 @@ pub struct CommodityChannelIndex {
 
 impl Display for CommodityChannelIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}({},{})", self.name(), self.period, self.ma_type,)
+        write!(f, "{}({},{})", self.name(), self.period, self.ma_type)
     }
 }
 

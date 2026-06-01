@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use nautilus_core::{UnixNanos, python::to_pytype_err};
 use nautilus_model::{
     data::{
-        Bar, Data, IndexPriceUpdate, MarkPriceUpdate, OrderBookDelta, OrderBookDepth10, QuoteTick,
-        TradeTick, close::InstrumentClose,
+        Bar, Data, IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate, OptionGreeks,
+        OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick, close::InstrumentClose,
     },
     python::instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
 };
@@ -38,22 +38,29 @@ fn data_to_pyobject(py: Python<'_>, item: Data) -> PyResult<Py<PyAny>> {
         Data::Depth10(depth) => Py::new(py, *depth).map(|x| x.into_any()),
         Data::IndexPriceUpdate(price) => Py::new(py, price).map(|x| x.into_any()),
         Data::MarkPriceUpdate(price) => Py::new(py, price).map(|x| x.into_any()),
+        Data::FundingRateUpdate(funding) => Py::new(py, funding).map(|x| x.into_any()),
+        Data::InstrumentStatus(status) => Py::new(py, status).map(|x| x.into_any()),
+        Data::OptionGreeks(greeks) => Py::new(py, greeks).map(|x| x.into_any()),
         Data::InstrumentClose(close) => Py::new(py, close).map(|x| x.into_any()),
         Data::Custom(custom) => Py::new(py, custom).map(|x| x.into_any()),
+        #[allow(unreachable_patterns)]
+        _ => Err(to_pytype_err("Unsupported Data variant")),
     }
 }
 
 /// A catalog for writing data to Parquet files.
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.persistence")
+#[pyclass(
+    name = "ParquetDataCatalog",
+    module = "nautilus_trader.core.nautilus_pyo3.persistence"
 )]
-pub struct ParquetDataCatalogV2 {
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.persistence")]
+pub struct PyParquetDataCatalog {
     inner: ParquetDataCatalog,
 }
 
 #[pymethods]
-impl ParquetDataCatalogV2 {
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl PyParquetDataCatalog {
     /// Create a new `ParquetCatalog` with the given base path and optional parameters.
     ///
     /// # Parameters
@@ -132,7 +139,6 @@ impl ParquetDataCatalogV2 {
         end: Option<u64>,
         skip_disjoint_check: bool,
     ) -> PyResult<String> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -161,7 +167,6 @@ impl ParquetDataCatalogV2 {
         end: Option<u64>,
         skip_disjoint_check: bool,
     ) -> PyResult<String> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -190,7 +195,6 @@ impl ParquetDataCatalogV2 {
         end: Option<u64>,
         skip_disjoint_check: bool,
     ) -> PyResult<String> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -219,7 +223,6 @@ impl ParquetDataCatalogV2 {
         end: Option<u64>,
         skip_disjoint_check: bool,
     ) -> PyResult<String> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -248,7 +251,6 @@ impl ParquetDataCatalogV2 {
         end: Option<u64>,
         skip_disjoint_check: bool,
     ) -> PyResult<String> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -277,7 +279,6 @@ impl ParquetDataCatalogV2 {
         end: Option<u64>,
         skip_disjoint_check: bool,
     ) -> PyResult<String> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -306,7 +307,6 @@ impl ParquetDataCatalogV2 {
         end: Option<u64>,
         skip_disjoint_check: bool,
     ) -> PyResult<String> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -316,10 +316,39 @@ impl ParquetDataCatalogV2 {
             .map_err(|e| PyIOError::new_err(format!("Failed to write index price updates: {e}")))
     }
 
+    /// Write option greeks data to Parquet files.
+    ///
+    /// # Parameters
+    ///
+    /// - `data`: Vector of option greeks to write
+    /// - `start`: Optional start timestamp override (nanoseconds since Unix epoch)
+    /// - `end`: Optional end timestamp override (nanoseconds since Unix epoch)
+    ///
+    /// # Returns
+    ///
+    /// Returns the path of the created file as a string.
+    #[pyo3(signature = (data, start=None, end=None, skip_disjoint_check=false))]
+    pub fn write_option_greeks(
+        &self,
+        data: Vec<OptionGreeks>,
+        start: Option<u64>,
+        end: Option<u64>,
+        skip_disjoint_check: bool,
+    ) -> PyResult<String> {
+        let start_nanos = start.map(UnixNanos::from);
+        let end_nanos = end.map(UnixNanos::from);
+
+        self.inner
+            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .map(|path| path.to_string_lossy().to_string())
+            .map_err(|e| PyIOError::new_err(format!("Failed to write option greeks: {e}")))
+    }
+
     /// Write instruments to Parquet files in the catalog.
     ///
-    /// Instruments are stored by instrument ID in `data/instruments/{instrument_id}/instrument.parquet`.
-    /// Multiple instruments with the same ID are written as multiple rows in the same file.
+    /// Instruments are stored under `data/instruments/{instrument_id}/` using timestamp-ranged
+    /// parquet file names, allowing multiple historical versions of the same instrument to be
+    /// written across separate calls.
     ///
     /// # Parameters
     ///
@@ -354,16 +383,27 @@ impl ParquetDataCatalogV2 {
     /// # Parameters
     ///
     /// - `instrument_ids`: Optional list of instrument IDs to filter by. If `None`, returns all instruments.
+    /// - `start`: Optional inclusive lower bound for `ts_init` filtering.
+    /// - `end`: Optional inclusive upper bound for `ts_init` filtering.
     ///
     /// # Returns
     ///
     /// Returns a list of instrument objects (e.g. CurrencyPair, Equity).
-    #[pyo3(signature = (instrument_ids=None))]
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn instruments(&self, instrument_ids: Option<Vec<String>>) -> PyResult<Vec<Py<PyAny>>> {
+    #[pyo3(signature = (instrument_ids=None, start=None, end=None))]
+    #[expect(clippy::needless_pass_by_value)]
+    pub fn instruments(
+        &self,
+        instrument_ids: Option<Vec<String>>,
+        start: Option<u64>,
+        end: Option<u64>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
         let rust_instruments = self
             .inner
-            .query_instruments(instrument_ids.as_deref())
+            .query_instruments_filtered(
+                instrument_ids.as_deref(),
+                start.map(UnixNanos::from),
+                end.map(UnixNanos::from),
+            )
             .map_err(|e| PyIOError::new_err(format!("Failed to query instruments: {e}")))?;
         Python::attach(|py| {
             rust_instruments
@@ -382,7 +422,7 @@ impl ParquetDataCatalogV2 {
     /// - `start`: Start timestamp (nanoseconds since Unix epoch)
     /// - `end`: End timestamp (nanoseconds since Unix epoch)
     #[pyo3(signature = (data_cls, instrument_id=None, *, start, end))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn extend_file_name(
         &self,
         data_cls: &str,
@@ -390,7 +430,6 @@ impl ParquetDataCatalogV2 {
         start: u64,
         end: u64,
     ) -> PyResult<()> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = UnixNanos::from(start);
         let end_nanos = UnixNanos::from(end);
 
@@ -415,7 +454,6 @@ impl ParquetDataCatalogV2 {
         ensure_contiguous_files: Option<bool>,
         deduplicate: Option<bool>,
     ) -> PyResult<()> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -435,7 +473,7 @@ impl ParquetDataCatalogV2 {
     /// - `ensure_contiguous_files`: Optional flag to ensure files are contiguous
     /// - `deduplicate`: Optional flag to deduplicate rows when combining files
     #[pyo3(signature = (type_name, instrument_id=None, start=None, end=None, ensure_contiguous_files=None, deduplicate=None))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn consolidate_data(
         &self,
         type_name: &str,
@@ -445,7 +483,6 @@ impl ParquetDataCatalogV2 {
         ensure_contiguous_files: Option<bool>,
         deduplicate: Option<bool>,
     ) -> PyResult<()> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -483,7 +520,6 @@ impl ParquetDataCatalogV2 {
         end: Option<u64>,
         ensure_contiguous_files: Option<bool>,
     ) -> PyResult<()> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -515,7 +551,7 @@ impl ParquetDataCatalogV2 {
     /// - `end`: Optional end timestamp for consolidation range (nanoseconds since Unix epoch)
     /// - `ensure_contiguous_files`: Optional flag to control file naming strategy
     #[pyo3(signature = (type_name, identifier=None, period_nanos=None, start=None, end=None, ensure_contiguous_files=None))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn consolidate_data_by_period(
         &mut self,
         type_name: &str,
@@ -525,7 +561,6 @@ impl ParquetDataCatalogV2 {
         end: Option<u64>,
         ensure_contiguous_files: Option<bool>,
     ) -> PyResult<()> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -555,7 +590,7 @@ impl ParquetDataCatalogV2 {
     /// - `data_cls`: The data class name
     /// - `instrument_id`: Optional instrument ID filter
     #[pyo3(signature = (data_cls, instrument_id=None))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn reset_data_file_names(
         &self,
         data_cls: &str,
@@ -589,7 +624,6 @@ impl ParquetDataCatalogV2 {
     /// - Empty directories are not automatically removed after deletion
     #[pyo3(signature = (start=None, end=None))]
     pub fn delete_catalog_range(&mut self, start: Option<u64>, end: Option<u64>) -> PyResult<()> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -620,7 +654,7 @@ impl ParquetDataCatalogV2 {
     /// - The method ensures data integrity by using atomic operations where possible
     /// - Empty directories are not automatically removed after deletion
     #[pyo3(signature = (type_name, instrument_id=None, start=None, end=None))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn delete_data_range(
         &mut self,
         type_name: &str,
@@ -628,7 +662,6 @@ impl ParquetDataCatalogV2 {
         start: Option<u64>,
         end: Option<u64>,
     ) -> PyResult<()> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -717,7 +750,6 @@ impl ParquetDataCatalogV2 {
         start: Option<u64>,
         end: Option<u64>,
     ) -> PyResult<Vec<String>> {
-        // Convert u64 timestamps to UnixNanos
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
 
@@ -739,7 +771,7 @@ impl ParquetDataCatalogV2 {
     ///
     /// Returns a list of (start, end) timestamp tuples representing missing intervals.
     #[pyo3(signature = (start, end, data_cls, instrument_id=None))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn get_missing_intervals_for_request(
         &self,
         start: u64,
@@ -763,7 +795,7 @@ impl ParquetDataCatalogV2 {
     ///
     /// Returns the first timestamp as nanoseconds since Unix epoch, or None if no data exists.
     #[pyo3(signature = (data_cls, instrument_id=None))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn query_first_timestamp(
         &self,
         data_cls: &str,
@@ -785,7 +817,7 @@ impl ParquetDataCatalogV2 {
     ///
     /// Returns the last timestamp as nanoseconds since Unix epoch, or None if no data exists.
     #[pyo3(signature = (data_cls, instrument_id=None))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn query_last_timestamp(
         &self,
         data_cls: &str,
@@ -807,7 +839,7 @@ impl ParquetDataCatalogV2 {
     ///
     /// Returns a list of (start, end) timestamp tuples representing covered intervals.
     #[pyo3(signature = (data_cls, instrument_id=None))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn get_intervals(
         &self,
         data_cls: &str,
@@ -820,7 +852,7 @@ impl ParquetDataCatalogV2 {
 
     /// Query Parquet files for data matching the given criteria.
     #[pyo3(signature = (data_type, identifiers=None, start=None, end=None, where_clause=None, files=None, optimize_file_loading=true))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn query(
         &mut self,
         py: Python<'_>,
@@ -933,6 +965,34 @@ impl ParquetDataCatalogV2 {
                     )
                     .map_err(|e| PyIOError::new_err(format!("Query failed: {e}")))?;
                 prices.into_iter().map(Data::from).collect()
+            }
+            "instrument_status" => {
+                let statuses = self
+                    .inner
+                    .query_typed_data::<InstrumentStatus>(
+                        identifiers,
+                        start_nanos,
+                        end_nanos,
+                        where_clause,
+                        files,
+                        optimize_file_loading,
+                    )
+                    .map_err(|e| PyIOError::new_err(format!("Query failed: {e}")))?;
+                statuses.into_iter().map(Data::from).collect()
+            }
+            "option_greeks" => {
+                let greeks = self
+                    .inner
+                    .query_typed_data::<OptionGreeks>(
+                        identifiers,
+                        start_nanos,
+                        end_nanos,
+                        where_clause,
+                        files,
+                        optimize_file_loading,
+                    )
+                    .map_err(|e| PyIOError::new_err(format!("Query failed: {e}")))?;
+                greeks.into_iter().map(Data::from).collect()
             }
             "instrument_closes" => {
                 let closes = self
@@ -1223,6 +1283,30 @@ impl ParquetDataCatalogV2 {
             .map_err(|e| PyIOError::new_err(format!("Failed to query data: {e}")))
     }
 
+    /// Query option greeks data from Parquet files.
+    #[pyo3(signature = (instrument_ids=None, start=None, end=None, where_clause=None))]
+    pub fn query_option_greeks(
+        &mut self,
+        instrument_ids: Option<Vec<String>>,
+        start: Option<u64>,
+        end: Option<u64>,
+        where_clause: Option<&str>,
+    ) -> PyResult<Vec<OptionGreeks>> {
+        let start_nanos = start.map(UnixNanos::from);
+        let end_nanos = end.map(UnixNanos::from);
+
+        self.inner
+            .query_typed_data::<OptionGreeks>(
+                instrument_ids,
+                start_nanos,
+                end_nanos,
+                where_clause,
+                None,
+                true,
+            )
+            .map_err(|e| PyIOError::new_err(format!("Failed to query data: {e}")))
+    }
+
     /// List all data types available in the catalog.
     ///
     /// # Returns
@@ -1346,7 +1430,7 @@ impl ParquetDataCatalogV2 {
     /// )
     /// ```
     #[pyo3(signature = (instance_id, data_cls, subdirectory=None, identifiers=None, use_ts_event_for_ts_init=false))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn convert_stream_to_data(
         &mut self,
         instance_id: &str,
@@ -1356,6 +1440,7 @@ impl ParquetDataCatalogV2 {
         use_ts_event_for_ts_init: bool,
     ) -> PyResult<()> {
         let subdir = subdirectory.unwrap_or("backtest");
+
         match self.inner.convert_stream_to_data(
             instance_id,
             data_cls,
@@ -1372,7 +1457,7 @@ impl ParquetDataCatalogV2 {
 
     /// Query custom data from Parquet files.
     #[pyo3(signature = (type_name, identifiers=None, start=None, end=None, where_clause=None))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn query_custom_data(
         &mut self,
         py: Python<'_>,
@@ -1400,6 +1485,7 @@ impl ParquetDataCatalogV2 {
             .map_err(|e| PyIOError::new_err(format!("Failed to query custom data: {e}")))?;
 
         let mut python_objects = Vec::new();
+
         for item in data {
             let py_obj: Py<PyAny> = match item {
                 Data::Custom(custom) => Py::new(py, custom.clone())?.into_any(),

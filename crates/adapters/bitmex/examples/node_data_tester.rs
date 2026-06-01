@@ -20,13 +20,17 @@
 //! - Testnet: `BITMEX_TESTNET_API_KEY` / `BITMEX_TESTNET_API_SECRET`
 //! - Mainnet: `BITMEX_API_KEY` / `BITMEX_API_SECRET`
 //!
-//! Run with: `cargo run --example bitmex-data-tester --package nautilus-bitmex`
+//! Run with: `cargo run --example bitmex-data-tester --package nautilus-bitmex --features examples`
 
-use nautilus_bitmex::{config::BitmexDataClientConfig, factories::BitmexDataClientFactory};
+use nautilus_bitmex::{
+    common::{consts::BITMEX_CLIENT_ID, enums::BitmexEnvironment},
+    config::BitmexDataClientConfig,
+    factories::BitmexDataClientFactory,
+};
 use nautilus_common::enums::Environment;
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
-    identifiers::{ClientId, InstrumentId, TraderId},
+    identifiers::{InstrumentId, TraderId},
     stubs::TestDefault,
 };
 use nautilus_testkit::testers::{DataTester, DataTesterConfig};
@@ -34,8 +38,6 @@ use nautilus_testkit::testers::{DataTester, DataTesterConfig};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
-
-    let use_testnet = true;
 
     let environment = Environment::Live;
     let trader_id = TraderId::test_default();
@@ -45,25 +47,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     let bitmex_config = BitmexDataClientConfig {
-        use_testnet,
+        environment: BitmexEnvironment::Testnet,
         ..Default::default()
     };
 
     let client_factory = BitmexDataClientFactory::new();
-    let client_id = ClientId::new("BITMEX");
+    let client_id = *BITMEX_CLIENT_ID;
 
     let mut node = LiveNode::builder(trader_id, environment)?
         .with_delay_post_stop_secs(2)
         .add_data_client(None, Box::new(client_factory), Box::new(bitmex_config))?
         .build()?;
 
-    let tester_config = DataTesterConfig::new(client_id, instrument_ids)
-        .with_subscribe_quotes(true)
-        .with_subscribe_trades(true)
-        .with_subscribe_mark_prices(true)
-        .with_subscribe_index_prices(true)
-        .with_subscribe_funding_rates(true)
-        .with_subscribe_instrument_status(true);
+    let tester_config = DataTesterConfig::builder()
+        .client_id(client_id)
+        .instrument_ids(instrument_ids)
+        .subscribe_quotes(true)
+        .subscribe_trades(true)
+        .subscribe_mark_prices(true)
+        .subscribe_index_prices(true)
+        .subscribe_funding_rates(true)
+        .subscribe_instrument_status(true)
+        .manage_book(true)
+        .build();
     let tester = DataTester::new(tester_config);
 
     node.add_actor(tester)?;

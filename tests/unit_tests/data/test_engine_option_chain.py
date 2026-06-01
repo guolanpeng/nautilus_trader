@@ -17,6 +17,7 @@ import pandas as pd
 import pytest
 import pytz
 
+from nautilus_trader.backtest.data_client import BacktestMarketDataClient
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.core import nautilus_pyo3
@@ -32,6 +33,7 @@ from nautilus_trader.data.messages import UnsubscribeOptionChain
 from nautilus_trader.data.messages import UnsubscribeOptionGreeks
 from nautilus_trader.model.data import DataType
 from nautilus_trader.model.data import OptionGreeks
+from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.enums import OptionKind
 from nautilus_trader.model.identifiers import ClientId
@@ -77,6 +79,12 @@ class MockOptionDataClient(MarketDataClient):
 
     def unsubscribe_option_greeks(self, command):
         self._remove_subscription_option_greeks(command.instrument_id)
+
+    def subscribe_instrument_status(self, command):
+        self._add_subscription_instrument_status(command.instrument_id)
+
+    def unsubscribe_instrument_status(self, command):
+        self._remove_subscription_instrument_status(command.instrument_id)
 
     def request_forward_prices(self, request):
         pass  # no-op for tests
@@ -180,7 +188,7 @@ class TestOptionChainEngine:
 
     _UNSET = object()
 
-    def _subscribe_and_bootstrap(self, series_id, strike_range=_UNSET):
+    def _subscribe_and_bootstrap(self, series_id, strike_range=_UNSET, snapshot_interval_ms=None):
         """
         Subscribe to an option chain and complete the bootstrap by simulating an empty
         forward price response.
@@ -191,7 +199,7 @@ class TestOptionChainEngine:
         sub_cmd = SubscribeOptionChain(
             series_id=series_id,
             strike_range=strike_range,
-            snapshot_interval_ms=None,
+            snapshot_interval_ms=snapshot_interval_ms,
             client_id=self.client.id,
             venue=OPRA,
             command_id=UUID4(),
@@ -260,7 +268,7 @@ class TestOptionChainEngine:
         all_ids = [str(iid) for iid in manager.all_instrument_ids()]
         assert len(all_ids) == 3  # 150C, 150P, 155C
 
-    def test_subscribe_option_chain_with_strike_range_creates_pending_request(self):
+    def test_subscribe_option_chain_fixed_strike_range_skips_bootstrap(self):
         # Arrange
         strike_range = nautilus_pyo3.StrikeRange.fixed(
             [
@@ -281,8 +289,30 @@ class TestOptionChainEngine:
         # Act
         self.data_engine.execute(command)
 
-        # Assert
+        # Assert: Fixed does not need ATM bootstrap, so no pending forward-price
+        # request should be created and the manager exists immediately.
+        assert len(self.data_engine._pending_option_chain_requests) == 0
+        assert str(self.series_id) in self.data_engine._option_chain_managers
+
+    def test_subscribe_option_chain_atm_relative_creates_pending_request(self):
+        # Arrange
+        strike_range = nautilus_pyo3.StrikeRange.atm_relative(2, 2)
+        command = SubscribeOptionChain(
+            series_id=self.series_id,
+            strike_range=strike_range,
+            snapshot_interval_ms=None,
+            client_id=self.client.id,
+            venue=OPRA,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.data_engine.execute(command)
+
+        # Assert: AtmRelative needs ATM bootstrap, so a forward-price request is pending.
         assert len(self.data_engine._pending_option_chain_requests) == 1
+        assert str(self.series_id) not in self.data_engine._option_chain_managers
 
     def test_option_chain_resolves_only_matching_underlying(self):
         # Act
@@ -519,3 +549,141 @@ class TestOptionChainEngine:
 
         # Assert
         assert inst_id not in self.client.subscribed_option_greeks()
+
+    def test_snapshot_timer_tears_down_expired_series(self):
+        # Arrange: set clock close to expiry so advance doesn't generate billions of events
+        self.clock.set_time(EXPIRY_NS - 5_000_000_000)  # 5 seconds before expiry
+
+        series_key = str(self.series_id)
+        self._subscribe_and_bootstrap(self.series_id, snapshot_interval_ms=1000)
+
+        assert series_key in self.data_engine._option_chain_managers
+        assert series_key in self.data_engine._option_chain_timer_names
+
+        # Act: advance clock past expiration and fire the timer
+        events = self.clock.advance_time(EXPIRY_NS + 1_000_000_000)
+        for event in events:
+            event.handle()
+
+        # Assert: manager, timer, and instrument index all cleaned up
+        assert series_key not in self.data_engine._option_chain_managers
+        assert series_key not in self.data_engine._option_chain_timer_names
+        for sk in self.data_engine._option_chain_instrument_index.values():
+            assert sk != series_key
+
+    def test_snapshot_timer_publishes_slice_to_bus(self):
+        # Arrange: subscribe with snapshot interval
+        series_key = str(self.series_id)
+        self._subscribe_and_bootstrap(self.series_id, snapshot_interval_ms=1000)
+
+        # Feed greeks with underlying_price to trigger ATM bootstrap
+        greeks = _make_greeks(self.aapl_call_150.id)
+        self.data_engine.process(greeks)
+
+        # Feed a quote tick so the aggregator has data for the snapshot
+        quote = QuoteTick(
+            self.aapl_call_150.id,
+            Price.from_str("5.00"),
+            Price.from_str("5.50"),
+            Quantity.from_int(10),
+            Quantity.from_int(10),
+            0,
+            0,
+        )
+        self.data_engine.process(quote)
+
+        # Subscribe to the option chain topic
+        received = []
+        topic = f"data.option_chain.{series_key}"
+        self.msgbus.subscribe(topic=topic, handler=received.append)
+
+        # Act: advance clock by 1 second to trigger the snapshot timer
+        events = self.clock.advance_time(1_000_000_000)
+        for event in events:
+            event.handle()
+
+        # Assert: snapshot was published to the bus
+        assert len(received) == 1
+
+
+class TestStrikeRangeKind:
+    def test_fixed_kind(self):
+        strike_range = nautilus_pyo3.StrikeRange.fixed(
+            [nautilus_pyo3.Price.from_str("100.00")],
+        )
+        assert strike_range.kind == "Fixed"
+
+    def test_atm_relative_kind(self):
+        strike_range = nautilus_pyo3.StrikeRange.atm_relative(2, 2)
+        assert strike_range.kind == "AtmRelative"
+
+    def test_atm_percent_kind(self):
+        strike_range = nautilus_pyo3.StrikeRange.atm_percent(0.05)
+        assert strike_range.kind == "AtmPercent"
+
+
+class TestOptionChainBacktestIntegration:
+    """
+    Regression coverage for issue #3938: BacktestMarketDataClient must unblock the
+    engine's pending option-chain bootstrap so the manager is created end-to-end without
+    manual response feeding.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.clock = TestClock()
+        self.trader_id = TestIdStubs.trader_id()
+        self.msgbus = MessageBus(trader_id=self.trader_id, clock=self.clock)
+        self.cache = TestComponentStubs.cache()
+        self.portfolio = Portfolio(
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.data_engine = DataEngine(
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.client = BacktestMarketDataClient(
+            client_id=ClientId("OPRA"),
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.data_engine.register_client(self.client)
+        self.client.start()
+
+        for inst in [
+            _make_option("AAPL240315C150", "AAPL", "150.00", OptionKind.CALL),
+            _make_option("AAPL240315P150", "AAPL", "150.00", OptionKind.PUT),
+            _make_option("AAPL240315C155", "AAPL", "155.00", OptionKind.CALL),
+        ]:
+            self.data_engine.process(inst)
+
+        self.series_id = nautilus_pyo3.OptionSeriesId(
+            "OPRA",
+            "AAPL",
+            "USD",
+            EXPIRY_NS,
+        )
+
+    def test_atm_relative_subscription_unblocks_via_backtest_client(self):
+        # Arrange
+        sub_cmd = SubscribeOptionChain(
+            series_id=self.series_id,
+            strike_range=nautilus_pyo3.StrikeRange.atm_relative(2, 2),
+            snapshot_interval_ms=None,
+            client_id=self.client.id,
+            venue=OPRA,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act: response routes through msgbus synchronously, so the engine
+        # processes it before execute() returns
+        self.data_engine.execute(sub_cmd)
+
+        # Assert
+        assert len(self.data_engine._pending_option_chain_requests) == 0
+        assert str(self.series_id) in self.data_engine._option_chain_managers

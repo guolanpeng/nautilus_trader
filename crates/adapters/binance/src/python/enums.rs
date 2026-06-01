@@ -20,6 +20,7 @@ use pyo3::prelude::*;
 use crate::common::enums::{BinanceEnvironment, BinanceProductType};
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BinanceProductType {
     fn __repr__(&self) -> String {
         format!(
@@ -47,12 +48,13 @@ impl BinanceProductType {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BinanceEnvironment {
     fn __repr__(&self) -> String {
         format!(
             "BinanceEnvironment.{}",
             match self {
-                Self::Mainnet => "MAINNET",
+                Self::Live => "LIVE",
                 Self::Testnet => "TESTNET",
                 Self::Demo => "DEMO",
             }
@@ -61,7 +63,7 @@ impl BinanceEnvironment {
 
     fn __str__(&self) -> String {
         match self {
-            Self::Mainnet => "MAINNET",
+            Self::Live => "LIVE",
             Self::Testnet => "TESTNET",
             Self::Demo => "DEMO",
         }

@@ -1,5 +1,5 @@
-# Pin to specific digest for supply-chain security (python:3.13-slim as of 2025-11-29)
-FROM python@sha256:326df678c20c78d465db501563f3492d17c42a4afe33a1f2bf5406a1d56b0e86 AS base
+# Pin to specific digest for supply-chain security (python:3.13-slim as of 2026-04-30)
+FROM python@sha256:a0779d7c12fc20be6ec6b4ddc901a4fd7657b8a6bc9def9d3fde89ed5efe0a3d AS base
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=off \
@@ -17,7 +17,7 @@ FROM base AS builder
 
 # Install build deps
 RUN apt-get update && \
-    apt-get install -y curl clang git make pkg-config capnproto libcapnp-dev && \
+    apt-get install -y curl clang lld git make pkg-config capnproto libcapnp-dev && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -25,8 +25,9 @@ RUN apt-get update && \
 RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
 
 # Install UV
-COPY uv-version ./
-RUN UV_VERSION=$(cat uv-version) && curl -LsSf https://astral.sh/uv/$UV_VERSION/install.sh | sh
+COPY scripts/uv-version.sh scripts/
+COPY pyproject.toml ./
+RUN UV_VERSION=$(bash scripts/uv-version.sh) && curl -LsSf https://astral.sh/uv/$UV_VERSION/install.sh | sh
 
 # Install package requirements
 COPY uv.lock pyproject.toml build.py ./

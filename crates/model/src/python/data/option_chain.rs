@@ -22,10 +22,9 @@ use crate::{
     data::{
         QuoteTick,
         greeks::OptionGreekValues,
-        option_chain::{
-            OptionChainSlice, OptionGreeks, OptionStrikeData, StrikeRange as RustStrikeRange,
-        },
+        option_chain::{OptionChainSlice, OptionGreeks, OptionStrikeData, StrikeRange},
     },
+    enums::GreeksConvention,
     identifiers::{InstrumentId, OptionSeriesId},
     types::Price,
 };
@@ -39,7 +38,7 @@ use crate::{
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")]
 #[derive(Clone, Debug)]
 pub struct PyStrikeRange {
-    pub inner: RustStrikeRange,
+    pub inner: StrikeRange,
 }
 
 #[pymethods]
@@ -50,7 +49,7 @@ impl PyStrikeRange {
     #[pyo3(name = "fixed")]
     fn py_fixed(strikes: Vec<Price>) -> Self {
         Self {
-            inner: RustStrikeRange::Fixed(strikes),
+            inner: StrikeRange::Fixed(strikes),
         }
     }
 
@@ -59,7 +58,7 @@ impl PyStrikeRange {
     #[pyo3(name = "atm_relative")]
     fn py_atm_relative(strikes_above: usize, strikes_below: usize) -> Self {
         Self {
-            inner: RustStrikeRange::AtmRelative {
+            inner: StrikeRange::AtmRelative {
                 strikes_above,
                 strikes_below,
             },
@@ -71,7 +70,18 @@ impl PyStrikeRange {
     #[pyo3(name = "atm_percent")]
     fn py_atm_percent(pct: f64) -> Self {
         Self {
-            inner: RustStrikeRange::AtmPercent { pct },
+            inner: StrikeRange::AtmPercent { pct },
+        }
+    }
+
+    /// Returns the variant name (`Fixed`, `AtmRelative`, or `AtmPercent`).
+    #[getter]
+    #[pyo3(name = "kind")]
+    fn py_kind(&self) -> &'static str {
+        match self.inner {
+            StrikeRange::Fixed(_) => "Fixed",
+            StrikeRange::AtmRelative { .. } => "AtmRelative",
+            StrikeRange::AtmPercent { .. } => "AtmPercent",
         }
     }
 
@@ -87,9 +97,10 @@ impl PyStrikeRange {
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OptionGreeks {
+    /// Exchange-provided option Greeks and implied volatility for a single instrument.
     #[new]
-    #[pyo3(signature = (instrument_id, delta, gamma, vega, theta, rho=0.0, mark_iv=None, bid_iv=None, ask_iv=None, underlying_price=None, open_interest=None, ts_event=0, ts_init=0))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (instrument_id, delta, gamma, vega, theta, rho=0.0, mark_iv=None, bid_iv=None, ask_iv=None, underlying_price=None, open_interest=None, ts_event=0, ts_init=0, convention=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         instrument_id: InstrumentId,
         delta: f64,
@@ -104,9 +115,11 @@ impl OptionGreeks {
         open_interest: Option<f64>,
         ts_event: u64,
         ts_init: u64,
+        convention: Option<GreeksConvention>,
     ) -> Self {
         Self {
             instrument_id,
+            convention: convention.unwrap_or_default(),
             greeks: OptionGreekValues {
                 delta,
                 gamma,
@@ -122,6 +135,12 @@ impl OptionGreeks {
             ts_event: UnixNanos::from(ts_event),
             ts_init: UnixNanos::from(ts_init),
         }
+    }
+
+    #[getter]
+    #[pyo3(name = "convention")]
+    fn py_convention(&self) -> GreeksConvention {
+        self.convention
     }
 
     #[getter]
@@ -231,9 +250,15 @@ impl OptionGreeks {
         let open_interest = obj.getattr("open_interest")?.extract::<Option<f64>>()?;
         let ts_event = obj.getattr("ts_event")?.extract::<u64>()?;
         let ts_init = obj.getattr("ts_init")?.extract::<u64>()?;
+        let convention = obj
+            .getattr("convention")
+            .ok()
+            .and_then(|v| v.extract::<GreeksConvention>().ok())
+            .unwrap_or_default();
 
         Ok(Self {
             instrument_id,
+            convention,
             greeks: OptionGreekValues {
                 delta,
                 gamma,
@@ -255,6 +280,7 @@ impl OptionGreeks {
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OptionStrikeData {
+    /// Combined quote and Greeks data for a single strike in an option chain.
     #[new]
     #[pyo3(signature = (quote, greeks=None))]
     fn py_new(quote: QuoteTick, greeks: Option<OptionGreeks>) -> Self {
@@ -284,6 +310,7 @@ impl OptionStrikeData {
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OptionChainSlice {
+    /// A point-in-time snapshot of an option chain for a single series.
     #[new]
     #[pyo3(signature = (series_id, atm_strike=None, ts_event=0, ts_init=0))]
     fn py_new(
@@ -326,56 +353,67 @@ impl OptionChainSlice {
         self.ts_init.as_u64()
     }
 
+    /// Returns the number of call entries.
     #[pyo3(name = "call_count")]
     fn py_call_count(&self) -> usize {
         self.call_count()
     }
 
+    /// Returns the number of put entries.
     #[pyo3(name = "put_count")]
     fn py_put_count(&self) -> usize {
         self.put_count()
     }
 
+    /// Returns the total number of unique strikes.
     #[pyo3(name = "strike_count")]
     fn py_strike_count(&self) -> usize {
         self.strike_count()
     }
 
+    /// Returns `true` if the chain has no data.
     #[pyo3(name = "is_empty")]
     fn py_is_empty(&self) -> bool {
         self.is_empty()
     }
 
+    /// Returns all strike prices present in the chain (union of calls and puts).
     #[pyo3(name = "strikes")]
     fn py_strikes(&self) -> Vec<Price> {
         self.strikes()
     }
 
+    /// Returns the call data for a given strike price.
     #[pyo3(name = "get_call")]
     fn py_get_call(&self, strike: Price) -> Option<OptionStrikeData> {
         self.get_call(&strike).cloned()
     }
 
+    /// Returns the put data for a given strike price.
     #[pyo3(name = "get_put")]
     fn py_get_put(&self, strike: Price) -> Option<OptionStrikeData> {
         self.get_put(&strike).cloned()
     }
 
+    /// Returns the call quote for a given strike price.
     #[pyo3(name = "get_call_quote")]
     fn py_get_call_quote(&self, strike: Price) -> Option<QuoteTick> {
         self.get_call_quote(&strike).copied()
     }
 
+    /// Returns the put quote for a given strike price.
     #[pyo3(name = "get_put_quote")]
     fn py_get_put_quote(&self, strike: Price) -> Option<QuoteTick> {
         self.get_put_quote(&strike).copied()
     }
 
+    /// Returns the call Greeks for a given strike price.
     #[pyo3(name = "get_call_greeks")]
     fn py_get_call_greeks(&self, strike: Price) -> Option<OptionGreeks> {
         self.get_call_greeks(&strike).copied()
     }
 
+    /// Returns the put Greeks for a given strike price.
     #[pyo3(name = "get_put_greeks")]
     fn py_get_put_greeks(&self, strike: Price) -> Option<OptionGreeks> {
         self.get_put_greeks(&strike).copied()

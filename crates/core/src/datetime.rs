@@ -16,9 +16,9 @@
 //! Common data and time functions.
 use std::convert::TryFrom;
 
-use chrono::{DateTime, Datelike, NaiveDate, SecondsFormat, TimeDelta, Utc, Weekday};
+use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, Utc, Weekday};
 
-use crate::UnixNanos;
+use crate::{UnixNanos, time::nanos_since_unix_epoch};
 
 /// Number of milliseconds in one second.
 pub const MILLISECONDS_IN_SECOND: u64 = 1_000;
@@ -28,6 +28,7 @@ pub const NANOSECONDS_IN_SECOND: u64 = 1_000_000_000;
 
 /// Number of nanoseconds in one millisecond.
 pub const NANOSECONDS_IN_MILLISECOND: u64 = 1_000_000;
+const NANOSECONDS_IN_MILLISECOND_U32: u32 = 1_000_000;
 
 /// Number of nanoseconds in one microsecond.
 pub const NANOSECONDS_IN_MICROSECOND: u64 = 1_000;
@@ -35,16 +36,41 @@ pub const NANOSECONDS_IN_MICROSECOND: u64 = 1_000;
 /// Number of nanoseconds in one minute.
 pub const NANOSECONDS_IN_MINUTE: u64 = 60 * NANOSECONDS_IN_SECOND;
 
+/// Number of nanoseconds in one day.
+pub const NANOSECONDS_IN_DAY: u64 = 24 * 60 * NANOSECONDS_IN_MINUTE;
+
 /// Number of seconds in one minute.
 pub const SECONDS_IN_MINUTE: u64 = 60;
 
+/// Number of seconds in one hour.
+pub const SECONDS_IN_HOUR: u64 = 60 * SECONDS_IN_MINUTE;
+
+/// Number of seconds in one day.
+pub const SECONDS_IN_DAY: u64 = 24 * SECONDS_IN_HOUR;
+
 // Maximum finite seconds input that can be converted to nanoseconds without overflowing `u64`.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "deriving a max-representable bound; f64 precision loss is part of the semantics"
+)]
 const MAX_SECS_FOR_NANOS: f64 = u64::MAX as f64 / NANOSECONDS_IN_SECOND as f64;
 // Maximum finite seconds input that can be converted to milliseconds without overflowing `u64`.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "deriving a max-representable bound; f64 precision loss is part of the semantics"
+)]
 const MAX_SECS_FOR_MILLIS: f64 = u64::MAX as f64 / MILLISECONDS_IN_SECOND as f64;
 // Maximum finite milliseconds input that can be converted to nanoseconds without overflowing `u64`.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "deriving a max-representable bound; f64 precision loss is part of the semantics"
+)]
 const MAX_MILLIS_FOR_NANOS: f64 = u64::MAX as f64 / NANOSECONDS_IN_MILLISECOND as f64;
 // Maximum finite microseconds input that can be converted to nanoseconds without overflowing `u64`.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "deriving a max-representable bound; f64 precision loss is part of the semantics"
+)]
 const MAX_MICROS_FOR_NANOS: f64 = u64::MAX as f64 / NANOSECONDS_IN_MICROSECOND as f64;
 
 // Compile-time checks for time constants to prevent accidental modification
@@ -58,7 +84,10 @@ const _: () = {
     assert!(NANOSECONDS_IN_SECOND / NANOSECONDS_IN_MILLISECOND == 1_000);
     assert!(NANOSECONDS_IN_SECOND / NANOSECONDS_IN_MICROSECOND == 1_000_000);
     assert!(SECONDS_IN_MINUTE == 60);
+    assert!(SECONDS_IN_HOUR == 3_600);
+    assert!(SECONDS_IN_DAY == 86_400);
     assert!(NANOSECONDS_IN_MINUTE == 60 * NANOSECONDS_IN_SECOND);
+    assert!(NANOSECONDS_IN_DAY == 24 * 60 * NANOSECONDS_IN_MINUTE);
 };
 
 #[inline]
@@ -72,6 +101,127 @@ fn unix_nanos_to_datetime(unix_nanos: UnixNanos) -> anyhow::Result<DateTime<Utc>
     Ok(DateTime::from_timestamp_nanos(nanos_i64))
 }
 
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    // Howard Hinnant's civil calendar algorithm maps UTC epoch days to a
+    // Gregorian date using integer arithmetic only. The input is already UTC,
+    // so no timezone or leap-second rules are involved in this formatter.
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+
+    (
+        i32::try_from(year).expect("year fits in i32"),
+        u32::try_from(month).expect("month is positive"),
+        u32::try_from(day).expect("day is positive"),
+    )
+}
+
+struct DateTimeParts {
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    subsec_nanos: u32,
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "digit helpers only receive values in 0..=9"
+)]
+fn push_digit(out: &mut String, digit: u32) {
+    out.push(char::from(b'0' + digit as u8));
+}
+
+fn push_2_digits(out: &mut String, value: u32) {
+    debug_assert!(value < 100);
+    push_digit(out, value / 10);
+    push_digit(out, value % 10);
+}
+
+fn push_3_digits(out: &mut String, value: u32) {
+    debug_assert!(value < 1_000);
+    push_digit(out, value / 100);
+    push_2_digits(out, value % 100);
+}
+
+fn push_4_digits(out: &mut String, value: i32) {
+    debug_assert!((0..=9_999).contains(&value));
+    let value = u32::try_from(value).expect("year is non-negative");
+    push_digit(out, value / 1_000);
+    push_digit(out, (value / 100) % 10);
+    push_2_digits(out, value % 100);
+}
+
+fn push_9_digits(out: &mut String, value: u32) {
+    debug_assert!(value < 1_000_000_000);
+    let mut divisor = 100_000_000;
+    while divisor > 0 {
+        push_digit(out, value / divisor % 10);
+        divisor /= 10;
+    }
+}
+
+fn split_unix_nanos(unix_nanos: UnixNanos) -> Option<DateTimeParts> {
+    let nanos = unix_nanos.as_u64();
+    if i64::try_from(nanos).is_err() {
+        return None;
+    }
+
+    let total_seconds = nanos / NANOSECONDS_IN_SECOND;
+    let subsec_nanos = u32::try_from(nanos % NANOSECONDS_IN_SECOND).expect("subsecond fits u32");
+    let days = total_seconds / SECONDS_IN_DAY;
+    let seconds_of_day = total_seconds % SECONDS_IN_DAY;
+    let (year, month, day) =
+        civil_from_days(i64::try_from(days).expect("days since epoch fits i64"));
+    let hour = u32::try_from(seconds_of_day / SECONDS_IN_HOUR).expect("hour fits u32");
+    let minute =
+        u32::try_from((seconds_of_day % SECONDS_IN_HOUR) / SECONDS_IN_MINUTE).expect("minute fits");
+    let second = u32::try_from(seconds_of_day % SECONDS_IN_MINUTE).expect("second fits");
+
+    Some(DateTimeParts {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        subsec_nanos,
+    })
+}
+
+fn push_iso8601_prefix(
+    out: &mut String,
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) {
+    push_4_digits(out, year);
+    out.push('-');
+    push_2_digits(out, month);
+    out.push('-');
+    push_2_digits(out, day);
+    out.push('T');
+    push_2_digits(out, hour);
+    out.push(':');
+    push_2_digits(out, minute);
+    out.push(':');
+    push_2_digits(out, second);
+    out.push('.');
+}
+
 /// List of weekdays (Monday to Friday).
 pub const WEEKDAYS: [Weekday; 5] = [
     Weekday::Mon,
@@ -83,9 +233,13 @@ pub const WEEKDAYS: [Weekday; 5] = [
 
 /// Converts seconds to nanoseconds (ns).
 ///
-#[allow(
+/// # Errors
+///
+/// Returns an error if `secs` is non-finite or exceeds `MAX_SECS_FOR_NANOS`.
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
     reason = "Intentional for unit conversion, may lose precision after clamping"
 )]
 pub fn secs_to_nanos(secs: f64) -> anyhow::Result<u64> {
@@ -103,9 +257,13 @@ pub fn secs_to_nanos(secs: f64) -> anyhow::Result<u64> {
 
 /// Converts seconds to milliseconds (ms).
 ///
-#[allow(
+/// # Errors
+///
+/// Returns an error if `secs` is non-finite or exceeds `MAX_SECS_FOR_MILLIS`.
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
     reason = "Intentional for unit conversion, may lose precision after clamping"
 )]
 pub fn secs_to_millis(secs: f64) -> anyhow::Result<u64> {
@@ -125,6 +283,10 @@ pub fn secs_to_millis(secs: f64) -> anyhow::Result<u64> {
 ///
 /// This is a convenience wrapper around [`secs_to_nanos`] when the caller expects
 /// the input to be trusted and in-range.
+///
+/// # Panics
+///
+/// Panics if [`secs_to_nanos`] would return an error for `secs`.
 #[must_use]
 pub fn secs_to_nanos_unchecked(secs: f64) -> u64 {
     secs_to_nanos(secs).expect("secs_to_nanos_unchecked: invalid or overflowing input")
@@ -146,9 +308,14 @@ pub const fn mins_to_nanos(mins: u64) -> u64 {
 ///
 /// Casting f64 to u64 by truncating the fractional part is intentional for unit conversion,
 /// which may lose precision and drop negative values after clamping.
-#[allow(
+///
+/// # Errors
+///
+/// Returns an error if `millis` is non-finite or exceeds `MAX_MILLIS_FOR_NANOS`.
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
     reason = "Intentional for unit conversion, may lose precision after clamping"
 )]
 pub fn millis_to_nanos(millis: f64) -> anyhow::Result<u64> {
@@ -169,6 +336,10 @@ pub fn millis_to_nanos(millis: f64) -> anyhow::Result<u64> {
 }
 
 /// Converts milliseconds (ms) to nanoseconds (ns), panicking on invalid input.
+///
+/// # Panics
+///
+/// Panics if [`millis_to_nanos`] would return an error for `millis`.
 #[must_use]
 pub fn millis_to_nanos_unchecked(millis: f64) -> u64 {
     millis_to_nanos(millis).expect("millis_to_nanos_unchecked: invalid or overflowing input")
@@ -178,9 +349,14 @@ pub fn millis_to_nanos_unchecked(millis: f64) -> u64 {
 ///
 /// Casting f64 to u64 by truncating the fractional part is intentional for unit conversion,
 /// which may lose precision and drop negative values after clamping.
-#[allow(
+///
+/// # Errors
+///
+/// Returns an error if `micros` is non-finite or exceeds `MAX_MICROS_FOR_NANOS`.
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
     reason = "Intentional for unit conversion, may lose precision after clamping"
 )]
 pub fn micros_to_nanos(micros: f64) -> anyhow::Result<u64> {
@@ -201,6 +377,10 @@ pub fn micros_to_nanos(micros: f64) -> anyhow::Result<u64> {
 }
 
 /// Converts microseconds (μs) to nanoseconds (ns), panicking on invalid input.
+///
+/// # Panics
+///
+/// Panics if [`micros_to_nanos`] would return an error for `micros`.
 #[must_use]
 pub fn micros_to_nanos_unchecked(micros: f64) -> u64 {
     micros_to_nanos(micros).expect("micros_to_nanos_unchecked: invalid or overflowing input")
@@ -210,7 +390,7 @@ pub fn micros_to_nanos_unchecked(micros: f64) -> u64 {
 ///
 /// Casting u64 to f64 may lose precision for large values,
 /// but is acceptable when computing fractional seconds.
-#[allow(
+#[expect(
     clippy::cast_precision_loss,
     reason = "Precision loss acceptable for time conversion"
 )]
@@ -240,10 +420,23 @@ pub const fn nanos_to_micros(nanos: u64) -> u64 {
 #[inline]
 #[must_use]
 pub fn unix_nanos_to_iso8601(unix_nanos: UnixNanos) -> String {
-    match unix_nanos_to_datetime(unix_nanos) {
-        Ok(dt) => dt.to_rfc3339_opts(SecondsFormat::Nanos, true),
-        Err(_) => unix_nanos.as_u64().to_string(),
-    }
+    let Some(parts) = split_unix_nanos(unix_nanos) else {
+        return unix_nanos.as_u64().to_string();
+    };
+
+    let mut out = String::with_capacity(30);
+    push_iso8601_prefix(
+        &mut out,
+        parts.year,
+        parts.month,
+        parts.day,
+        parts.hour,
+        parts.minute,
+        parts.second,
+    );
+    push_9_digits(&mut out, parts.subsec_nanos);
+    out.push('Z');
+    out
 }
 
 /// Converts an ISO 8601 (RFC 3339) format string to UNIX nanoseconds timestamp.
@@ -283,10 +476,26 @@ pub fn iso8601_to_unix_nanos(date_string: &str) -> anyhow::Result<UnixNanos> {
 #[inline]
 #[must_use]
 pub fn unix_nanos_to_iso8601_millis(unix_nanos: UnixNanos) -> String {
-    match unix_nanos_to_datetime(unix_nanos) {
-        Ok(dt) => dt.to_rfc3339_opts(SecondsFormat::Millis, true),
-        Err(_) => unix_nanos.as_u64().to_string(),
-    }
+    let Some(parts) = split_unix_nanos(unix_nanos) else {
+        return unix_nanos.as_u64().to_string();
+    };
+
+    let mut out = String::with_capacity(24);
+    push_iso8601_prefix(
+        &mut out,
+        parts.year,
+        parts.month,
+        parts.day,
+        parts.hour,
+        parts.minute,
+        parts.second,
+    );
+    push_3_digits(
+        &mut out,
+        parts.subsec_nanos / NANOSECONDS_IN_MILLISECOND_U32,
+    );
+    out.push('Z');
+    out
 }
 
 /// Floor the given UNIX nanoseconds to the nearest microsecond.
@@ -335,23 +544,18 @@ pub fn last_weekday_nanos(year: i32, month: u32, day: u32) -> anyhow::Result<Uni
 ///
 /// Returns an error if the timestamp is invalid.
 pub fn is_within_last_24_hours(timestamp_ns: UnixNanos) -> anyhow::Result<bool> {
+    // Use the time seam so the comparison is deterministic under
+    // `simulation` + `cfg(madsim)` and we avoid a wall-clock call that
+    // would otherwise bypass the DST contract.
     let timestamp_ns = timestamp_ns.as_u64();
-    let seconds = timestamp_ns / NANOSECONDS_IN_SECOND;
-    let nanoseconds = (timestamp_ns % NANOSECONDS_IN_SECOND) as u32;
-    // Convert seconds to i64 safely
-    let secs_i64 = i64::try_from(seconds)
-        .map_err(|_| anyhow::anyhow!("Timestamp seconds overflow: {seconds}"))?;
-    let timestamp = DateTime::from_timestamp(secs_i64, nanoseconds)
-        .ok_or_else(|| anyhow::anyhow!("Invalid timestamp {timestamp_ns}"))?;
-    let now = Utc::now();
+    let now_ns = nanos_since_unix_epoch();
 
     // Future timestamps are not within the last 24 hours
-    if timestamp > now {
+    if timestamp_ns > now_ns {
         return Ok(false);
     }
 
-    // Check if the timestamp is within the last 24 hours (non-negative duration <= 1 day)
-    Ok(now.signed_duration_since(timestamp) <= TimeDelta::days(1))
+    Ok(now_ns - timestamp_ns <= NANOSECONDS_IN_DAY)
 }
 
 /// Subtract `n` months from a chrono `DateTime<Utc>`.
@@ -383,6 +587,10 @@ pub fn add_n_months(datetime: DateTime<Utc>, n: u32) -> anyhow::Result<DateTime<
 /// # Errors
 ///
 /// Returns an error if the resulting timestamp is out of range or invalid.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "explicit `if timestamp < 0` guard before the cast"
+)]
 pub fn subtract_n_months_nanos(unix_nanos: UnixNanos, n: u32) -> anyhow::Result<UnixNanos> {
     let datetime = unix_nanos_to_datetime(unix_nanos)?;
     let result = subtract_n_months(datetime, n)?;
@@ -403,6 +611,10 @@ pub fn subtract_n_months_nanos(unix_nanos: UnixNanos, n: u32) -> anyhow::Result<
 /// # Errors
 ///
 /// Returns an error if the resulting timestamp is out of range or invalid.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "explicit `if timestamp < 0` guard before the cast"
+)]
 pub fn add_n_months_nanos(unix_nanos: UnixNanos, n: u32) -> anyhow::Result<UnixNanos> {
     let datetime = unix_nanos_to_datetime(unix_nanos)?;
     let result = add_n_months(datetime, n)?;
@@ -455,6 +667,10 @@ pub fn subtract_n_years(datetime: DateTime<Utc>, n: u32) -> anyhow::Result<DateT
 /// # Errors
 ///
 /// Returns an error if the resulting timestamp is out of range or invalid.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "explicit `if timestamp < 0` guard before the cast"
+)]
 pub fn add_n_years_nanos(unix_nanos: UnixNanos, n: u32) -> anyhow::Result<UnixNanos> {
     let datetime = unix_nanos_to_datetime(unix_nanos)?;
     let result = add_n_years(datetime, n)?;
@@ -475,6 +691,10 @@ pub fn add_n_years_nanos(unix_nanos: UnixNanos, n: u32) -> anyhow::Result<UnixNa
 /// # Errors
 ///
 /// Returns an error if the resulting timestamp is out of range or invalid.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "explicit `if timestamp < 0` guard before the cast"
+)]
 pub fn subtract_n_years_nanos(unix_nanos: UnixNanos, n: u32) -> anyhow::Result<UnixNanos> {
     let datetime = unix_nanos_to_datetime(unix_nanos)?;
     let result = subtract_n_years(datetime, n)?;
@@ -520,7 +740,7 @@ pub const fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
-/// Convert optional DateTime to optional UnixNanos timestamp.
+/// Convert optional `DateTime` to optional `UnixNanos` timestamp.
 pub fn datetime_to_unix_nanos(value: Option<DateTime<Utc>>) -> Option<UnixNanos> {
     value
         .and_then(|dt| dt.timestamp_nanos_opt())
@@ -529,12 +749,13 @@ pub fn datetime_to_unix_nanos(value: Option<DateTime<Utc>>) -> Option<UnixNanos>
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::float_cmp,
     reason = "Exact float comparisons acceptable in tests"
 )]
 mod tests {
-    use chrono::{DateTime, TimeDelta, TimeZone, Timelike, Utc};
+    use chrono::{DateTime, SecondsFormat, TimeDelta, TimeZone, Timelike, Utc};
+    use proptest::prelude::*;
     use rstest::rstest;
 
     use super::*;
@@ -725,6 +946,8 @@ mod tests {
     #[case(1_000, "1970-01-01T00:00:00.000001000Z")] // 1 microsecond
     #[case(1_000_000, "1970-01-01T00:00:00.001000000Z")] // 1 millisecond
     #[case(1_000_000_000, "1970-01-01T00:00:01.000000000Z")] // 1 second
+    #[case(951_782_400_000_000_000, "2000-02-29T00:00:00.000000000Z")] // Leap day
+    #[case(1_609_459_199_999_999_999, "2020-12-31T23:59:59.999999999Z")] // Year boundary
     #[case(1_702_857_600_000_000_000, "2023-12-18T00:00:00.000000000Z")] // Specific date
     fn test_unix_nanos_to_iso8601(#[case] nanos: u64, #[case] expected: &str) {
         let result = unix_nanos_to_iso8601(UnixNanos::from(nanos));
@@ -732,13 +955,89 @@ mod tests {
     }
 
     #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(951_782_400_123_456_789)]
+    #[case(1_609_459_199_999_999_999)]
+    #[case(i64::MAX as u64)]
+    fn test_unix_nanos_to_iso8601_matches_chrono_oracle(#[case] nanos: u64) {
+        let nanos_i64 = i64::try_from(nanos).expect("oracle cases stay within chrono range");
+        let expected =
+            DateTime::from_timestamp_nanos(nanos_i64).to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let result = unix_nanos_to_iso8601(UnixNanos::from(nanos));
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    #[case((i64::MAX as u64) + 1)]
+    #[case(u64::MAX)]
+    fn test_unix_nanos_to_iso8601_falls_back_when_chrono_range_exceeded(#[case] nanos: u64) {
+        let result = unix_nanos_to_iso8601(UnixNanos::from(nanos));
+        assert_eq!(result, nanos.to_string());
+    }
+
+    #[rstest]
     #[case(0, "1970-01-01T00:00:00.000Z")] // Unix epoch
     #[case(1_000_000, "1970-01-01T00:00:00.001Z")] // 1 millisecond
     #[case(1_000_000_000, "1970-01-01T00:00:01.000Z")] // 1 second
+    #[case(951_782_400_123_456_789, "2000-02-29T00:00:00.123Z")] // Leap day
+    #[case(1_609_459_199_999_999_999, "2020-12-31T23:59:59.999Z")] // Year boundary
     #[case(1_702_857_600_123_456_789, "2023-12-18T00:00:00.123Z")] // With millisecond precision
     fn test_unix_nanos_to_iso8601_millis(#[case] nanos: u64, #[case] expected: &str) {
         let result = unix_nanos_to_iso8601_millis(UnixNanos::from(nanos));
         assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(951_782_400_123_456_789)]
+    #[case(1_609_459_199_999_999_999)]
+    #[case(i64::MAX as u64)]
+    fn test_unix_nanos_to_iso8601_millis_matches_chrono_oracle(#[case] nanos: u64) {
+        let nanos_i64 = i64::try_from(nanos).expect("oracle cases stay within chrono range");
+        let expected =
+            DateTime::from_timestamp_nanos(nanos_i64).to_rfc3339_opts(SecondsFormat::Millis, true);
+        let result = unix_nanos_to_iso8601_millis(UnixNanos::from(nanos));
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    #[case((i64::MAX as u64) + 1)]
+    #[case(u64::MAX)]
+    fn test_unix_nanos_to_iso8601_millis_falls_back_when_chrono_range_exceeded(#[case] nanos: u64) {
+        let result = unix_nanos_to_iso8601_millis(UnixNanos::from(nanos));
+        assert_eq!(result, nanos.to_string());
+    }
+
+    // Sweep the full representable range against chrono, complementing the fixed-point oracle
+    // cases above; any divergence in the integer date math surfaces as a mismatch here.
+    proptest! {
+        #[rstest]
+        fn prop_unix_nanos_to_iso8601_matches_chrono(nanos in 0u64..=i64::MAX as u64) {
+            let nanos_i64 = i64::try_from(nanos).expect("nanos within i64 range");
+            let expected = DateTime::from_timestamp_nanos(nanos_i64)
+                .to_rfc3339_opts(SecondsFormat::Nanos, true);
+            let actual = unix_nanos_to_iso8601(UnixNanos::from(nanos));
+            prop_assert_eq!(actual, expected);
+        }
+
+        #[rstest]
+        fn prop_unix_nanos_to_iso8601_millis_matches_chrono(nanos in 0u64..=i64::MAX as u64) {
+            let nanos_i64 = i64::try_from(nanos).expect("nanos within i64 range");
+            let expected = DateTime::from_timestamp_nanos(nanos_i64)
+                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            let actual = unix_nanos_to_iso8601_millis(UnixNanos::from(nanos));
+            prop_assert_eq!(actual, expected);
+        }
+
+        #[rstest]
+        fn prop_unix_nanos_to_iso8601_falls_back_above_chrono_range(
+            nanos in (i64::MAX as u64 + 1)..=u64::MAX,
+        ) {
+            let raw = nanos.to_string();
+            prop_assert_eq!(unix_nanos_to_iso8601(UnixNanos::from(nanos)), raw.as_str());
+            prop_assert_eq!(unix_nanos_to_iso8601_millis(UnixNanos::from(nanos)), raw.as_str());
+        }
     }
 
     #[rstest]
@@ -777,7 +1076,7 @@ mod tests {
     #[rstest]
     fn test_is_within_last_24_hours_when_now() {
         let now_ns = Utc::now().timestamp_nanos_opt().unwrap();
-        assert!(is_within_last_24_hours(UnixNanos::from(now_ns as u64)).unwrap());
+        assert!(is_within_last_24_hours(UnixNanos::from(now_ns.cast_unsigned())).unwrap());
     }
 
     #[rstest]
@@ -785,7 +1084,7 @@ mod tests {
         let past_ns = (Utc::now() - TimeDelta::try_days(2).unwrap())
             .timestamp_nanos_opt()
             .unwrap();
-        assert!(!is_within_last_24_hours(UnixNanos::from(past_ns as u64)).unwrap());
+        assert!(!is_within_last_24_hours(UnixNanos::from(past_ns.cast_unsigned())).unwrap());
     }
 
     #[rstest]
@@ -794,13 +1093,13 @@ mod tests {
         let future_ns = (Utc::now() + TimeDelta::try_hours(1).unwrap())
             .timestamp_nanos_opt()
             .unwrap();
-        assert!(!is_within_last_24_hours(UnixNanos::from(future_ns as u64)).unwrap());
+        assert!(!is_within_last_24_hours(UnixNanos::from(future_ns.cast_unsigned())).unwrap());
 
         // One day in the future should also return false
         let future_ns = (Utc::now() + TimeDelta::try_days(1).unwrap())
             .timestamp_nanos_opt()
             .unwrap();
-        assert!(!is_within_last_24_hours(UnixNanos::from(future_ns as u64)).unwrap());
+        assert!(!is_within_last_24_hours(UnixNanos::from(future_ns.cast_unsigned())).unwrap());
     }
 
     #[rstest]

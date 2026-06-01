@@ -29,6 +29,7 @@ use std::{
 };
 
 use nautilus_core::{UnixNanos, correctness::FAILED};
+use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
 use crate::{
@@ -42,7 +43,8 @@ use crate::{
 };
 
 /// Represents a throttling limit per interval.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimit {
     pub limit: usize,
     pub interval_ns: u64,
@@ -320,7 +322,7 @@ impl<T, F> ThrottlerProcess<T, F>
 where
     T: Debug,
 {
-    pub fn new(actor_id: Ustr) -> Self {
+    pub(crate) fn new(actor_id: Ustr) -> Self {
         let endpoint = MStr::endpoint(format!("{actor_id}_process")).expect(FAILED);
         Self {
             actor_id,
@@ -330,7 +332,7 @@ where
         }
     }
 
-    pub fn get_timer_callback(&self) -> TimeEventCallback {
+    pub(crate) fn get_timer_callback(&self) -> TimeEventCallback {
         let endpoint = self.endpoint;
         TimeEventCallback::from(move |event: TimeEvent| {
             msgbus::send_any(endpoint, &(event));
@@ -417,8 +419,8 @@ mod tests {
 
     #[allow(unsafe_code)]
     impl TestThrottler {
-        #[allow(clippy::mut_from_ref)]
-        pub fn get_throttler(&self) -> &mut Throttler<u64, Box<dyn Fn(u64)>> {
+        #[expect(clippy::mut_from_ref)]
+        pub(crate) fn get_throttler(&self) -> &mut Throttler<u64, Box<dyn Fn(u64)>> {
             unsafe { &mut *self.throttler.get() }
         }
     }

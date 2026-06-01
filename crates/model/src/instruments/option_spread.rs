@@ -18,7 +18,8 @@ use std::hash::{Hash, Hasher};
 use nautilus_core::{
     Params, UnixNanos,
     correctness::{
-        FAILED, check_equal_u8, check_valid_string_ascii, check_valid_string_ascii_optional,
+        CorrectnessResult, CorrectnessResultExt, FAILED, check_equal_u8, check_valid_string_ascii,
+        check_valid_string_ascii_optional,
     },
 };
 use rust_decimal::Decimal;
@@ -112,7 +113,7 @@ impl OptionSpread {
     /// # Errors
     ///
     /// Returns an error if any input validation fails.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
@@ -138,7 +139,7 @@ impl OptionSpread {
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
-    ) -> anyhow::Result<Self> {
+    ) -> CorrectnessResult<Self> {
         check_valid_string_ascii_optional(exchange.map(|u| u.as_str()), stringify!(exchange))?;
         check_valid_string_ascii(strategy_type.as_str(), stringify!(strategy_type))?;
         check_equal_u8(
@@ -186,7 +187,8 @@ impl OptionSpread {
     /// # Panics
     ///
     /// Panics if any input parameter is invalid (see `new_checked`).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
+    #[must_use]
     pub fn new(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
@@ -239,7 +241,7 @@ impl OptionSpread {
             ts_event,
             ts_init,
         )
-        .expect(FAILED)
+        .expect_display(FAILED)
     }
 }
 
@@ -309,6 +311,10 @@ impl Instrument for OptionSpread {
         None
     }
 
+    fn strategy_type(&self) -> Option<Ustr> {
+        Some(self.strategy_type)
+    }
+
     fn activation_ns(&self) -> Option<UnixNanos> {
         Some(self.activation_ns)
     }
@@ -326,7 +332,7 @@ impl Instrument for OptionSpread {
     }
 
     fn size_precision(&self) -> u8 {
-        0
+        0 // No fractional units
     }
 
     fn price_increment(&self) -> Price {
@@ -397,11 +403,69 @@ impl Instrument for OptionSpread {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use ustr::Ustr;
 
-    use crate::instruments::{OptionSpread, stubs::*};
+    use crate::{
+        enums::{AssetClass, InstrumentClass},
+        identifiers::{InstrumentId, Symbol},
+        instruments::{Instrument, OptionSpread, stubs::*},
+        types::{Currency, Price, Quantity},
+    };
 
     #[rstest]
-    fn test_equality(option_spread: OptionSpread) {
-        assert_eq!(option_spread, option_spread.clone());
+    fn test_trait_accessors(option_spread: OptionSpread) {
+        assert_eq!(
+            option_spread.id(),
+            InstrumentId::from("UD:U$: GN 2534559.GLBX")
+        );
+        assert_eq!(option_spread.asset_class(), AssetClass::FX);
+        assert_eq!(
+            option_spread.instrument_class(),
+            InstrumentClass::OptionSpread
+        );
+        assert_eq!(option_spread.quote_currency(), Currency::USD());
+        assert!(!option_spread.is_inverse());
+        assert_eq!(option_spread.exchange(), Some(Ustr::from("XCME")));
+        assert_eq!(option_spread.size_precision(), 0);
+        assert_eq!(option_spread.size_increment(), Quantity::from("1"));
+        assert_eq!(option_spread.min_quantity(), Some(Quantity::from("1")));
+    }
+
+    #[rstest]
+    fn test_new_checked_price_precision_mismatch() {
+        let result = OptionSpread::new_checked(
+            InstrumentId::from("TEST.GLBX"),
+            Symbol::from("TEST"),
+            AssetClass::FX,
+            Some(Ustr::from("XCME")),
+            Ustr::from("SR3"),
+            Ustr::from("GN"),
+            0.into(),
+            0.into(),
+            Currency::USD(),
+            4, // mismatch
+            Price::from("0.01"),
+            Quantity::from(1),
+            Quantity::from(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(),
+            0.into(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_serialization_roundtrip(option_spread: OptionSpread) {
+        let json = serde_json::to_string(&option_spread).unwrap();
+        let deserialized: OptionSpread = serde_json::from_str(&json).unwrap();
+        assert_eq!(option_spread, deserialized);
     }
 }

@@ -26,6 +26,7 @@ from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.core.nautilus_pyo3 import OKXContractType
+from nautilus_trader.core.nautilus_pyo3 import OKXEnvironment
 from nautilus_trader.core.nautilus_pyo3 import OKXInstrumentType
 from nautilus_trader.core.nautilus_pyo3 import OKXMarginMode
 from nautilus_trader.live.config import LiveRiskEngineConfig
@@ -125,7 +126,6 @@ config_node = TradingNodeConfig(
         use_pyo3=True,
     ),
     exec_engine=LiveExecEngineConfig(
-        convert_quote_qty_to_base=False,
         reconciliation=True,
         reconciliation_instrument_ids=reconciliation_instrument_ids,
         # reconciliation_lookback_mins=60,
@@ -137,12 +137,13 @@ config_node = TradingNodeConfig(
         # snapshot_orders=True,
         # snapshot_positions=True,
         # snapshot_positions_interval_secs=5.0,
-        purge_closed_orders_interval_mins=15,  # Example of purging closed orders for HFT
-        purge_closed_orders_buffer_mins=60,  # Purged orders closed for at least an hour
-        purge_closed_positions_interval_mins=15,  # Example of purging closed positions for HFT
-        purge_closed_positions_buffer_mins=60,  # Purge positions closed for at least an hour
-        purge_account_events_interval_mins=15,  # Example of purging account events for HFT
-        purge_account_events_lookback_mins=60,  # Purge account events occurring more than an hour ago
+        # purge_closed_orders_interval_mins=1,  # Example of purging closed orders for HFT
+        # purge_closed_orders_buffer_mins=0,  # Purged orders closed for at least an hour
+        # purge_closed_positions_interval_mins=1,  # Example of purging closed positions for HFT
+        # purge_closed_positions_buffer_mins=0,  # Purge positions closed for at least an hour
+        # purge_account_events_interval_mins=1,  # Example of purging account events for HFT
+        # purge_account_events_lookback_mins=0,  # Purge account events occurring more than an hour ago
+        # purge_from_database=True,  # Set True with caution
         graceful_shutdown_on_exception=True,
     ),
     risk_engine=LiveRiskEngineConfig(bypass=True),  # Must bypass for spot margin for now
@@ -165,27 +166,19 @@ config_node = TradingNodeConfig(
     # ),
     data_clients={
         OKX: OKXDataClientConfig(
-            api_key=None,  # 'OKX_API_KEY' env var
-            api_secret=None,  # 'OKX_API_SECRET' env var
-            api_passphrase=None,  # 'OKX_API_PASSPHRASE' env var
-            base_url_http=None,  # Override with custom endpoint
+            environment=OKXEnvironment.LIVE,
             instrument_provider=InstrumentProviderConfig(
                 load_all=False,
                 load_ids=load_ids,
             ),
             instrument_types=instrument_types,
             contract_types=contract_types,
-            is_demo=False,  # If client uses the demo API
-            http_timeout_secs=10,  # Set to reasonable duration
+            http_timeout_secs=10,
         ),
     },
     exec_clients={
         OKX: OKXExecClientConfig(
-            api_key=None,  # 'OKX_API_KEY' env var
-            api_secret=None,  # 'OKX_API_SECRET' env var
-            api_passphrase=None,  # 'OKX_API_PASSPHRASE' env var
-            base_url_http=None,  # Override with custom endpoint
-            base_url_ws=None,  # Override with custom endpoint
+            environment=OKXEnvironment.LIVE,
             instrument_provider=InstrumentProviderConfig(
                 load_all=False,
                 load_ids=load_ids,
@@ -196,9 +189,8 @@ config_node = TradingNodeConfig(
             use_spot_margin=use_spot_margin,
             # use_spot_cash_position_reports=True,  # Spot CASH position reports
             # use_mm_mass_cancel=True,
-            is_demo=False,  # If client uses the demo API
             use_fills_channel=False,  # Set to True if VIP5+ to get separate fill reports
-            http_timeout_secs=10,  # Set to reasonable duration
+            http_timeout_secs=10,
         ),
     },
     timeout_connection=20.0,

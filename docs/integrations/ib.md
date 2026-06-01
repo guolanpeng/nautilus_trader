@@ -36,6 +36,10 @@ You can find live example scripts [here](https://github.com/nautechsystems/nauti
 
 Before implementing your trading strategies, make sure that either TWS (Trader Workstation) or IB Gateway is running. You can log in to one of these standalone applications with your credentials, or connect programmatically via `DockerizedIBGateway`.
 
+:::warning
+Configure TWS or IB Gateway to return market data timestamps in UTC before connecting NautilusTrader. This setting must be enabled by the user in TWS/IB Gateway, as NautilusTrader is designed to work with UTC timestamps.
+:::
+
 ### Connection methods
 
 There are two primary ways to connect to Interactive Brokers:
@@ -263,6 +267,7 @@ Setting `symbology_method` to `IB_RAW` enforces stricter parsing rules that alig
 
 - `IBUS30=CFD.IBCFD`
 - `XAUUSD=CMDTY.IBCMDTY`
+- `EUR.USD=CASH.IDEALPRO`
 - `AAPL=STK.SMART`
 
 This configuration ensures explicit instrument identification and supports instruments from any region, especially those with non-standard symbology where simplified parsing may fail.
@@ -284,24 +289,29 @@ instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
 
 **Examples of MIC Conversion:**
 
-- `CME` → `XCME` (Chicago Mercantile Exchange)
-- `NASDAQ` → `XNAS` (Nasdaq Stock Market)
-- `NYSE` → `XNYS` (New York Stock Exchange)
-- `LSE` → `XLON` (London Stock Exchange)
+- `CME` -> `XCME` (Chicago Mercantile Exchange)
+- `NASDAQ` -> `XNAS` (Nasdaq Stock Market)
+- `NYSE` -> `XNYS` (New York Stock Exchange)
+- `LSE` -> `XLON` (London Stock Exchange)
 
 #### `symbol_to_mic_venue`
 
-For custom venue mapping, use the `symbol_to_mic_venue` dictionary to override default conversions:
+Symbol-prefix to MIC venue overrides. Applied **first** in venue resolution, independent of `convert_exchange_to_mic_venue`. When a contract's symbol matches a configured prefix, that MIC venue is used; otherwise resolution uses exchange (and optionally MIC conversion if `convert_exchange_to_mic_venue` is True). Useful for OPT contracts with exchange SMART (e.g. SPX -> XCBO) and for aligning with databento-style instrument IDs.
 
 ```python
 instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
-    convert_exchange_to_mic_venue=True,
     symbol_to_mic_venue={
-        "ES": "XCME",  # All ES futures/options use CME MIC
-        "SPY": "ARCX", # SPY specifically uses ARCA
+        "SPX": "XCBO",  # OPT with exchange SMART -> XCBO
+        "ES": "XCME",   # All ES futures/options use CME MIC
+        "SPY": "ARCX",  # SPY specifically uses ARCA
     },
 )
+# convert_exchange_to_mic_venue can be True or False; symbol_to_mic_venue is applied first
 ```
+
+#### Venue resolution and `_process_contract_details`
+
+When loading instruments via `IBContract`, the provider passes `venue=None` into `_process_contract_details`, so each contract detail gets its own venue (via `symbol_to_mic_venue`, validExchanges, and MIC conversion). Callers that pass a single venue string still get one venue for all details. To get per-detail resolution when you have mixed or SMART-routed results, pass `venue=None`.
 
 ### Supported instrument formats
 
@@ -372,9 +382,17 @@ To search for contract information, use the [IB Contract Information Center](htt
 
 There are two primary methods for loading instruments:
 
+Interactive Brokers does not support loading the full IB instrument universe with
+`load_all=True`. Configure `load_ids` or `load_contracts` for the instruments a node
+needs at startup, or request an instrument explicitly before subscribing to its market
+data.
+
 #### 1. Using `load_ids` (recommended)
 
 Use `symbology_method=SymbologyMethod.IB_SIMPLIFIED` (default) with `load_ids` for clean, intuitive instrument identification:
+
+For FX instruments, use slash-separated symbols such as `EUR/USD.IDEALPRO`. The dotted
+local symbol form belongs to raw symbology, for example `EUR.USD=CASH.IDEALPRO`.
 
 ```python
 from nautilus_trader.adapters.interactive_brokers.config import InteractiveBrokersInstrumentProviderConfig
@@ -523,8 +541,8 @@ For continuous futures contracts (using `secType='CONTFUT'`), the adapter create
 
 ```python
 # Continuous futures examples
-IBContract(secType='CONTFUT', exchange='CME', symbol='ES')  # → ES.CME
-IBContract(secType='CONTFUT', exchange='NYMEX', symbol='CL') # → CL.NYMEX
+IBContract(secType='CONTFUT', exchange='CME', symbol='ES')  # -> ES.CME
+IBContract(secType='CONTFUT', exchange='NYMEX', symbol='CL') # -> CL.NYMEX
 
 # With MIC venue conversion enabled
 instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
@@ -1063,7 +1081,7 @@ production_data_config = InteractiveBrokersDataClientConfig(
 | `connection_timeout`                    | `300`                                           | Seconds to wait for the initial API connection. |
 | `request_timeout_secs`                  | `60`                                            | Seconds to wait for request responses (contract details, etc.). |
 | `fetch_all_open_orders`                 | `False`                                         | When `True`, pulls open orders for every API client ID (not just this session). |
-| `track_option_exercise_from_position_update` | `False`                                    | Subscribe to real-time position updates to detect option exercises when `True`. |
+| `track_option_exercise_from_position_update` | `False`                                    | Subscribe to real‑time position updates to detect option exercises when `True`. |
 
 ### Execution client configuration
 
@@ -1115,9 +1133,9 @@ The adapter supports most Interactive Brokers order types:
 
 | Feature              | Supported | Notes                                        |
 |--------------------|-----------|----------------------------------------------|
-| Query positions     | ✓         | Real-time position updates.                  |
+| Query positions     | ✓         | Real‑time position updates.                  |
 | Position mode       | ✓         | Net vs separate long/short positions.       |
-| Leverage control    | ✓         | Account-level margin requirements.          |
+| Leverage control    | ✓         | Account‑level margin requirements.          |
 | Margin mode         | ✓         | Portfolio vs individual margin.             |
 
 #### Order querying
@@ -1126,16 +1144,16 @@ The adapter supports most Interactive Brokers order types:
 |--------------------|-----------|----------------------------------------------|
 | Query open orders   | ✓         | List all active orders.                      |
 | Query order history | ✓         | Historical order data.                       |
-| Order status updates| ✓         | Real-time order state changes.              |
+| Order status updates| ✓         | Real‑time order state changes.              |
 | Trade history       | ✓         | Execution and fill reports.                 |
 
 #### Contingent orders
 
 | Feature              | Supported | Notes                                        |
 |--------------------|-----------|----------------------------------------------|
-| Order lists         | ✓         | Atomic multi-order submission.               |
-| OCO orders          | ✓         | One-Cancels-Other with customizable OCA types (1, 2, 3). |
-| Bracket orders      | ✓         | Parent-child order relationships. |
+| Order lists         | ✓         | Atomic multi‑order submission.               |
+| OCO orders          | ✓         | One‑Cancels‑Other with customizable OCA types (1, 2, 3). |
+| Bracket orders      | ✓         | Parent‑child order relationships. |
 | Conditional orders  | ✓         | Advanced order conditions and triggers.     |
 
 #### Basic execution client configuration
@@ -1190,6 +1208,18 @@ exec_config = InteractiveBrokersExecClientConfig(
     # ... other parameters
 )
 ```
+
+#### Order params
+
+The execution adapter supports `params["exchange"]` on order submit, order list submit, and
+order modification commands. Use it to override the IB contract exchange for routing the current
+order while preserving the cached instrument contract:
+
+```python
+self.submit_order(order, params={"exchange": "IEX"})
+```
+
+Leave `exchange` unset, or set it to an empty string, to use the cached contract exchange.
 
 #### Order tags and advanced features
 

@@ -13,9 +13,16 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::str::FromStr;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    str::FromStr,
+};
 
-use nautilus_core::python::{parsing::get_required_string, to_pyvalue_err};
+use nautilus_core::python::{
+    parsing::{get_optional_parsed, get_required_string},
+    to_pyvalue_err,
+};
 use pyo3::{prelude::*, types::PyDict};
 
 use crate::{
@@ -26,6 +33,7 @@ use crate::{
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl AccountBalance {
+    /// Represents an account balance denominated in a particular currency.
     #[new]
     fn py_new(total: Money, locked: Money, free: Money) -> PyResult<Self> {
         Self::new_checked(total, locked, free).map_err(to_pyvalue_err)
@@ -39,25 +47,42 @@ impl AccountBalance {
         self.to_string()
     }
 
+    fn __hash__(&self) -> isize {
+        let mut h = DefaultHasher::new();
+        self.total.raw.hash(&mut h);
+        self.locked.raw.hash(&mut h);
+        self.free.raw.hash(&mut h);
+        self.currency.code.hash(&mut h);
+        h.finish() as isize
+    }
+
+    /// Returns a copy of this balance.
+    #[pyo3(name = "copy")]
+    fn py_copy(&self) -> Self {
+        *self
+    }
+
     /// Constructs an [`AccountBalance`] from a Python dict.
     ///
     /// # Errors
     ///
     /// Returns a `PyErr` if parsing or conversion fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if parsing numeric values (`unwrap()`) fails due to invalid format.
     #[staticmethod]
     #[pyo3(name = "from_dict")]
     pub fn py_from_dict(values: &Bound<'_, PyDict>) -> PyResult<Self> {
         let currency_str = get_required_string(values, "currency")?;
         let total_str = get_required_string(values, "total")?;
-        let total: f64 = total_str.parse::<f64>().unwrap();
+        let total: f64 = total_str.parse::<f64>().map_err(|e| {
+            to_pyvalue_err(format!("invalid AccountBalance total '{total_str}': {e}"))
+        })?;
         let free_str = get_required_string(values, "free")?;
-        let free: f64 = free_str.parse::<f64>().unwrap();
+        let free: f64 = free_str.parse::<f64>().map_err(|e| {
+            to_pyvalue_err(format!("invalid AccountBalance free '{free_str}': {e}"))
+        })?;
         let locked_str = get_required_string(values, "locked")?;
-        let locked: f64 = locked_str.parse::<f64>().unwrap();
+        let locked: f64 = locked_str.parse::<f64>().map_err(|e| {
+            to_pyvalue_err(format!("invalid AccountBalance locked '{locked_str}': {e}"))
+        })?;
         let currency = Currency::from_str(currency_str.as_str()).map_err(to_pyvalue_err)?;
         Self::new_checked(
             Money::new(total, currency),
@@ -108,9 +133,24 @@ impl AccountBalance {
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl MarginBalance {
+    /// Represents a margin balance.
+    ///
+    /// Margin entries have two mutually exclusive scopes:
+    ///
+    /// - Per-instrument: `instrument_id = Some(id)`. Used for isolated margin and
+    ///   for calculated margin in backtest mode where each instrument carries its
+    ///   own reserve.
+    /// - Account-wide (cross margin): `instrument_id = None`. Used for venues that
+    ///   report a single aggregate margin per collateral currency (most derivatives
+    ///   venues in cross-margin mode).
     #[new]
-    fn py_new(initial: Money, maintenance: Money, instrument: InstrumentId) -> Self {
-        Self::new(initial, maintenance, instrument)
+    #[pyo3(signature = (initial, maintenance, instrument_id=None))]
+    fn py_new(
+        initial: Money,
+        maintenance: Money,
+        instrument_id: Option<InstrumentId>,
+    ) -> PyResult<Self> {
+        Self::new_checked(initial, maintenance, instrument_id).map_err(to_pyvalue_err)
     }
 
     fn __repr__(&self) -> String {
@@ -121,31 +161,52 @@ impl MarginBalance {
         self.to_string()
     }
 
+    fn __hash__(&self) -> isize {
+        let mut h = DefaultHasher::new();
+        self.initial.raw.hash(&mut h);
+        self.maintenance.raw.hash(&mut h);
+        self.currency.code.hash(&mut h);
+        self.instrument_id.hash(&mut h);
+        h.finish() as isize
+    }
+
+    /// Returns a copy of this margin balance.
+    #[pyo3(name = "copy")]
+    fn py_copy(&self) -> Self {
+        *self
+    }
+
     /// Constructs a [`MarginBalance`] from a Python dict.
     ///
     /// # Errors
     ///
     /// Returns a `PyErr` if parsing or conversion fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if parsing numeric values (`unwrap()`) fails due to invalid format.
     #[staticmethod]
     #[pyo3(name = "from_dict")]
     pub fn py_from_dict(values: &Bound<'_, PyDict>) -> PyResult<Self> {
         let currency_str = get_required_string(values, "currency")?;
         let initial_str = get_required_string(values, "initial")?;
-        let initial: f64 = initial_str.parse::<f64>().unwrap();
+        let initial: f64 = initial_str.parse::<f64>().map_err(|e| {
+            to_pyvalue_err(format!(
+                "invalid MarginBalance initial '{initial_str}': {e}"
+            ))
+        })?;
         let maintenance_str = get_required_string(values, "maintenance")?;
-        let maintenance: f64 = maintenance_str.parse::<f64>().unwrap();
-        let instrument_id_str = get_required_string(values, "instrument_id")?;
+        let maintenance: f64 = maintenance_str.parse::<f64>().map_err(|e| {
+            to_pyvalue_err(format!(
+                "invalid MarginBalance maintenance '{maintenance_str}': {e}"
+            ))
+        })?;
+        let instrument_id = get_optional_parsed(values, "instrument_id", |s| {
+            Ok::<InstrumentId, String>(InstrumentId::from(s))
+        })?;
         let currency = Currency::from_str(currency_str.as_str()).map_err(to_pyvalue_err)?;
-        let account_balance = Self::new(
+        Self::new_checked(
             Money::new(initial, currency),
             Money::new(maintenance, currency),
-            InstrumentId::from(instrument_id_str),
-        );
-        Ok(account_balance)
+            instrument_id,
+        )
+        .map_err(to_pyvalue_err)
     }
 
     /// Converts this [`MarginBalance`] into a Python dict.
@@ -175,7 +236,78 @@ impl MarginBalance {
             ),
         )?;
         dict.set_item("currency", self.currency.code.to_string())?;
-        dict.set_item("instrument_id", self.instrument_id.to_string())?;
+        match self.instrument_id {
+            Some(id) => dict.set_item("instrument_id", id.to_string())?,
+            None => dict.set_item("instrument_id", py.None())?,
+        }
         Ok(dict.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pyo3::{Python, types::PyDict};
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case(
+        "total",
+        "ValueError: invalid AccountBalance total 'not-a-number': invalid float literal"
+    )]
+    #[case(
+        "free",
+        "ValueError: invalid AccountBalance free 'not-a-number': invalid float literal"
+    )]
+    #[case(
+        "locked",
+        "ValueError: invalid AccountBalance locked 'not-a-number': invalid float literal"
+    )]
+    fn test_account_balance_from_dict_rejects_invalid_numeric_field(
+        #[case] field: &str,
+        #[case] expected: &str,
+    ) {
+        Python::initialize();
+        Python::attach(|py| {
+            let values = PyDict::new(py);
+            values.set_item("currency", "USD").unwrap();
+            values.set_item("total", "1.00").unwrap();
+            values.set_item("free", "1.00").unwrap();
+            values.set_item("locked", "0.00").unwrap();
+            values.set_item(field, "not-a-number").unwrap();
+
+            let error = AccountBalance::py_from_dict(&values).unwrap_err();
+
+            assert_eq!(error.to_string(), expected);
+        });
+    }
+
+    #[rstest]
+    #[case(
+        "initial",
+        "ValueError: invalid MarginBalance initial 'not-a-number': invalid float literal"
+    )]
+    #[case(
+        "maintenance",
+        "ValueError: invalid MarginBalance maintenance 'not-a-number': invalid float literal"
+    )]
+    fn test_margin_balance_from_dict_rejects_invalid_numeric_field(
+        #[case] field: &str,
+        #[case] expected: &str,
+    ) {
+        Python::initialize();
+        Python::attach(|py| {
+            let values = PyDict::new(py);
+            values.set_item("currency", "USD").unwrap();
+            values.set_item("initial", "1.00").unwrap();
+            values.set_item("maintenance", "0.50").unwrap();
+            values.set_item("instrument_id", py.None()).unwrap();
+            values.set_item(field, "not-a-number").unwrap();
+
+            let error = MarginBalance::py_from_dict(&values).unwrap_err();
+
+            assert_eq!(error.to_string(), expected);
+        });
     }
 }

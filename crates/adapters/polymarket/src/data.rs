@@ -14,30 +14,49 @@
 // -------------------------------------------------------------------------------------------------
 
 //! Live market data client implementation for the Polymarket adapter.
+//!
+//! Tick-size changes are handled as book epoch transitions: the local order
+//! book is dropped, incremental `price_change` deltas are gated through
+//! `pending_snapshot_after_tick_change`, and the gate clears once the next
+//! venue snapshot reseeds the book under the new precision. The quote arm of
+//! `price_change` stays open through the gap because each payload carries
+//! `best_bid` / `best_ask` on the new grid; `last_quotes` is preserved so the
+//! unchanged side's size carries forward. See
+//! `docs/integrations/polymarket.md` for the full description.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
-use ahash::AHashMap;
-use dashmap::{DashMap, DashSet};
+use ahash::AHashSet;
+use anyhow::Context;
+use dashmap::DashMap;
 use nautilus_common::{
     clients::DataClient,
     live::{get_runtime, runner::get_data_event_sender},
     messages::{
-        DataEvent,
+        DataEvent, DataResponse,
         data::{
-            SubscribeBookDeltas, SubscribeQuotes, SubscribeTrades, UnsubscribeBookDeltas,
-            UnsubscribeQuotes, UnsubscribeTrades,
+            BookResponse, InstrumentResponse, InstrumentsResponse, RequestBookSnapshot,
+            RequestInstrument, RequestInstruments, RequestTrades, SubscribeBookDeltas,
+            SubscribeInstruments, SubscribeQuotes, SubscribeTrades, TradesResponse,
+            UnsubscribeBookDeltas, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
     providers::InstrumentProvider,
 };
-use nautilus_core::time::{AtomicTime, get_atomic_clock_realtime};
+use nautilus_core::{
+    AtomicMap, AtomicSet,
+    datetime::datetime_to_unix_nanos,
+    time::{AtomicTime, get_atomic_clock_realtime},
+};
 use nautilus_model::{
-    data::{Data as NautilusData, OrderBookDeltas_API, QuoteTick},
-    enums::BookType,
+    data::{Data as NautilusData, InstrumentStatus, OrderBookDeltas_API, QuoteTick},
+    enums::{BookType, MarketStatusAction},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
@@ -47,10 +66,15 @@ use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use crate::{
-    common::consts::POLYMARKET_VENUE,
+    common::consts::{GAMMA_CONDITION_IDS_BATCH_SIZE, POLYMARKET_VENUE},
     config::PolymarketDataClientConfig,
-    http::gamma::PolymarketGammaHttpClient,
-    providers::PolymarketInstrumentProvider,
+    filters::InstrumentFilter,
+    http::{
+        clob::PolymarketClobPublicClient, data_api::PolymarketDataApiHttpClient,
+        gamma::PolymarketGammaHttpClient, parse::rebuild_instrument_with_tick_size,
+        query::GetGammaMarketsParams,
+    },
+    providers::{PolymarketInstrumentProvider, extract_condition_id, fetch_configured_instruments},
     websocket::{
         client::PolymarketWebSocketClient,
         messages::{MarketWsMessage, PolymarketQuotes, PolymarketWsMessage},
@@ -61,15 +85,146 @@ use crate::{
     },
 };
 
+fn resolve_token_id_from(
+    instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    instrument_id: InstrumentId,
+) -> anyhow::Result<String> {
+    let loaded = instruments.load();
+    let instrument = loaded
+        .get(&instrument_id)
+        .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found"))?;
+    Ok(instrument.raw_symbol().as_str().to_string())
+}
+
+// Reconciles the WS subscription for `instrument_id` with the union of caller
+// intents. Holds `ws_sub_mutex` across the async WS send so concurrent
+// subscribe/unsubscribe calls arrive at the WS handler in mutex-release order;
+// that makes the final wire state consistent with the last writer.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared state comes in as Arc refs"
+)]
+async fn sync_ws_subscription_async(
+    instrument_id: InstrumentId,
+    token_id_str: String,
+    active_quote_subs: Arc<AtomicSet<InstrumentId>>,
+    active_delta_subs: Arc<AtomicSet<InstrumentId>>,
+    active_trade_subs: Arc<AtomicSet<InstrumentId>>,
+    ws_open_tokens: Arc<AtomicSet<Ustr>>,
+    ws_sub_mutex: Arc<tokio::sync::Mutex<()>>,
+    ws: crate::websocket::client::WsSubscriptionHandle,
+) {
+    let token_id = Ustr::from(token_id_str.as_str());
+    let _guard = ws_sub_mutex.lock().await;
+
+    let wants_subscribe = active_quote_subs.contains(&instrument_id)
+        || active_delta_subs.contains(&instrument_id)
+        || active_trade_subs.contains(&instrument_id);
+    let is_open = ws_open_tokens.contains(&token_id);
+
+    if wants_subscribe && !is_open {
+        ws_open_tokens.insert(token_id);
+
+        if let Err(e) = ws.subscribe_market(vec![token_id_str]).await {
+            log::error!("Failed to subscribe to market data: {e:?}");
+            // Roll back tracked WS state so a retry can take effect.
+            ws_open_tokens.remove(&token_id);
+        }
+    } else if !wants_subscribe && is_open {
+        ws_open_tokens.remove(&token_id);
+
+        if let Err(e) = ws.unsubscribe_market(vec![token_id_str]).await {
+            log::error!("Failed to unsubscribe from market data: {e:?}");
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TokenMeta {
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+}
+
+// Inserts `instrument` into the live instrument cache and updates the
+// `token_meta` routing index in one step. Every path that populates the live
+// cache must go through here so WS messages can always resolve token_id back
+// to an InstrumentId.
+fn cache_instrument(
+    instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    token_meta: &Arc<DashMap<Ustr, TokenMeta>>,
+    instrument: &InstrumentAny,
+) {
+    let instrument_id = instrument.id();
+    token_meta.insert(
+        Ustr::from(instrument.raw_symbol().as_str()),
+        TokenMeta {
+            instrument_id,
+            price_precision: instrument.price_precision(),
+            size_precision: instrument.size_precision(),
+        },
+    );
+    instruments.insert(instrument_id, instrument.clone());
+}
+
+fn cache_and_publish_instruments(
+    instruments_cache: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    token_meta: &Arc<DashMap<Ustr, TokenMeta>>,
+    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    instruments: Vec<InstrumentAny>,
+) -> usize {
+    let total = instruments.len();
+
+    for instrument in instruments {
+        let instrument_id = instrument.id();
+        cache_instrument(instruments_cache, token_meta, &instrument);
+
+        if let Err(e) = data_sender.send(DataEvent::Instrument(instrument)) {
+            log::warn!("Failed to publish instrument {instrument_id}: {e}");
+        }
+    }
+
+    total
+}
+
+async fn refresh_scoped_instruments(
+    http_client: PolymarketGammaHttpClient,
+    instrument_config: Option<crate::config::PolymarketInstrumentProviderConfig>,
+    filters: Vec<Arc<dyn InstrumentFilter>>,
+    instruments_cache: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    token_meta: &Arc<DashMap<Ustr, TokenMeta>>,
+    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+) -> anyhow::Result<usize> {
+    let Some(instrument_config) = instrument_config else {
+        return Ok(0);
+    };
+    let refreshed =
+        fetch_configured_instruments(&http_client, &instrument_config, &filters).await?;
+
+    Ok(cache_and_publish_instruments(
+        instruments_cache,
+        token_meta,
+        data_sender,
+        refreshed,
+    ))
+}
+
 struct WsMessageContext {
     clock: &'static AtomicTime,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    token_instruments: Arc<AHashMap<Ustr, InstrumentAny>>,
+    token_meta: Arc<DashMap<Ustr, TokenMeta>>,
+    instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    gamma_client: PolymarketGammaHttpClient,
+    filters: Vec<Arc<dyn InstrumentFilter>>,
     order_books: Arc<DashMap<InstrumentId, OrderBook>>,
     last_quotes: Arc<DashMap<InstrumentId, QuoteTick>>,
-    active_quote_subs: Arc<DashSet<InstrumentId>>,
-    active_delta_subs: Arc<DashSet<InstrumentId>>,
-    active_trade_subs: Arc<DashSet<InstrumentId>>,
+    active_quote_subs: Arc<AtomicSet<InstrumentId>>,
+    active_delta_subs: Arc<AtomicSet<InstrumentId>>,
+    active_trade_subs: Arc<AtomicSet<InstrumentId>>,
+    pending_snapshot_after_tick_change: Arc<AtomicSet<InstrumentId>>,
+    subscribe_new_markets: bool,
+    new_market_filter: Option<Arc<dyn InstrumentFilter>>,
+    cancellation_token: CancellationToken,
 }
 
 /// Polymarket data client for live market data streaming.
@@ -85,16 +240,25 @@ pub struct PolymarketDataClient {
     client_id: ClientId,
     config: PolymarketDataClientConfig,
     provider: PolymarketInstrumentProvider,
+    clob_public_client: PolymarketClobPublicClient,
+    data_api_client: PolymarketDataApiHttpClient,
     ws_client: PolymarketWebSocketClient,
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    token_meta: Arc<DashMap<Ustr, TokenMeta>>,
     order_books: Arc<DashMap<InstrumentId, OrderBook>>,
     last_quotes: Arc<DashMap<InstrumentId, QuoteTick>>,
-    active_quote_subs: Arc<DashSet<InstrumentId>>,
-    active_delta_subs: Arc<DashSet<InstrumentId>>,
-    active_trade_subs: Arc<DashSet<InstrumentId>>,
+    active_quote_subs: Arc<AtomicSet<InstrumentId>>,
+    active_delta_subs: Arc<AtomicSet<InstrumentId>>,
+    active_trade_subs: Arc<AtomicSet<InstrumentId>>,
+    pending_snapshot_after_tick_change: Arc<AtomicSet<InstrumentId>>,
+    ws_open_tokens: Arc<AtomicSet<Ustr>>,
+    ws_sub_mutex: Arc<tokio::sync::Mutex<()>>,
+    pending_auto_loads: Arc<StdMutex<AHashSet<InstrumentId>>>,
+    auto_load_scheduled: Arc<AtomicBool>,
 }
 
 impl PolymarketDataClient {
@@ -103,27 +267,39 @@ impl PolymarketDataClient {
         client_id: ClientId,
         config: PolymarketDataClientConfig,
         gamma_client: PolymarketGammaHttpClient,
+        clob_public_client: PolymarketClobPublicClient,
+        data_api_client: PolymarketDataApiHttpClient,
         ws_client: PolymarketWebSocketClient,
     ) -> Self {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
-        let provider = PolymarketInstrumentProvider::new(gamma_client);
+        let provider =
+            PolymarketInstrumentProvider::new(gamma_client, config.instrument_config.clone());
 
         Self {
             clock,
             client_id,
             config,
             provider,
+            clob_public_client,
+            data_api_client,
             ws_client,
             is_connected: AtomicBool::new(false),
             cancellation_token: CancellationToken::new(),
             tasks: Vec::new(),
             data_sender,
+            instruments: Arc::new(AtomicMap::new()),
+            token_meta: Arc::new(DashMap::new()),
             order_books: Arc::new(DashMap::new()),
             last_quotes: Arc::new(DashMap::new()),
-            active_quote_subs: Arc::new(DashSet::new()),
-            active_delta_subs: Arc::new(DashSet::new()),
-            active_trade_subs: Arc::new(DashSet::new()),
+            active_quote_subs: Arc::new(AtomicSet::new()),
+            active_delta_subs: Arc::new(AtomicSet::new()),
+            active_trade_subs: Arc::new(AtomicSet::new()),
+            pending_snapshot_after_tick_change: Arc::new(AtomicSet::new()),
+            ws_open_tokens: Arc::new(AtomicSet::new()),
+            ws_sub_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            pending_auto_loads: Arc::new(StdMutex::new(AHashSet::new())),
+            auto_load_scheduled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -145,6 +321,11 @@ impl PolymarketDataClient {
         &self.provider
     }
 
+    /// Adds an instrument filter on the underlying provider.
+    pub fn add_instrument_filter(&mut self, filter: Arc<dyn InstrumentFilter>) {
+        self.provider.add_filter(filter);
+    }
+
     /// Returns `true` when the client is connected.
     #[must_use]
     pub fn is_connected(&self) -> bool {
@@ -152,51 +333,378 @@ impl PolymarketDataClient {
     }
 
     fn resolve_token_id(&self, instrument_id: InstrumentId) -> anyhow::Result<String> {
-        let instrument = self
-            .provider
-            .store()
-            .find(&instrument_id)
+        let instruments = self.instruments.load();
+        let instrument = instruments
+            .get(&instrument_id)
             .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found"))?;
         Ok(instrument.raw_symbol().as_str().to_string())
     }
 
-    fn subscribe_ws_market(&self, token_id: String) {
+    // Spawns an async task that reconciles the WS subscription for
+    // `instrument_id`. The task holds `ws_sub_mutex` across the wire send so
+    // concurrent subscribe/unsubscribe calls deliver commands to the WS handler
+    // in a consistent order with the final `active_*_subs` state.
+    fn sync_ws_subscription(&self, instrument_id: InstrumentId) {
+        let token_id_str = match self.resolve_token_id(instrument_id) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let active_quote_subs = self.active_quote_subs.clone();
+        let active_delta_subs = self.active_delta_subs.clone();
+        let active_trade_subs = self.active_trade_subs.clone();
+        let ws_open_tokens = self.ws_open_tokens.clone();
+        let ws_sub_mutex = self.ws_sub_mutex.clone();
         let ws = self.ws_client.clone_subscription_handle();
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.subscribe_market(vec![token_id]).await {
-                log::error!("Failed to subscribe to market data: {e:?}");
-            }
-        });
+
+        get_runtime().spawn(sync_ws_subscription_async(
+            instrument_id,
+            token_id_str,
+            active_quote_subs,
+            active_delta_subs,
+            active_trade_subs,
+            ws_open_tokens,
+            ws_sub_mutex,
+            ws,
+        ));
     }
 
-    fn unsubscribe_ws_market(&self, token_id: String) {
-        let ws = self.ws_client.clone_subscription_handle();
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.unsubscribe_market(vec![token_id]).await {
-                log::error!("Failed to unsubscribe from market data: {e:?}");
-            }
-        });
+    fn queue_pending_load(&self, instrument_id: InstrumentId) {
+        {
+            let mut pending = self
+                .pending_auto_loads
+                .lock()
+                .expect("pending_auto_loads mutex poisoned");
+            pending.insert(instrument_id);
+        }
+
+        self.ensure_auto_load_task();
     }
 
-    fn has_any_market_sub(&self, instrument_id: &InstrumentId) -> bool {
-        self.active_quote_subs.contains(instrument_id)
-            || self.active_delta_subs.contains(instrument_id)
-            || self.active_trade_subs.contains(instrument_id)
+    fn drop_pending_if_unwanted(&self, instrument_id: InstrumentId) {
+        if self.active_quote_subs.contains(&instrument_id)
+            || self.active_delta_subs.contains(&instrument_id)
+            || self.active_trade_subs.contains(&instrument_id)
+        {
+            return;
+        }
+        let mut pending = self
+            .pending_auto_loads
+            .lock()
+            .expect("pending_auto_loads mutex poisoned");
+        pending.remove(&instrument_id);
+    }
+
+    fn drop_local_book_state_if_unwanted(&self, instrument_id: InstrumentId) {
+        // Stale book/quote leaks across resubscribes
+        if self.active_quote_subs.contains(&instrument_id)
+            || self.active_delta_subs.contains(&instrument_id)
+        {
+            return;
+        }
+        self.order_books.remove(&instrument_id);
+        self.last_quotes.remove(&instrument_id);
+    }
+
+    fn ensure_auto_load_task(&self) {
+        if self
+            .auto_load_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let pending = self.pending_auto_loads.clone();
+        let scheduled = self.auto_load_scheduled.clone();
+        let debounce_ms = self.config.auto_load_debounce_ms;
+        let max_retries = self.config.auto_load_max_retries;
+        let base_secs = self.config.auto_load_retry_delay_initial_secs;
+        let max_secs = self.config.auto_load_retry_delay_max_secs;
+        let http = self.provider.http_client().clone();
+        let filters = self.provider.filters();
+        let instruments = self.instruments.clone();
+        let token_meta = self.token_meta.clone();
+        let active_quote_subs = self.active_quote_subs.clone();
+        let active_delta_subs = self.active_delta_subs.clone();
+        let active_trade_subs = self.active_trade_subs.clone();
+        let ws_open_tokens = self.ws_open_tokens.clone();
+        let ws_sub_mutex = self.ws_sub_mutex.clone();
+        let ws_client = self.ws_client.clone_subscription_handle();
+        let data_sender = self.data_sender.clone();
+        let cancellation = self.cancellation_token.clone();
+
+        get_runtime().spawn(async move {
+            // Coalesce concurrent misses into one Gamma call.
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(debounce_ms)) => {}
+                () = cancellation.cancelled() => {
+                    scheduled.store(false, Ordering::Release);
+                    return;
+                }
+            }
+
+            // Drain pending and release `scheduled` so new misses spawn a fresh
+            // task in parallel rather than piggybacking on this batch's budget.
+            let mut batch: AHashSet<InstrumentId> = {
+                let mut guard = pending.lock().expect("pending_auto_loads mutex poisoned");
+                let snapshot = guard.iter().copied().collect();
+                guard.clear();
+                snapshot
+            };
+            scheduled.store(false, Ordering::Release);
+
+            if batch.is_empty() {
+                return;
+            }
+
+            log::info!(
+                "Auto-loading {} missing instrument(s): {batch:?}",
+                batch.len(),
+            );
+
+            for attempt in 0..=max_retries {
+                if cancellation.is_cancelled() {
+                    return;
+                }
+
+                // Drop entries the user has since unsubscribed from.
+                batch.retain(|id| {
+                    active_quote_subs.contains(id)
+                        || active_delta_subs.contains(id)
+                        || active_trade_subs.contains(id)
+                });
+
+                if batch.is_empty() {
+                    return;
+                }
+
+                let mut condition_ids: Vec<String> = batch
+                    .iter()
+                    .filter_map(|id| extract_condition_id(id).ok())
+                    .collect();
+                condition_ids.sort();
+                condition_ids.dedup();
+
+                if condition_ids.is_empty() {
+                    log::error!(
+                        "Auto-load aborted: no condition_ids could be extracted from {} entries",
+                        batch.len(),
+                    );
+                    return;
+                }
+
+                // Gamma caps `condition_ids=` filters at ~100; chunk and merge.
+                let mut loaded: Vec<InstrumentAny> = Vec::new();
+                let mut transient: AHashSet<String> = AHashSet::new();
+                let mut chunk_failed = false;
+
+                for chunk in condition_ids.chunks(GAMMA_CONDITION_IDS_BATCH_SIZE) {
+                    let params = GetGammaMarketsParams {
+                        condition_ids: Some(chunk.join(",")),
+                        ..Default::default()
+                    };
+
+                    match http
+                        .request_instruments_by_params_with_transient(params)
+                        .await
+                    {
+                        Ok((insts, trans)) => {
+                            loaded.extend(insts);
+                            transient.extend(trans);
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Auto-load batch failed for chunk of {} condition_id(s): {e:?}",
+                                chunk.len(),
+                            );
+                            chunk_failed = true;
+                            break;
+                        }
+                    }
+                }
+
+                // A chunk failure leaves the batch's state unknown; count it
+                // against the retry budget instead of dropping the subscription.
+                let next_batch: AHashSet<InstrumentId> = if chunk_failed {
+                    batch.clone()
+                } else {
+                    for inst in loaded {
+                        if !filters.iter().all(|f| f.accept(&inst)) {
+                            log::debug!("Auto-loaded instrument {} filtered out", inst.id());
+                            continue;
+                        }
+
+                        cache_instrument(&instruments, &token_meta, &inst);
+
+                        let instrument_id = inst.id();
+                        if let Err(e) = data_sender.send(DataEvent::Instrument(inst)) {
+                            log::error!(
+                                "Failed to emit auto-loaded instrument {instrument_id}: {e}"
+                            );
+                        }
+                    }
+
+                    // Snapshot loaded keys so the arc-swap Guard does not span
+                    // the WS reconciliation awaits below.
+                    let loaded_ids: AHashSet<InstrumentId> = {
+                        let cache = instruments.load();
+                        batch
+                            .iter()
+                            .filter(|id| cache.contains_key(id))
+                            .copied()
+                            .collect()
+                    };
+                    let mut next: AHashSet<InstrumentId> = AHashSet::new();
+
+                    for id in &batch {
+                        let cid = match extract_condition_id(id) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+
+                        if loaded_ids.contains(id) {
+                            if let Ok(token_id) = resolve_token_id_from(&instruments, *id) {
+                                sync_ws_subscription_async(
+                                    *id,
+                                    token_id,
+                                    active_quote_subs.clone(),
+                                    active_delta_subs.clone(),
+                                    active_trade_subs.clone(),
+                                    ws_open_tokens.clone(),
+                                    ws_sub_mutex.clone(),
+                                    ws_client.clone(),
+                                )
+                                .await;
+                            }
+                        } else if transient.contains(&cid) {
+                            // CLOB still hydrating: retry within the budget.
+                            next.insert(*id);
+                        } else {
+                            // Absent from bulk response (same observable state as a
+                            // 404 in the single-market path): also transient.
+                            next.insert(*id);
+                        }
+                    }
+                    next
+                };
+
+                if next_batch.is_empty() {
+                    return;
+                }
+
+                if attempt >= max_retries {
+                    let reason = if chunk_failed {
+                        "Gamma fetch failed"
+                    } else {
+                        "no usable token_id"
+                    };
+
+                    for id in &next_batch {
+                        log::error!(
+                            "Cannot find instrument for {id}: {reason} after {max_retries} retries (CLOB lifecycle race)"
+                        );
+                    }
+                    return;
+                }
+
+                let delay = crate::common::retry::auto_load_retry_delay(
+                    attempt, base_secs, max_secs,
+                );
+                let kind = if chunk_failed { "chunk failure" } else { "transient" };
+                log::info!(
+                    "Auto-load retry {}/{} for {} {kind} instrument(s) in {:.1}s",
+                    attempt + 1,
+                    max_retries,
+                    next_batch.len(),
+                    delay.as_secs_f64(),
+                );
+
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    () = cancellation.cancelled() => return,
+                }
+
+                batch = next_batch;
+            }
+        });
     }
 
     async fn bootstrap_instruments(&mut self) -> anyhow::Result<()> {
-        self.provider.load_all(None).await?;
+        self.provider.initialize(false).await?;
 
-        for instrument in self.provider.store().list_all() {
-            if let Err(e) = self
-                .data_sender
-                .send(DataEvent::Instrument(instrument.clone()))
-            {
-                log::warn!("Failed to publish instrument {}: {e}", instrument.id());
-            }
+        let total = cache_and_publish_instruments(
+            &self.instruments,
+            &self.token_meta,
+            &self.data_sender,
+            self.provider
+                .store()
+                .list_all()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+
+        log::info!("Published {total} Polymarket instruments to data engine");
+        Ok(())
+    }
+
+    fn spawn_instrument_refresh_task(&mut self) {
+        let Some(interval_mins) = self.config.update_instruments_interval_mins else {
+            return;
+        };
+
+        if interval_mins == 0 || self.config.instrument_config.is_none() {
+            return;
         }
 
-        Ok(())
+        let interval = Duration::from_secs(interval_mins.saturating_mul(60));
+        let cancellation = self.cancellation_token.clone();
+        let http_client = self.provider.http_client().clone();
+        let instrument_config = self.config.instrument_config.clone();
+        let filters = self.provider.filters();
+        let instruments_cache = self.instruments.clone();
+        let token_meta = self.token_meta.clone();
+        let data_sender = self.data_sender.clone();
+
+        let handle = get_runtime().spawn(async move {
+            log::debug!("Polymarket instrument refresh task started");
+
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(interval) => {}
+                    () = cancellation.cancelled() => {
+                        log::debug!("Polymarket instrument refresh task cancelled");
+                        break;
+                    }
+                }
+
+                match refresh_scoped_instruments(
+                    http_client.clone(),
+                    instrument_config.clone(),
+                    filters.clone(),
+                    &instruments_cache,
+                    &token_meta,
+                    &data_sender,
+                )
+                .await
+                {
+                    Ok(total) => {
+                        if total > 0 {
+                            log::info!(
+                                "Refreshed {total} Polymarket instruments into the live cache"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to refresh Polymarket instruments: {e}");
+                    }
+                }
+            }
+
+            log::debug!("Polymarket instrument refresh task ended");
+        });
+
+        self.tasks.push(handle);
     }
 
     fn spawn_message_handler(
@@ -204,16 +712,34 @@ impl PolymarketDataClient {
         mut rx: tokio::sync::mpsc::UnboundedReceiver<PolymarketWsMessage>,
     ) {
         let cancellation = self.cancellation_token.clone();
-        let token_instruments = Arc::new(self.provider.build_token_map());
+
+        for (token_id, instrument) in self.provider.build_token_map() {
+            self.token_meta.insert(
+                token_id,
+                TokenMeta {
+                    instrument_id: instrument.id(),
+                    price_precision: instrument.price_precision(),
+                    size_precision: instrument.size_precision(),
+                },
+            );
+        }
+
         let ctx = WsMessageContext {
             clock: self.clock,
             data_sender: self.data_sender.clone(),
-            token_instruments,
+            token_meta: self.token_meta.clone(),
+            instruments: self.instruments.clone(),
+            gamma_client: self.provider.http_client().clone(),
+            filters: self.provider.filters(),
             order_books: self.order_books.clone(),
             last_quotes: self.last_quotes.clone(),
             active_quote_subs: self.active_quote_subs.clone(),
             active_delta_subs: self.active_delta_subs.clone(),
             active_trade_subs: self.active_trade_subs.clone(),
+            pending_snapshot_after_tick_change: self.pending_snapshot_after_tick_change.clone(),
+            subscribe_new_markets: self.config.subscribe_new_markets,
+            new_market_filter: self.config.new_market_filter.clone(),
+            cancellation_token: cancellation.clone(),
         };
 
         let handle = get_runtime().spawn(async move {
@@ -261,28 +787,36 @@ impl PolymarketDataClient {
         match message {
             MarketWsMessage::Book(snap) => {
                 let token_id = Ustr::from(snap.asset_id.as_str());
-                let instrument = match ctx.token_instruments.get(&token_id) {
-                    Some(inst) => inst,
+                let meta = match ctx.token_meta.get(&token_id) {
+                    Some(m) => *m,
                     None => {
                         log::debug!("No instrument for token_id {token_id}");
                         return;
                     }
                 };
-                let instrument_id = instrument.id();
+                let instrument_id = meta.instrument_id;
                 let ts_init = ctx.clock.get_time_ns();
+                let mut book_seeded = false;
 
                 if ctx.active_delta_subs.contains(&instrument_id) {
-                    match parse_book_snapshot(&snap, instrument, ts_init) {
+                    match parse_book_snapshot(
+                        &snap,
+                        instrument_id,
+                        meta.price_precision,
+                        meta.size_precision,
+                        ts_init,
+                    ) {
                         Ok(deltas) => {
                             let mut book = ctx
                                 .order_books
                                 .entry(instrument_id)
                                 .or_insert_with(|| OrderBook::new(instrument_id, BookType::L2_MBP));
 
-                            if let Err(e) = book.apply_deltas(&deltas) {
-                                log::error!(
+                            match book.apply_deltas(&deltas) {
+                                Ok(()) => book_seeded = true,
+                                Err(e) => log::error!(
                                     "Failed to apply book snapshot for {instrument_id}: {e}"
-                                );
+                                ),
                             }
 
                             let data: NautilusData = OrderBookDeltas_API::new(deltas).into();
@@ -295,13 +829,27 @@ impl PolymarketDataClient {
                 }
 
                 if ctx.active_quote_subs.contains(&instrument_id) {
-                    match parse_quote_from_snapshot(&snap, instrument, ts_init) {
-                        Ok(Some(quote)) => {
-                            Self::emit_quote_if_changed(ctx, instrument_id, quote);
-                        }
+                    match parse_quote_from_snapshot(
+                        &snap,
+                        instrument_id,
+                        meta.price_precision,
+                        meta.size_precision,
+                        ts_init,
+                    ) {
+                        Ok(Some(quote)) => Self::emit_quote_if_changed(ctx, instrument_id, quote),
                         Ok(None) => {}
                         Err(e) => log::error!("Failed to parse quote from snapshot: {e}"),
                     }
+                }
+
+                if book_seeded
+                    && ctx
+                        .pending_snapshot_after_tick_change
+                        .contains(&instrument_id)
+                {
+                    ctx.pending_snapshot_after_tick_change
+                        .remove(&instrument_id);
+                    log::info!("Resumed book for {instrument_id} after tick size change");
                 }
             }
 
@@ -318,23 +866,36 @@ impl PolymarketDataClient {
                 // Each change may belong to a different asset, so resolve per-change
                 for change in &quotes.price_changes {
                     let token_id = Ustr::from(change.asset_id.as_str());
-                    let instrument = match ctx.token_instruments.get(&token_id) {
-                        Some(inst) => inst,
+                    let meta = match ctx.token_meta.get(&token_id) {
+                        Some(m) => *m,
                         None => {
                             log::debug!("No instrument for token_id {token_id}");
                             continue;
                         }
                     };
-                    let instrument_id = instrument.id();
+                    let instrument_id = meta.instrument_id;
+                    let pending = ctx
+                        .pending_snapshot_after_tick_change
+                        .contains(&instrument_id);
 
-                    if ctx.active_delta_subs.contains(&instrument_id) {
+                    if pending && ctx.active_delta_subs.contains(&instrument_id) {
+                        log::debug!(
+                            "Dropping book delta for {instrument_id}: awaiting snapshot after tick size change",
+                        );
+                    } else if ctx.active_delta_subs.contains(&instrument_id) {
                         let per_asset = PolymarketQuotes {
                             market: quotes.market,
                             price_changes: vec![change.clone()],
                             timestamp: quotes.timestamp.clone(),
                         };
 
-                        match parse_book_deltas(&per_asset, instrument, ts_init) {
+                        match parse_book_deltas(
+                            &per_asset,
+                            instrument_id,
+                            meta.price_precision,
+                            meta.size_precision,
+                            ts_init,
+                        ) {
                             Ok(deltas) => {
                                 if let Some(mut book) = ctx.order_books.get_mut(&instrument_id)
                                     && let Err(e) = book.apply_deltas(&deltas)
@@ -357,16 +918,20 @@ impl PolymarketDataClient {
                     if ctx.active_quote_subs.contains(&instrument_id) {
                         // Clone and drop guard before emit to avoid DashMap deadlock
                         let last_quote = ctx.last_quotes.get(&instrument_id).map(|r| *r);
+
                         match parse_quote_from_price_change(
                             change,
-                            instrument,
+                            instrument_id,
+                            meta.price_precision,
+                            meta.size_precision,
                             last_quote.as_ref(),
                             ts_event,
                             ts_init,
                         ) {
-                            Ok(quote) => {
+                            Ok(Some(quote)) => {
                                 Self::emit_quote_if_changed(ctx, instrument_id, quote);
                             }
+                            Ok(None) => {} // Missing best_bid/best_ask
                             Err(e) => {
                                 log::error!("Failed to parse quote from price change: {e}");
                             }
@@ -377,18 +942,25 @@ impl PolymarketDataClient {
 
             MarketWsMessage::LastTradePrice(trade) => {
                 let token_id = Ustr::from(trade.asset_id.as_str());
-                let instrument = match ctx.token_instruments.get(&token_id) {
-                    Some(inst) => inst,
+                let meta = match ctx.token_meta.get(&token_id) {
+                    Some(m) => *m,
                     None => {
                         log::debug!("No instrument for token_id {token_id}");
                         return;
                     }
                 };
-                let instrument_id = instrument.id();
+                let instrument_id = meta.instrument_id;
 
                 if ctx.active_trade_subs.contains(&instrument_id) {
                     let ts_init = ctx.clock.get_time_ns();
-                    match parse_trade_tick(&trade, instrument, ts_init) {
+
+                    match parse_trade_tick(
+                        &trade,
+                        instrument_id,
+                        meta.price_precision,
+                        meta.size_precision,
+                        ts_init,
+                    ) {
                         Ok(tick) => {
                             if let Err(e) = ctx
                                 .data_sender
@@ -403,11 +975,225 @@ impl PolymarketDataClient {
             }
 
             MarketWsMessage::TickSizeChange(change) => {
+                let token_id = Ustr::from(change.asset_id.as_str());
+                let meta = match ctx.token_meta.get(&token_id) {
+                    Some(m) => *m,
+                    None => {
+                        log::error!("No instrument for token_id {token_id}");
+                        return;
+                    }
+                };
+
+                let tick_size: rust_decimal::Decimal = match change.new_tick_size.parse() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::error!(
+                            "Failed to parse new tick size '{}': {e}",
+                            change.new_tick_size
+                        );
+                        return;
+                    }
+                };
+                let new_price_precision = tick_size.scale() as u8;
+
+                let instruments = ctx.instruments.load();
+                let existing = instruments.get(&meta.instrument_id);
+
+                // No-op tick_size_change must not trigger an epoch transition.
+                if let Some(existing_inst) = existing
+                    && existing_inst.price_increment().as_decimal() == tick_size
+                {
+                    log::debug!(
+                        "Ignoring duplicate tick size change for {}: {} -> {}",
+                        change.asset_id,
+                        change.old_tick_size,
+                        change.new_tick_size,
+                    );
+                    return;
+                }
+
                 log::info!(
                     "Tick size changed for {}: {} -> {}",
                     change.asset_id,
                     change.old_tick_size,
                     change.new_tick_size
+                );
+
+                ctx.token_meta.insert(
+                    token_id,
+                    TokenMeta {
+                        price_precision: new_price_precision,
+                        ..meta
+                    },
+                );
+
+                if let Some(existing) = existing {
+                    let ts_init = ctx.clock.get_time_ns();
+
+                    match rebuild_instrument_with_tick_size(
+                        existing,
+                        &change.new_tick_size,
+                        ts_init,
+                        ts_init,
+                    ) {
+                        Ok(rebuilt) => {
+                            ctx.instruments.insert(rebuilt.id(), rebuilt.clone());
+                            if let Err(e) = ctx.data_sender.send(DataEvent::Instrument(rebuilt)) {
+                                log::error!("Failed to emit rebuilt instrument: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to rebuild instrument for tick size change: {e}");
+                        }
+                    }
+                }
+
+                // Book epoch transition; see module docs.
+                let instrument_id = meta.instrument_id;
+                ctx.order_books.remove(&instrument_id);
+
+                if ctx.active_delta_subs.contains(&instrument_id) {
+                    ctx.pending_snapshot_after_tick_change.insert(instrument_id);
+                }
+            }
+
+            MarketWsMessage::NewMarket(nm) => {
+                if !ctx.subscribe_new_markets {
+                    log::trace!("Ignoring new market event (subscribe_new_markets=false)");
+                    return;
+                }
+
+                if let Some(ref nf) = ctx.new_market_filter
+                    && !nf.accept_new_market(&nm)
+                {
+                    log::debug!("New market slug={} rejected by new_market_filter", nm.slug);
+                    return;
+                }
+
+                let gamma_client = ctx.gamma_client.clone();
+                let filters = ctx.filters.clone();
+                let token_meta = ctx.token_meta.clone();
+                let instruments = ctx.instruments.clone();
+                let data_sender = ctx.data_sender.clone();
+                let clock = ctx.clock;
+                let cancellation = ctx.cancellation_token.clone();
+                let slug = nm.slug;
+                let active = nm.active;
+
+                get_runtime().spawn(async move {
+                    let fetch = gamma_client
+                        .request_instruments_by_slugs_with_retry(vec![slug.clone()]);
+
+                    let result = tokio::select! {
+                        r = fetch => r,
+                        () = cancellation.cancelled() => {
+                            log::debug!("New market fetch for '{slug}' cancelled during shutdown");
+                            return;
+                        }
+                    };
+
+                    match result {
+                        Ok(new_instruments) => {
+                            for inst in new_instruments {
+                                if cancellation.is_cancelled() {
+                                    log::debug!("New market processing cancelled during shutdown");
+                                    return;
+                                }
+
+                                if !filters.iter().all(|f| f.accept(&inst)) {
+                                    log::debug!("New market instrument {} filtered out", inst.id());
+                                    continue;
+                                }
+
+                                cache_instrument(&instruments, &token_meta, &inst);
+
+                                let instrument_id = inst.id();
+                                if let Err(e) = data_sender.send(DataEvent::Instrument(inst)) {
+                                    log::error!(
+                                        "Failed to emit new market instrument {instrument_id}: {e}"
+                                    );
+                                }
+
+                                // Emit instrument status based on WS active flag
+                                let ts_now = clock.get_time_ns();
+                                let action = if active {
+                                    MarketStatusAction::Trading
+                                } else {
+                                    MarketStatusAction::PreOpen
+                                };
+                                let status = InstrumentStatus::new(
+                                    instrument_id,
+                                    action,
+                                    ts_now,
+                                    ts_now,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                );
+
+                                if let Err(e) =
+                                    data_sender.send(DataEvent::InstrumentStatus(status))
+                                {
+                                    log::error!(
+                                        "Failed to emit instrument status for {instrument_id}: {e}"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => log::warn!(
+                            "Failed to fetch instruments for new market slug '{slug}' after retries: {e}"
+                        ),
+                    }
+                });
+            }
+
+            MarketWsMessage::MarketResolved(resolved) => {
+                log::info!(
+                    "Market resolved: {} winner={} ({})",
+                    resolved.market,
+                    resolved.winning_asset_id,
+                    resolved.winning_outcome
+                );
+
+                let ts_init = ctx.clock.get_time_ns();
+                let reason = Ustr::from(&format!(
+                    "Winner: {} ({})",
+                    resolved.winning_asset_id, resolved.winning_outcome
+                ));
+
+                for asset_id in &resolved.assets_ids {
+                    let token_id = Ustr::from(asset_id.as_str());
+                    if let Some(meta) = ctx.token_meta.get(&token_id) {
+                        let status = InstrumentStatus::new(
+                            meta.instrument_id,
+                            MarketStatusAction::Close,
+                            ts_init,
+                            ts_init,
+                            Some(reason),
+                            None,
+                            Some(false),
+                            None,
+                            None,
+                        );
+
+                        if let Err(e) = ctx.data_sender.send(DataEvent::InstrumentStatus(status)) {
+                            log::error!(
+                                "Failed to emit instrument status for {}: {e}",
+                                meta.instrument_id
+                            );
+                        }
+                    }
+                }
+            }
+
+            MarketWsMessage::BestBidAsk(bba) => {
+                log::trace!(
+                    "best_bid_ask for {}: bid={} ask={}",
+                    bba.asset_id,
+                    bba.best_bid,
+                    bba.best_ask
                 );
             }
         }
@@ -471,6 +1257,7 @@ impl DataClient for PolymarketDataClient {
         log::debug!("Resetting Polymarket data client: {}", self.client_id);
         self.is_connected.store(false, Ordering::Relaxed);
         self.cancellation_token = CancellationToken::new();
+
         for handle in self.tasks.drain(..) {
             handle.abort();
         }
@@ -490,9 +1277,19 @@ impl DataClient for PolymarketDataClient {
 
         log::info!("Connecting Polymarket data client");
 
+        log::info!("Bootstrapping instruments from Gamma API...");
         self.bootstrap_instruments().await?;
+        log::info!(
+            "Bootstrap complete, {} instruments loaded",
+            self.instruments.load().len(),
+        );
 
         self.ws_client.connect().await?;
+
+        if self.config.subscribe_new_markets {
+            log::info!("Subscribing to new markets...");
+            self.ws_client.subscribe_market(vec![]).await?;
+        }
 
         let rx = self
             .ws_client
@@ -500,6 +1297,7 @@ impl DataClient for PolymarketDataClient {
             .ok_or_else(|| anyhow::anyhow!("WS message receiver not available after connect"))?;
 
         self.spawn_message_handler(rx);
+        self.spawn_instrument_refresh_task();
 
         self.is_connected.store(true, Ordering::Relaxed);
         log::info!("Connected Polymarket data client");
@@ -534,7 +1332,220 @@ impl DataClient for PolymarketDataClient {
         !self.is_connected()
     }
 
-    fn subscribe_book_deltas(&mut self, cmd: &SubscribeBookDeltas) -> anyhow::Result<()> {
+    fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
+        let sender = self.data_sender.clone();
+        let instruments = self
+            .instruments
+            .load()
+            .values()
+            .filter(|instrument| instrument.id().venue == *POLYMARKET_VENUE)
+            .cloned()
+            .collect::<Vec<_>>();
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let venue = *POLYMARKET_VENUE;
+        let start_nanos = datetime_to_unix_nanos(request.start);
+        let end_nanos = datetime_to_unix_nanos(request.end);
+        let params = request.params;
+        let clock = self.clock;
+
+        get_runtime().spawn(async move {
+            let response = DataResponse::Instruments(InstrumentsResponse::new(
+                request_id,
+                client_id,
+                venue,
+                instruments,
+                start_nanos,
+                end_nanos,
+                clock.get_time_ns(),
+                params,
+            ));
+
+            if let Err(e) = sender.send(DataEvent::Response(response)) {
+                log::error!("Failed to send instruments response: {e}");
+            }
+        });
+
+        Ok(())
+    }
+
+    fn request_instrument(&self, request: RequestInstrument) -> anyhow::Result<()> {
+        let instrument_id = request.instrument_id;
+        let http = self.provider.http_client().clone();
+        let sender = self.data_sender.clone();
+        let instruments_cache = self.instruments.clone();
+        let token_meta = self.token_meta.clone();
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let request_id = request.request_id;
+        let start = request.start;
+        let end = request.end;
+        let params = request.params;
+        let clock = self.clock;
+
+        get_runtime().spawn(async move {
+            let condition_id = match extract_condition_id(&instrument_id) {
+                Ok(cid) => cid,
+                Err(e) => {
+                    log::error!("Failed to extract condition_id for {instrument_id}: {e}");
+                    return;
+                }
+            };
+
+            let query_params = GetGammaMarketsParams {
+                condition_ids: Some(condition_id),
+                ..Default::default()
+            };
+
+            let instrument = match http.request_instruments_by_params(query_params).await {
+                Ok(instruments) => instruments.into_iter().find(|i| i.id() == instrument_id),
+                Err(e) => {
+                    log::error!("Failed to fetch instrument {instrument_id} from Gamma API: {e}");
+                    return;
+                }
+            };
+
+            if let Some(inst) = instrument {
+                cache_instrument(&instruments_cache, &token_meta, &inst);
+
+                // Publish onto the data bus so other clients (e.g. the exec
+                // client's token map) can update from the same fetch.
+                if let Err(e) = sender.send(DataEvent::Instrument(inst.clone())) {
+                    log::warn!("Failed to publish instrument {instrument_id}: {e}");
+                }
+
+                let response = DataResponse::Instrument(Box::new(InstrumentResponse::new(
+                    request_id,
+                    client_id,
+                    instrument_id,
+                    inst,
+                    datetime_to_unix_nanos(start),
+                    datetime_to_unix_nanos(end),
+                    clock.get_time_ns(),
+                    params,
+                )));
+
+                if let Err(e) = sender.send(DataEvent::Response(response)) {
+                    log::error!("Failed to send instrument response: {e}");
+                }
+            } else {
+                log::error!("Instrument {instrument_id} not found on Polymarket");
+            }
+        });
+
+        Ok(())
+    }
+
+    fn request_book_snapshot(&self, request: RequestBookSnapshot) -> anyhow::Result<()> {
+        let instrument_id = request.instrument_id;
+        let instruments = self.instruments.load();
+        let instrument = instruments
+            .get(&instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found"))?;
+
+        let token_id = instrument.raw_symbol().as_str().to_string();
+        let price_precision = instrument.price_precision();
+        let size_precision = instrument.size_precision();
+
+        let clob_client = self.clob_public_client.clone();
+        let sender = self.data_sender.clone();
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let request_id = request.request_id;
+        let params = request.params;
+        let clock = self.clock;
+
+        get_runtime().spawn(async move {
+            match clob_client
+                .request_book_snapshot(instrument_id, &token_id, price_precision, size_precision)
+                .await
+                .context("failed to request book snapshot from Polymarket")
+            {
+                Ok(book) => {
+                    let response = DataResponse::Book(BookResponse::new(
+                        request_id,
+                        client_id,
+                        instrument_id,
+                        book,
+                        None,
+                        None,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send book snapshot response: {e}");
+                    }
+                }
+                Err(e) => log::error!("Book snapshot request failed: {e:?}"),
+            }
+        });
+
+        Ok(())
+    }
+
+    fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
+        let instrument_id = request.instrument_id;
+        let instruments = self.instruments.load();
+        let instrument = instruments
+            .get(&instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found"))?;
+
+        let condition_id = extract_condition_id(&instrument_id)?;
+        let token_id = instrument.raw_symbol().as_str().to_string();
+        let price_precision = instrument.price_precision();
+        let size_precision = instrument.size_precision();
+        let limit = request.limit.map(|n| n.get() as u32);
+
+        let data_api_client = self.data_api_client.clone();
+        let sender = self.data_sender.clone();
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let request_id = request.request_id;
+        let params = request.params;
+        let clock = self.clock;
+        let start_nanos = datetime_to_unix_nanos(request.start);
+        let end_nanos = datetime_to_unix_nanos(request.end);
+
+        get_runtime().spawn(async move {
+            match data_api_client
+                .request_trade_ticks(
+                    instrument_id,
+                    &condition_id,
+                    &token_id,
+                    price_precision,
+                    size_precision,
+                    limit,
+                )
+                .await
+                .context("failed to request trades from Polymarket Data API")
+            {
+                Ok(trades) => {
+                    let response = DataResponse::Trades(TradesResponse::new(
+                        request_id,
+                        client_id,
+                        instrument_id,
+                        trades,
+                        start_nanos,
+                        end_nanos,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send trades response: {e}");
+                    }
+                }
+                Err(e) => log::error!("Trade request failed for {instrument_id}: {e:?}"),
+            }
+        });
+
+        Ok(())
+    }
+
+    fn subscribe_instruments(&mut self, _cmd: SubscribeInstruments) -> anyhow::Result<()> {
+        log::debug!("subscribe_instruments: subscribed individually via data subscription methods");
+        Ok(())
+    }
+
+    fn subscribe_book_deltas(&mut self, cmd: SubscribeBookDeltas) -> anyhow::Result<()> {
         if cmd.book_type != BookType::L2_MBP {
             anyhow::bail!(
                 "Polymarket only supports L2_MBP order book deltas, received {:?}",
@@ -543,92 +1554,954 @@ impl DataClient for PolymarketDataClient {
         }
 
         let instrument_id = cmd.instrument_id;
-        let token_id = self.resolve_token_id(instrument_id)?;
+        let cached = self.instruments.load().contains_key(&instrument_id);
 
+        if !cached && !self.config.auto_load_missing_instruments {
+            anyhow::bail!(
+                "Instrument {instrument_id} not found, and `auto_load_missing_instruments` is disabled"
+            );
+        }
+
+        // Mark intent before routing so unsubscribe can race-safely clear it.
+        self.active_delta_subs.insert(instrument_id);
         self.order_books
             .entry(instrument_id)
             .or_insert_with(|| OrderBook::new(instrument_id, BookType::L2_MBP));
 
-        let needs_ws_sub = !self.has_any_market_sub(&instrument_id);
-        self.active_delta_subs.insert(instrument_id);
-
-        if needs_ws_sub {
-            self.subscribe_ws_market(token_id);
+        if !cached {
+            self.queue_pending_load(instrument_id);
+            return Ok(());
         }
 
-        log::info!("Subscribed to book deltas for {instrument_id}");
+        self.sync_ws_subscription(instrument_id);
+        log::debug!("Subscribed to book deltas for {instrument_id}");
         Ok(())
     }
 
-    fn subscribe_quotes(&mut self, cmd: &SubscribeQuotes) -> anyhow::Result<()> {
+    fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
-        let token_id = self.resolve_token_id(instrument_id)?;
+        let cached = self.instruments.load().contains_key(&instrument_id);
 
-        let needs_ws_sub = !self.has_any_market_sub(&instrument_id);
+        if !cached && !self.config.auto_load_missing_instruments {
+            anyhow::bail!(
+                "Instrument {instrument_id} not found, and `auto_load_missing_instruments` is disabled"
+            );
+        }
+
         self.active_quote_subs.insert(instrument_id);
 
-        if needs_ws_sub {
-            self.subscribe_ws_market(token_id);
+        if !cached {
+            self.queue_pending_load(instrument_id);
+            return Ok(());
         }
 
-        log::info!("Subscribed to quotes for {instrument_id}");
+        self.sync_ws_subscription(instrument_id);
+        log::debug!("Subscribed to quotes for {instrument_id}");
         Ok(())
     }
 
-    fn subscribe_trades(&mut self, cmd: &SubscribeTrades) -> anyhow::Result<()> {
+    fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
-        let token_id = self.resolve_token_id(instrument_id)?;
+        let cached = self.instruments.load().contains_key(&instrument_id);
 
-        let needs_ws_sub = !self.has_any_market_sub(&instrument_id);
-        self.active_trade_subs.insert(instrument_id);
-
-        if needs_ws_sub {
-            self.subscribe_ws_market(token_id);
+        if !cached && !self.config.auto_load_missing_instruments {
+            anyhow::bail!(
+                "Instrument {instrument_id} not found, and `auto_load_missing_instruments` is disabled"
+            );
         }
 
-        log::info!("Subscribed to trades for {instrument_id}");
+        self.active_trade_subs.insert(instrument_id);
+
+        if !cached {
+            self.queue_pending_load(instrument_id);
+            return Ok(());
+        }
+
+        self.sync_ws_subscription(instrument_id);
+        log::debug!("Subscribed to trades for {instrument_id}");
         Ok(())
     }
 
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         self.active_delta_subs.remove(&instrument_id);
-
-        if !self.has_any_market_sub(&instrument_id)
-            && let Ok(token_id) = self.resolve_token_id(instrument_id)
-        {
-            self.unsubscribe_ws_market(token_id);
-        }
-
-        log::info!("Unsubscribed from book deltas for {instrument_id}");
+        self.pending_snapshot_after_tick_change
+            .remove(&instrument_id);
+        self.drop_pending_if_unwanted(instrument_id);
+        self.drop_local_book_state_if_unwanted(instrument_id);
+        self.sync_ws_subscription(instrument_id);
+        log::debug!("Unsubscribed from book deltas for {instrument_id}");
         Ok(())
     }
 
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         self.active_quote_subs.remove(&instrument_id);
-
-        if !self.has_any_market_sub(&instrument_id)
-            && let Ok(token_id) = self.resolve_token_id(instrument_id)
-        {
-            self.unsubscribe_ws_market(token_id);
-        }
-
-        log::info!("Unsubscribed from quotes for {instrument_id}");
+        self.drop_pending_if_unwanted(instrument_id);
+        self.drop_local_book_state_if_unwanted(instrument_id);
+        self.sync_ws_subscription(instrument_id);
+        log::debug!("Unsubscribed from quotes for {instrument_id}");
         Ok(())
     }
 
     fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         self.active_trade_subs.remove(&instrument_id);
+        self.drop_pending_if_unwanted(instrument_id);
+        self.sync_ws_subscription(instrument_id);
+        log::debug!("Unsubscribed from trades for {instrument_id}");
+        Ok(())
+    }
+}
 
-        if !self.has_any_market_sub(&instrument_id)
-            && let Ok(token_id) = self.resolve_token_id(instrument_id)
-        {
-            self.unsubscribe_ws_market(token_id);
+#[cfg(test)]
+mod tests {
+    use nautilus_core::UnixNanos;
+    use nautilus_model::{
+        enums::AssetClass,
+        identifiers::{InstrumentId, Symbol},
+        instruments::BinaryOption,
+        types::{Currency, Price, Quantity},
+    };
+    use nautilus_network::retry::RetryConfig;
+    use rstest::rstest;
+
+    use super::*;
+    use crate::{
+        common::enums::PolymarketOrderSide,
+        websocket::{
+            client::WsSubscriptionHandle,
+            handler::HandlerCommand,
+            messages::{
+                MarketWsMessage, PolymarketBookLevel, PolymarketBookSnapshot, PolymarketQuote,
+                PolymarketQuotes, PolymarketTickSizeChange,
+            },
+        },
+    };
+
+    fn make_handle() -> (
+        WsSubscriptionHandle,
+        tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
+        (WsSubscriptionHandle::from_sender(tx), rx)
+    }
+
+    type ActiveSet = Arc<AtomicSet<InstrumentId>>;
+    type OpenTokens = Arc<AtomicSet<Ustr>>;
+    type WsMutex = Arc<tokio::sync::Mutex<()>>;
+
+    fn make_state() -> (ActiveSet, ActiveSet, ActiveSet, OpenTokens, WsMutex) {
+        (
+            Arc::new(AtomicSet::new()),
+            Arc::new(AtomicSet::new()),
+            Arc::new(AtomicSet::new()),
+            Arc::new(AtomicSet::new()),
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+    }
+
+    fn instrument_id() -> InstrumentId {
+        InstrumentId::from("0xCOND-0xTOKEN.POLYMARKET")
+    }
+
+    fn token_ustr() -> Ustr {
+        Ustr::from("0xCOND-0xTOKEN")
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn sync_ws_subscribes_when_intent_present_and_ws_closed() {
+        let (ws, mut rx) = make_handle();
+        let (quotes, deltas, trades, open, mutex) = make_state();
+
+        // Intent: quotes subscribed.
+        let inst = instrument_id();
+        quotes.insert(inst);
+
+        sync_ws_subscription_async(
+            inst,
+            inst.symbol.as_str().to_string(),
+            quotes.clone(),
+            deltas,
+            trades,
+            open.clone(),
+            mutex,
+            ws,
+        )
+        .await;
+
+        assert!(open.contains(&token_ustr()));
+
+        match rx.try_recv().expect("expected SubscribeMarket command") {
+            HandlerCommand::SubscribeMarket(ids) => {
+                assert_eq!(ids, vec![inst.symbol.as_str().to_string()]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn sync_ws_unsubscribes_when_intent_absent_and_ws_open() {
+        let (ws, mut rx) = make_handle();
+        let (quotes, deltas, trades, open, mutex) = make_state();
+
+        // WS currently open, but no caller wants it anymore.
+        let inst = instrument_id();
+        open.insert(token_ustr());
+
+        sync_ws_subscription_async(
+            inst,
+            inst.symbol.as_str().to_string(),
+            quotes,
+            deltas,
+            trades,
+            open.clone(),
+            mutex,
+            ws,
+        )
+        .await;
+
+        assert!(!open.contains(&token_ustr()));
+
+        match rx.try_recv().expect("expected UnsubscribeMarket command") {
+            HandlerCommand::UnsubscribeMarket(ids) => {
+                assert_eq!(ids, vec![inst.symbol.as_str().to_string()]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::intent_matches_open(true, true, false)]
+    #[case::no_intent_not_open(false, false, false)]
+    #[tokio::test]
+    async fn sync_ws_no_op_when_state_already_matches(
+        #[case] want: bool,
+        #[case] is_open_initial: bool,
+        #[case] expect_command: bool,
+    ) {
+        let (ws, mut rx) = make_handle();
+        let (quotes, deltas, trades, open, mutex) = make_state();
+
+        let inst = instrument_id();
+
+        if want {
+            quotes.insert(inst);
         }
 
-        log::info!("Unsubscribed from trades for {instrument_id}");
-        Ok(())
+        if is_open_initial {
+            open.insert(token_ustr());
+        }
+
+        sync_ws_subscription_async(
+            inst,
+            inst.symbol.as_str().to_string(),
+            quotes,
+            deltas,
+            trades,
+            open.clone(),
+            mutex,
+            ws,
+        )
+        .await;
+
+        // State is preserved either way.
+        assert_eq!(open.contains(&token_ustr()), is_open_initial);
+        assert_eq!(rx.try_recv().is_ok(), expect_command);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn sync_ws_rolls_back_open_tokens_on_send_failure() {
+        // Drop the receiver so the channel send fails.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
+        drop(rx);
+        let ws = WsSubscriptionHandle::from_sender(tx);
+
+        let (quotes, deltas, trades, open, mutex) = make_state();
+
+        let inst = instrument_id();
+        quotes.insert(inst);
+
+        sync_ws_subscription_async(
+            inst,
+            inst.symbol.as_str().to_string(),
+            quotes,
+            deltas,
+            trades,
+            open.clone(),
+            mutex,
+            ws,
+        )
+        .await;
+
+        // Send failed, so the tracked WS state must be rolled back.
+        assert!(!open.contains(&token_ustr()));
+    }
+
+    #[rstest]
+    #[case::any_kind(true, false, false)]
+    #[case::another_kind(false, true, false)]
+    #[case::third_kind(false, false, true)]
+    #[tokio::test]
+    async fn sync_ws_opens_for_any_active_kind(#[case] q: bool, #[case] d: bool, #[case] t: bool) {
+        let (ws, mut rx) = make_handle();
+        let (quotes, deltas, trades, open, mutex) = make_state();
+
+        let inst = instrument_id();
+
+        if q {
+            quotes.insert(inst);
+        }
+
+        if d {
+            deltas.insert(inst);
+        }
+
+        if t {
+            trades.insert(inst);
+        }
+
+        sync_ws_subscription_async(
+            inst,
+            inst.symbol.as_str().to_string(),
+            quotes,
+            deltas,
+            trades,
+            open.clone(),
+            mutex,
+            ws,
+        )
+        .await;
+
+        assert!(open.contains(&token_ustr()));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HandlerCommand::SubscribeMarket(_))
+        ));
+    }
+
+    fn stub_instrument(
+        raw_symbol: &str,
+        price_increment: Price,
+        size_increment: Quantity,
+    ) -> InstrumentAny {
+        let price_precision = price_increment.precision;
+        let size_precision = size_increment.precision;
+        InstrumentAny::BinaryOption(BinaryOption::new(
+            InstrumentId::from(format!("{raw_symbol}.POLYMARKET").as_str()),
+            Symbol::new(raw_symbol),
+            AssetClass::Alternative,
+            Currency::pUSD(),
+            UnixNanos::default(),
+            UnixNanos::from(u64::MAX),
+            price_precision,
+            size_precision,
+            price_increment,
+            size_increment,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        ))
+    }
+
+    #[rstest]
+    #[case::p3_s2("token-a", Price::from("0.001"), Quantity::from("0.01"))]
+    #[case::p5_s4("token-b", Price::from("0.00001"), Quantity::from("0.0001"))]
+    fn cache_instrument_writes_both_maps(
+        #[case] raw_symbol: &str,
+        #[case] price_increment: Price,
+        #[case] size_increment: Quantity,
+    ) {
+        let instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>> = Arc::new(AtomicMap::new());
+        let token_meta: Arc<DashMap<Ustr, TokenMeta>> = Arc::new(DashMap::new());
+        let inst = stub_instrument(raw_symbol, price_increment, size_increment);
+        let expected_id = inst.id();
+        let expected_token = Ustr::from(raw_symbol);
+        let expected_price_precision = price_increment.precision;
+        let expected_size_precision = size_increment.precision;
+
+        cache_instrument(&instruments, &token_meta, &inst);
+
+        let loaded = instruments.load();
+        let cached = loaded
+            .get(&expected_id)
+            .expect("instrument inserted into live cache");
+        assert_eq!(cached.id(), expected_id);
+        assert_eq!(cached.raw_symbol().as_str(), raw_symbol);
+
+        let meta = token_meta
+            .get(&expected_token)
+            .expect("token_meta inserted for raw_symbol");
+        assert_eq!(meta.instrument_id, expected_id);
+        assert_eq!(meta.price_precision, expected_price_precision);
+        assert_eq!(meta.size_precision, expected_size_precision);
+    }
+
+    #[rstest]
+    fn cache_instrument_overwrites_precisions_on_second_call() {
+        let instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>> = Arc::new(AtomicMap::new());
+        let token_meta: Arc<DashMap<Ustr, TokenMeta>> = Arc::new(DashMap::new());
+        let raw_symbol = "token-overwrite";
+
+        let first = stub_instrument(raw_symbol, Price::from("0.01"), Quantity::from("0.1"));
+        cache_instrument(&instruments, &token_meta, &first);
+
+        let second = stub_instrument(raw_symbol, Price::from("0.0001"), Quantity::from("0.001"));
+        cache_instrument(&instruments, &token_meta, &second);
+
+        let meta = token_meta
+            .get(&Ustr::from(raw_symbol))
+            .expect("token_meta present after overwrite");
+        assert_eq!(meta.price_precision, 4);
+        assert_eq!(meta.size_precision, 3);
+        assert_eq!(token_meta.len(), 1);
+        assert_eq!(instruments.load().len(), 1);
+    }
+
+    #[rstest]
+    fn cache_instrument_maintains_dual_cache_invariant() {
+        let instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>> = Arc::new(AtomicMap::new());
+        let token_meta: Arc<DashMap<Ustr, TokenMeta>> = Arc::new(DashMap::new());
+
+        let samples = [
+            stub_instrument("token-1", Price::from("0.001"), Quantity::from("0.01")),
+            stub_instrument("token-2", Price::from("0.0001"), Quantity::from("0.01")),
+            stub_instrument("token-3", Price::from("0.00001"), Quantity::from("0.001")),
+        ];
+
+        for inst in &samples {
+            cache_instrument(&instruments, &token_meta, inst);
+        }
+
+        let loaded = instruments.load();
+        assert_eq!(loaded.len(), samples.len());
+        for inst in loaded.values() {
+            let token_id = Ustr::from(inst.raw_symbol().as_str());
+            let meta = token_meta
+                .get(&token_id)
+                .unwrap_or_else(|| panic!("missing token_meta for {token_id}"));
+            assert_eq!(meta.instrument_id, inst.id());
+        }
+    }
+
+    fn make_ws_ctx() -> (
+        WsMessageContext,
+        tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    ) {
+        let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let gamma_client = PolymarketGammaHttpClient::new(
+            Some("http://localhost".to_string()),
+            5,
+            RetryConfig::default(),
+        )
+        .expect("gamma client");
+
+        let ctx = WsMessageContext {
+            clock: get_atomic_clock_realtime(),
+            data_sender: data_tx,
+            token_meta: Arc::new(DashMap::new()),
+            instruments: Arc::new(AtomicMap::new()),
+            gamma_client,
+            filters: vec![],
+            order_books: Arc::new(DashMap::new()),
+            last_quotes: Arc::new(DashMap::new()),
+            active_quote_subs: Arc::new(AtomicSet::new()),
+            active_delta_subs: Arc::new(AtomicSet::new()),
+            active_trade_subs: Arc::new(AtomicSet::new()),
+            pending_snapshot_after_tick_change: Arc::new(AtomicSet::new()),
+            subscribe_new_markets: false,
+            new_market_filter: None,
+            cancellation_token: CancellationToken::new(),
+        };
+
+        (ctx, data_rx)
+    }
+
+    fn seed_instrument(
+        ctx: &WsMessageContext,
+        raw_symbol: &str,
+        price_increment: Price,
+        size_increment: Quantity,
+    ) -> InstrumentAny {
+        let inst = stub_instrument(raw_symbol, price_increment, size_increment);
+        cache_instrument(&ctx.instruments, &ctx.token_meta, &inst);
+        inst
+    }
+
+    fn level(price: &str, size: &str) -> PolymarketBookLevel {
+        PolymarketBookLevel {
+            price: price.to_string(),
+            size: size.to_string(),
+        }
+    }
+
+    fn make_snapshot(market: &str, asset_id: &str, prices: &[(&str, &str)]) -> MarketWsMessage {
+        let mid = prices.len() / 2;
+        let bids = prices[..mid].iter().map(|(p, s)| level(p, s)).collect();
+        let asks = prices[mid..].iter().map(|(p, s)| level(p, s)).collect();
+        MarketWsMessage::Book(PolymarketBookSnapshot {
+            market: Ustr::from(market),
+            asset_id: Ustr::from(asset_id),
+            bids,
+            asks,
+            timestamp: "1700000000000".to_string(),
+        })
+    }
+
+    fn make_tick_change(market: &str, asset_id: &str, old: &str, new: &str) -> MarketWsMessage {
+        MarketWsMessage::TickSizeChange(PolymarketTickSizeChange {
+            market: Ustr::from(market),
+            asset_id: Ustr::from(asset_id),
+            new_tick_size: new.to_string(),
+            old_tick_size: old.to_string(),
+            timestamp: "1700000001000".to_string(),
+        })
+    }
+
+    fn make_price_change(market: &str, asset_id: &str, price: &str, size: &str) -> MarketWsMessage {
+        MarketWsMessage::PriceChange(PolymarketQuotes {
+            market: Ustr::from(market),
+            price_changes: vec![PolymarketQuote {
+                asset_id: Ustr::from(asset_id),
+                price: price.to_string(),
+                side: PolymarketOrderSide::Buy,
+                size: size.to_string(),
+                hash: String::new(),
+                best_bid: None,
+                best_ask: None,
+            }],
+            timestamp: "1700000002000".to_string(),
+        })
+    }
+
+    #[rstest]
+    fn tick_size_change_clears_book_and_marks_pending() {
+        // Coarsens 0.001 -> 0.01. last_quote is preserved (carried forward by
+        // parse_quote_from_price_change). raw_symbol == asset_id because
+        // token_meta is keyed on raw_symbol.
+        let asset_id_str = "0xTOKEN";
+        let token_ustr = Ustr::from(asset_id_str);
+        let market = "0xMARKET";
+
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let inst = seed_instrument(
+            &ctx,
+            asset_id_str,
+            Price::from("0.001"),
+            Quantity::from("0.01"),
+        );
+        let instrument_id = inst.id();
+        ctx.active_delta_subs.insert(instrument_id);
+
+        // Seed last_quote so we can assert it survives the tick-size change.
+        let prior_quote = QuoteTick::new(
+            instrument_id,
+            Price::from("0.504"),
+            Price::from("0.506"),
+            Quantity::from("5.00"),
+            Quantity::from("8.00"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+        ctx.last_quotes.insert(instrument_id, prior_quote);
+
+        let snap = make_snapshot(
+            market,
+            asset_id_str,
+            &[
+                ("0.501", "10"),
+                ("0.504", "5"),
+                ("0.506", "8"),
+                ("0.509", "12"),
+            ],
+        );
+        PolymarketDataClient::handle_market_message(snap, &ctx);
+        assert!(ctx.order_books.contains_key(&instrument_id));
+        // Drain the snapshot DataEvents we just produced so the assertion
+        // below only sees what the tick-size change emits.
+        while data_rx.try_recv().is_ok() {}
+
+        let change = make_tick_change(market, asset_id_str, "0.001", "0.01");
+        PolymarketDataClient::handle_market_message(change, &ctx);
+
+        assert!(!ctx.order_books.contains_key(&instrument_id));
+        // last_quote is intentionally preserved across the epoch.
+        assert!(ctx.last_quotes.contains_key(&instrument_id));
+        assert!(
+            ctx.pending_snapshot_after_tick_change
+                .contains(&instrument_id)
+        );
+
+        let meta = ctx.token_meta.get(&token_ustr).expect("token_meta");
+        assert_eq!(meta.price_precision, 2);
+
+        let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|e| matches!(e, DataEvent::Instrument(_))),
+            "expected rebuilt instrument event, found: {events:?}",
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, DataEvent::Data(_))),
+            "tick size change must not emit Data events: {events:?}",
+        );
+    }
+
+    #[rstest]
+    fn pending_drops_price_change_until_snapshot() {
+        // Acceptance criterion 4: a price_change arriving while pending
+        // must be dropped; the next snapshot reseeds the book and clears
+        // the pending flag.
+        let asset_id_str = "0xTOKEN2";
+        let market = "0xMARKET";
+
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let inst = seed_instrument(
+            &ctx,
+            asset_id_str,
+            Price::from("0.01"),
+            Quantity::from("0.01"),
+        );
+        let instrument_id = inst.id();
+        ctx.active_delta_subs.insert(instrument_id);
+        ctx.pending_snapshot_after_tick_change.insert(instrument_id);
+
+        let pc = make_price_change(market, asset_id_str, "0.50", "20");
+        PolymarketDataClient::handle_market_message(pc, &ctx);
+
+        assert!(!ctx.order_books.contains_key(&instrument_id));
+        let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
+        assert!(
+            events.is_empty(),
+            "price_change while pending must not emit any events: {events:?}",
+        );
+
+        let snap = make_snapshot(
+            market,
+            asset_id_str,
+            &[("0.45", "5"), ("0.49", "10"), ("0.51", "8"), ("0.55", "12")],
+        );
+        PolymarketDataClient::handle_market_message(snap, &ctx);
+
+        assert!(
+            !ctx.pending_snapshot_after_tick_change
+                .contains(&instrument_id)
+        );
+        assert!(ctx.order_books.contains_key(&instrument_id));
+    }
+
+    #[rstest]
+    fn tick_size_change_noop_preserves_book_and_quote() {
+        // Same tick_size on both sides must be ignored, not treated as an epoch.
+        let asset_id_str = "0xTOKEN_NOOP";
+        let token_ustr = Ustr::from(asset_id_str);
+        let market = "0xMARKET";
+
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let inst = seed_instrument(
+            &ctx,
+            asset_id_str,
+            Price::from("0.01"),
+            Quantity::from("0.01"),
+        );
+        let instrument_id = inst.id();
+        ctx.active_delta_subs.insert(instrument_id);
+
+        let snap = make_snapshot(
+            market,
+            asset_id_str,
+            &[("0.50", "10"), ("0.54", "5"), ("0.56", "8"), ("0.59", "12")],
+        );
+        PolymarketDataClient::handle_market_message(snap, &ctx);
+        let book_ts_before = ctx
+            .order_books
+            .get(&instrument_id)
+            .expect("book entry")
+            .ts_last;
+
+        while data_rx.try_recv().is_ok() {}
+
+        let change = make_tick_change(market, asset_id_str, "0.01", "0.01");
+        PolymarketDataClient::handle_market_message(change, &ctx);
+
+        let book_after = ctx.order_books.get(&instrument_id).expect("book entry");
+        assert_eq!(book_after.ts_last, book_ts_before);
+        assert!(
+            !ctx.pending_snapshot_after_tick_change
+                .contains(&instrument_id)
+        );
+        let meta = ctx.token_meta.get(&token_ustr).expect("token_meta");
+        assert_eq!(meta.price_precision, 2);
+        let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
+        assert!(
+            events.is_empty(),
+            "no-op tick change must not emit events: {events:?}",
+        );
+    }
+
+    #[rstest]
+    fn tick_size_change_same_precision_different_value_triggers_epoch() {
+        // Regression lock: a precision-only no-op check would skip 0.005 -> 0.001
+        // (both precision 3) even though the tick value really changed.
+        let asset_id_str = "0xTOKEN_VALUE";
+        let token_ustr = Ustr::from(asset_id_str);
+        let market = "0xMARKET";
+
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let inst = seed_instrument(
+            &ctx,
+            asset_id_str,
+            Price::from("0.005"),
+            Quantity::from("0.01"),
+        );
+        let instrument_id = inst.id();
+        ctx.active_delta_subs.insert(instrument_id);
+        ctx.order_books.insert(
+            instrument_id,
+            OrderBook::new(instrument_id, BookType::L2_MBP),
+        );
+
+        let change = make_tick_change(market, asset_id_str, "0.005", "0.001");
+        PolymarketDataClient::handle_market_message(change, &ctx);
+
+        assert!(!ctx.order_books.contains_key(&instrument_id));
+        assert!(
+            ctx.pending_snapshot_after_tick_change
+                .contains(&instrument_id)
+        );
+        let meta = ctx.token_meta.get(&token_ustr).expect("token_meta");
+        assert_eq!(meta.price_precision, 3);
+
+        let rebuilt = ctx
+            .instruments
+            .load()
+            .get(&instrument_id)
+            .cloned()
+            .expect("rebuilt instrument");
+        assert_eq!(rebuilt.price_increment(), Price::from("0.001"));
+
+        let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|e| matches!(e, DataEvent::Instrument(_))),
+            "expected rebuilt instrument event, found: {events:?}",
+        );
+    }
+
+    #[rstest]
+    fn tick_size_change_does_not_mark_pending_for_trade_only_sub() {
+        // Trade-only subs don't read the book; pending would be dead state.
+        let asset_id_str = "0xTOKEN6";
+        let market = "0xMARKET";
+
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let inst = seed_instrument(
+            &ctx,
+            asset_id_str,
+            Price::from("0.001"),
+            Quantity::from("0.01"),
+        );
+        let instrument_id = inst.id();
+        ctx.active_trade_subs.insert(instrument_id);
+
+        let change = make_tick_change(market, asset_id_str, "0.001", "0.01");
+        PolymarketDataClient::handle_market_message(change, &ctx);
+
+        assert!(
+            !ctx.pending_snapshot_after_tick_change
+                .contains(&instrument_id)
+        );
+        let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|e| matches!(e, DataEvent::Instrument(_))),
+            "instrument update must still be emitted: {events:?}",
+        );
+    }
+
+    #[rstest]
+    fn pending_persists_when_snapshot_has_corrupt_level() {
+        // parse_book_snapshot must fail on a malformed mid-book level; pending
+        // stays set even though parse_quote_from_snapshot succeeds on the top.
+        let asset_id_str = "0xTOKEN7";
+
+        let (ctx, _data_rx) = make_ws_ctx();
+        let inst = seed_instrument(
+            &ctx,
+            asset_id_str,
+            Price::from("0.01"),
+            Quantity::from("0.01"),
+        );
+        let instrument_id = inst.id();
+        ctx.active_delta_subs.insert(instrument_id);
+        ctx.active_quote_subs.insert(instrument_id);
+        ctx.pending_snapshot_after_tick_change.insert(instrument_id);
+
+        let snap = MarketWsMessage::Book(PolymarketBookSnapshot {
+            market: Ustr::from("0xMARKET"),
+            asset_id: Ustr::from(asset_id_str),
+            bids: vec![level("not-a-number", "1"), level("0.49", "10")],
+            asks: vec![level("0.51", "8"), level("0.55", "12")],
+            timestamp: "1700000000000".to_string(),
+        });
+        PolymarketDataClient::handle_market_message(snap, &ctx);
+
+        assert!(
+            ctx.pending_snapshot_after_tick_change
+                .contains(&instrument_id)
+        );
+        assert!(!ctx.order_books.contains_key(&instrument_id));
+    }
+
+    #[rstest]
+    fn price_change_emits_delta_when_not_pending() {
+        // Positive complement to pending_drops_price_change_until_snapshot.
+        let asset_id_str = "0xTOKEN10";
+        let market = "0xMARKET";
+
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let inst = seed_instrument(
+            &ctx,
+            asset_id_str,
+            Price::from("0.01"),
+            Quantity::from("0.01"),
+        );
+        let instrument_id = inst.id();
+        ctx.active_delta_subs.insert(instrument_id);
+        ctx.order_books.insert(
+            instrument_id,
+            OrderBook::new(instrument_id, BookType::L2_MBP),
+        );
+
+        let pc = make_price_change(market, asset_id_str, "0.50", "20");
+        PolymarketDataClient::handle_market_message(pc, &ctx);
+
+        let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DataEvent::Data(NautilusData::Deltas(_)))),
+            "delta must be emitted on the not-pending happy path: {events:?}",
+        );
+
+        let book = ctx.order_books.get(&instrument_id).expect("book entry");
+        assert_eq!(book.best_bid_price(), Some(Price::from("0.50")));
+        assert_eq!(book.best_bid_size(), Some(Quantity::from("20.00")));
+    }
+
+    #[rstest]
+    fn quote_path_open_during_pending_window() {
+        // Only the delta arm is gated. Unchanged ask_size carries forward
+        // from the preserved last_quote rather than defaulting to zero.
+        let asset_id_str = "0xTOKEN8";
+        let market = "0xMARKET";
+
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let inst = seed_instrument(
+            &ctx,
+            asset_id_str,
+            Price::from("0.01"),
+            Quantity::from("0.01"),
+        );
+        let instrument_id = inst.id();
+        ctx.active_delta_subs.insert(instrument_id);
+        ctx.active_quote_subs.insert(instrument_id);
+        ctx.pending_snapshot_after_tick_change.insert(instrument_id);
+
+        // Sizes must use the instrument's size_precision; QuoteTick::new_checked
+        // rejects cross-precision construction.
+        let prior = QuoteTick::new(
+            instrument_id,
+            Price::from("0.49"),
+            Price::from("0.51"),
+            Quantity::from("100.00"),
+            Quantity::from("75.00"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+        ctx.last_quotes.insert(instrument_id, prior);
+
+        let pc = MarketWsMessage::PriceChange(PolymarketQuotes {
+            market: Ustr::from(market),
+            price_changes: vec![PolymarketQuote {
+                asset_id: Ustr::from(asset_id_str),
+                price: "0.50".to_string(),
+                side: PolymarketOrderSide::Buy,
+                size: "20".to_string(),
+                hash: String::new(),
+                best_bid: Some("0.50".to_string()),
+                best_ask: Some("0.52".to_string()),
+            }],
+            timestamp: "1700000003000".to_string(),
+        });
+        PolymarketDataClient::handle_market_message(pc, &ctx);
+
+        let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, DataEvent::Data(NautilusData::Deltas(_)))),
+            "delta must be dropped while pending: {events:?}",
+        );
+        let emitted_quote = events
+            .iter()
+            .find_map(|e| match e {
+                DataEvent::Data(NautilusData::Quote(q)) => Some(q),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected quote event, found: {events:?}"));
+        assert_eq!(emitted_quote.bid_size, Quantity::from("20.00"));
+        // ask_size carried forward from the prior quote, not defaulted to zero.
+        assert_eq!(emitted_quote.ask_size, Quantity::from("75.00"));
+    }
+
+    #[rstest]
+    fn pending_persists_when_snapshot_fails_to_seed() {
+        // An empty snapshot must leave pending in place.
+        let asset_id_str = "0xTOKEN5";
+        let market = "0xMARKET";
+
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let inst = seed_instrument(
+            &ctx,
+            asset_id_str,
+            Price::from("0.01"),
+            Quantity::from("0.01"),
+        );
+        let instrument_id = inst.id();
+        ctx.active_delta_subs.insert(instrument_id);
+        ctx.pending_snapshot_after_tick_change.insert(instrument_id);
+
+        let empty = MarketWsMessage::Book(PolymarketBookSnapshot {
+            market: Ustr::from(market),
+            asset_id: Ustr::from(asset_id_str),
+            bids: vec![],
+            asks: vec![],
+            timestamp: "1700000000000".to_string(),
+        });
+        PolymarketDataClient::handle_market_message(empty, &ctx);
+
+        assert!(
+            ctx.pending_snapshot_after_tick_change
+                .contains(&instrument_id)
+        );
+        let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
+        assert!(
+            !events.iter().any(|e| matches!(e, DataEvent::Data(_))),
+            "empty snapshot must not emit Data events: {events:?}",
+        );
     }
 }

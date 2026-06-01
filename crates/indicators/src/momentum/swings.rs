@@ -28,6 +28,10 @@ const MAX_PERIOD: usize = 1_024;
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators")
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.indicators")
+)]
 pub struct Swings {
     pub period: usize,
     pub direction: i64,
@@ -48,7 +52,7 @@ pub struct Swings {
 
 impl Display for Swings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}({})", self.name(), self.period,)
+        write!(f, "{}({})", self.name(), self.period)
     }
 }
 

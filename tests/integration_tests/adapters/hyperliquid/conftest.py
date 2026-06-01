@@ -183,6 +183,7 @@ def mock_http_client():
     mock.request_account_state = AsyncMock(return_value=mock_account_state)
 
     mock.request_order_status_reports = AsyncMock(return_value=[])
+    mock.request_order_status_report = AsyncMock(return_value=None)
     mock.request_fill_reports = AsyncMock(return_value=[])
     mock.request_position_status_reports = AsyncMock(return_value=[])
 
@@ -192,9 +193,16 @@ def mock_http_client():
     mock.modify_order = AsyncMock()
     mock.cancel_order = AsyncMock()
 
+    _ok_response = '{"status":"ok","response":{"type":"default"}}'
+    mock.submit_split_outcome = AsyncMock(return_value=_ok_response)
+    mock.submit_merge_outcome = AsyncMock(return_value=_ok_response)
+    mock.submit_merge_question = AsyncMock(return_value=_ok_response)
+    mock.submit_negate_outcome = AsyncMock(return_value=_ok_response)
+
     mock.info_meta = AsyncMock(return_value=MagicMock())
     mock.info_l2_book = AsyncMock(return_value=MagicMock())
     mock.info_clearinghouse_state = AsyncMock(return_value={})
+    mock.build_all_dex_asset_ctxs_instrument_ids = AsyncMock(return_value={})
 
     return mock
 
@@ -207,6 +215,12 @@ def _create_ws_mock() -> MagicMock:
     mock.connect = AsyncMock()
     mock.close = AsyncMock()
     mock.disconnect = AsyncMock()
+    mock.set_post_timeout = MagicMock()
+    mock.submit_order = AsyncMock()
+    mock.submit_orders = AsyncMock()
+    mock.modify_order = AsyncMock()
+    mock.cancel_order = AsyncMock()
+    mock.cancel_orders = AsyncMock(return_value=[])
     mock.get_cloid_mapping = MagicMock(return_value=None)
     mock.subscribe_book = AsyncMock()
     mock.subscribe_trades = AsyncMock()
@@ -215,6 +229,10 @@ def _create_ws_mock() -> MagicMock:
     mock.subscribe_mark_prices = AsyncMock()
     mock.subscribe_index_prices = AsyncMock()
     mock.subscribe_funding_rates = AsyncMock()
+    mock.subscribe_open_interest = AsyncMock()
+    mock.subscribe_all_dexs_asset_ctxs = AsyncMock()
+    mock.subscribe_all_mids = AsyncMock()
+    mock.subscribe_all_mids_with_dex = AsyncMock()
     mock.unsubscribe_book = AsyncMock()
     mock.unsubscribe_trades = AsyncMock()
     mock.unsubscribe_quotes = AsyncMock()
@@ -222,7 +240,11 @@ def _create_ws_mock() -> MagicMock:
     mock.unsubscribe_mark_prices = AsyncMock()
     mock.unsubscribe_index_prices = AsyncMock()
     mock.unsubscribe_funding_rates = AsyncMock()
-    mock.cache_instrument = MagicMock()
+    mock.unsubscribe_open_interest = AsyncMock()
+    mock.unsubscribe_all_dexs_asset_ctxs = AsyncMock()
+    mock.unsubscribe_all_mids = AsyncMock()
+    mock.unsubscribe_all_mids_with_dex = AsyncMock()
+    mock.cache_all_dex_asset_ctxs_instrument_ids = MagicMock()
     mock.cache_instruments = MagicMock()
     mock.subscribe_order_updates = AsyncMock()
     mock.subscribe_user_events = AsyncMock()

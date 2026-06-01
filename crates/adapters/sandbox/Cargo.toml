@@ -18,7 +18,7 @@ workspace = true
 
 [lib]
 name = "nautilus_sandbox"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [features]
 default = ["high-precision"]
@@ -35,13 +35,16 @@ python = [
   "nautilus-core/python",
   "nautilus-execution/python",
   "nautilus-model/python",
+  "nautilus-system/python",
   "pyo3",
+  "pyo3-stub-gen",
 ]
 high-precision = ["nautilus-model/high-precision"]
 example-databento = [
   "dep:nautilus-databento",
   "dep:nautilus-live",
   "dep:dotenvy",
+  "nautilus-live/node",
 ]
 
 [package.metadata.docs.rs]
@@ -53,16 +56,15 @@ nautilus-common = { workspace = true, features = ["live"] }
 nautilus-core = { workspace = true }
 nautilus-execution = { workspace = true }
 nautilus-model = { workspace = true }
-nautilus-system = { workspace = true }
+nautilus-system = { workspace = true, optional = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-derive_builder = { workspace = true }
+bon = { workspace = true }
 log = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
-thiserror = { workspace = true }
 ustr = { workspace = true }
 
 nautilus-databento = { workspace = true, features = ["live"], optional = true }
@@ -70,15 +72,24 @@ nautilus-live = { workspace = true, optional = true }
 
 dotenvy = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-data = { workspace = true }
 nautilus-testkit = { workspace = true }
+nautilus-trading = { workspace = true }
 
 rstest = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
 
 [[example]]
 name = "databento-cme-sandbox"
 path = "examples/databento_cme.rs"
 required-features = ["example-databento"]
 doc = false
+
+[[test]]
+name = "python"
+path = "tests/python.rs"
+required-features = ["python"]

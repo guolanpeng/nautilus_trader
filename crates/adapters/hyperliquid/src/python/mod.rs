@@ -15,6 +15,11 @@
 
 //! Python bindings from `pyo3`.
 
+#![expect(
+    clippy::missing_errors_doc,
+    reason = "errors documented on underlying Rust methods"
+)]
+
 pub mod config;
 pub mod enums;
 pub mod factories;
@@ -22,44 +27,40 @@ pub mod http;
 pub mod urls;
 pub mod websocket;
 
+use nautilus_common::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
-use nautilus_model::identifiers::ClientOrderId;
-use nautilus_system::{
-    factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
-    get_global_pyo3_registry,
-};
+use nautilus_model::{data::ensure_rust_extractor_registered, identifiers::ClientOrderId};
+use nautilus_system::get_global_pyo3_registry;
 use pyo3::prelude::*;
 
 use crate::{
-    common::builder_fee::revoke_from_env,
+    account::resolve_execution_account_address,
+    common::{
+        consts::{HYPERLIQUID, HYPERLIQUID_POST_ONLY_WOULD_MATCH},
+        enums::{
+            HyperliquidConditionalOrderType, HyperliquidEnvironment, HyperliquidProductType,
+            HyperliquidTpSl, HyperliquidTrailingOffsetType,
+        },
+    },
     config::{HyperliquidDataClientConfig, HyperliquidExecClientConfig},
+    data_types::{
+        HyperliquidAllDexsAssetCtxs, HyperliquidAllMids, HyperliquidOpenInterest,
+        register_hyperliquid_custom_data,
+    },
     factories::{
         HyperliquidDataClientFactory, HyperliquidExecFactoryConfig,
         HyperliquidExecutionClientFactory,
     },
-    http::models::Cloid,
+    http::{HyperliquidHttpClient, models::Cloid},
+    websocket::HyperliquidWebSocketClient,
 };
 
-#[pyfunction]
-#[pyo3(name = "revoke_hyperliquid_builder_fee", signature = (non_interactive = false))]
-fn py_revoke_hyperliquid_builder_fee(non_interactive: bool) -> PyResult<bool> {
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| to_pyruntime_err(format!("Failed to create runtime: {e}")))?;
-
-        Ok(runtime.block_on(revoke_from_env(non_interactive)))
-    })
-    .join()
-    .map_err(|_| to_pyruntime_err("Thread panicked"))?
-}
-
-/// Compute the cloid (hex hash) from a client_order_id.
+/// Compute the deterministic CLOID from a client_order_id.
 ///
-/// The cloid is a keccak256 hash of the client_order_id, truncated to 16 bytes,
-/// represented as a hex string with `0x` prefix.
+/// The CLOID is derived from a keccak256 hash of the client_order_id,
+/// truncated to 16 bytes, represented as a hex string with `0x` prefix.
 #[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.hyperliquid")]
 #[pyo3(name = "hyperliquid_cloid_from_client_order_id")]
 fn py_hyperliquid_cloid_from_client_order_id(client_order_id: ClientOrderId) -> String {
     Cloid::from_client_order_id(client_order_id).to_hex()
@@ -71,14 +72,31 @@ fn py_hyperliquid_cloid_from_client_order_id(client_order_id: ClientOrderId) -> 
 ///
 /// Returns an error if the symbol does not contain a valid Hyperliquid product type suffix.
 #[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.hyperliquid")]
 #[pyo3(name = "hyperliquid_product_type_from_symbol")]
-fn py_hyperliquid_product_type_from_symbol(
-    symbol: &str,
-) -> PyResult<crate::common::HyperliquidProductType> {
-    crate::common::HyperliquidProductType::from_symbol(symbol).map_err(to_pyvalue_err)
+fn py_hyperliquid_product_type_from_symbol(symbol: &str) -> PyResult<HyperliquidProductType> {
+    HyperliquidProductType::from_symbol(symbol).map_err(to_pyvalue_err)
 }
 
-#[allow(clippy::needless_pass_by_value)]
+/// Resolve the Hyperliquid execution account address for REST queries and WebSocket subscriptions.
+///
+/// # Errors
+///
+/// Returns an error if the selected vault address or private key is invalid.
+#[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.hyperliquid")]
+#[pyo3(name = "hyperliquid_resolve_execution_account_address", signature = (private_key=None, vault_address=None, account_address=None, environment=HyperliquidEnvironment::Mainnet))]
+fn py_hyperliquid_resolve_execution_account_address(
+    private_key: Option<&str>,
+    vault_address: Option<&str>,
+    account_address: Option<&str>,
+    environment: HyperliquidEnvironment,
+) -> PyResult<Option<String>> {
+    resolve_execution_account_address(private_key, vault_address, account_address, environment)
+        .map_err(to_pyvalue_err)
+}
+
+#[expect(clippy::needless_pass_by_value)]
 fn extract_hyperliquid_data_factory(
     py: Python<'_>,
     factory: Py<PyAny>,
@@ -91,7 +109,7 @@ fn extract_hyperliquid_data_factory(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn extract_hyperliquid_exec_factory(
     py: Python<'_>,
     factory: Py<PyAny>,
@@ -104,7 +122,7 @@ fn extract_hyperliquid_exec_factory(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn extract_hyperliquid_data_config(
     py: Python<'_>,
     config: Py<PyAny>,
@@ -117,7 +135,7 @@ fn extract_hyperliquid_data_config(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn extract_hyperliquid_exec_config(
     py: Python<'_>,
     config: Py<PyAny>,
@@ -135,14 +153,15 @@ fn extract_hyperliquid_exec_config(
 pub fn hyperliquid(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "HYPERLIQUID_POST_ONLY_WOULD_MATCH",
-        crate::common::consts::HYPERLIQUID_POST_ONLY_WOULD_MATCH,
+        HYPERLIQUID_POST_ONLY_WOULD_MATCH,
     )?;
-    m.add_class::<crate::http::HyperliquidHttpClient>()?;
-    m.add_class::<crate::websocket::HyperliquidWebSocketClient>()?;
-    m.add_class::<crate::common::enums::HyperliquidProductType>()?;
-    m.add_class::<crate::common::enums::HyperliquidTpSl>()?;
-    m.add_class::<crate::common::enums::HyperliquidConditionalOrderType>()?;
-    m.add_class::<crate::common::enums::HyperliquidTrailingOffsetType>()?;
+    m.add_class::<HyperliquidHttpClient>()?;
+    m.add_class::<HyperliquidWebSocketClient>()?;
+    m.add_class::<HyperliquidProductType>()?;
+    m.add_class::<HyperliquidTpSl>()?;
+    m.add_class::<HyperliquidConditionalOrderType>()?;
+    m.add_class::<HyperliquidTrailingOffsetType>()?;
+    m.add_class::<HyperliquidEnvironment>()?;
     m.add_function(wrap_pyfunction!(urls::py_get_hyperliquid_http_base_url, m)?)?;
     m.add_function(wrap_pyfunction!(urls::py_get_hyperliquid_ws_url, m)?)?;
     m.add_function(wrap_pyfunction!(
@@ -153,27 +172,37 @@ pub fn hyperliquid(m: &Bound<'_, PyModule>) -> PyResult<()> {
         py_hyperliquid_cloid_from_client_order_id,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(py_revoke_hyperliquid_builder_fee, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        py_hyperliquid_resolve_execution_account_address,
+        m
+    )?)?;
     m.add_class::<HyperliquidDataClientConfig>()?;
     m.add_class::<HyperliquidExecClientConfig>()?;
     m.add_class::<HyperliquidExecFactoryConfig>()?;
     m.add_class::<HyperliquidDataClientFactory>()?;
     m.add_class::<HyperliquidExecutionClientFactory>()?;
+    m.add_class::<HyperliquidAllDexsAssetCtxs>()?;
+    m.add_class::<HyperliquidAllMids>()?;
+    m.add_class::<HyperliquidOpenInterest>()?;
+
+    register_hyperliquid_custom_data();
+    let _result = ensure_rust_extractor_registered::<HyperliquidAllDexsAssetCtxs>();
+    let _result = ensure_rust_extractor_registered::<HyperliquidAllMids>();
+    let _result = ensure_rust_extractor_registered::<HyperliquidOpenInterest>();
 
     let registry = get_global_pyo3_registry();
 
     if let Err(e) = registry
-        .register_factory_extractor("HYPERLIQUID".to_string(), extract_hyperliquid_data_factory)
+        .register_factory_extractor(HYPERLIQUID.to_string(), extract_hyperliquid_data_factory)
     {
         return Err(to_pyruntime_err(format!(
             "Failed to register Hyperliquid data factory extractor: {e}"
         )));
     }
 
-    if let Err(e) = registry.register_exec_factory_extractor(
-        "HYPERLIQUID".to_string(),
-        extract_hyperliquid_exec_factory,
-    ) {
+    if let Err(e) = registry
+        .register_exec_factory_extractor(HYPERLIQUID.to_string(), extract_hyperliquid_exec_factory)
+    {
         return Err(to_pyruntime_err(format!(
             "Failed to register Hyperliquid exec factory extractor: {e}"
         )));

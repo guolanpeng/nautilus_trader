@@ -52,7 +52,7 @@ pub struct BurnEvent {
 impl BurnEvent {
     /// Creates a new [`BurnEvent`] instance with the specified parameters.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         dex: SharedDex,
         pool_identifier: PoolIdentifier,
@@ -84,7 +84,6 @@ impl BurnEvent {
     }
 
     /// Converts a burn event into a `PoolLiquidityUpdate`.
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn to_pool_liquidity_update(
         &self,
@@ -92,7 +91,7 @@ impl BurnEvent {
         dex: SharedDex,
         instrument_id: InstrumentId,
         pool_identifier: PoolIdentifier,
-        timestamp: Option<UnixNanos>,
+        timestamp: UnixNanos,
     ) -> PoolLiquidityUpdate {
         PoolLiquidityUpdate::new(
             chain,
@@ -111,7 +110,8 @@ impl BurnEvent {
             self.amount1,
             self.tick_lower,
             self.tick_upper,
-            timestamp,
+            timestamp, // ts_event
+            timestamp, // ts_init (same block timestamp)
         )
     }
 }

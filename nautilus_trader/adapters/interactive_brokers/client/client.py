@@ -62,9 +62,20 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import Component
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
+from nautilus_trader.common.enums import ComponentState
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import VenueOrderId
+
+
+_SHUTDOWN_STATES = frozenset(
+    {
+        ComponentState.STOPPING,
+        ComponentState.STOPPED,
+        ComponentState.DISPOSING,
+        ComponentState.DISPOSED,
+    },
+)
 
 
 class InteractiveBrokersClient(
@@ -137,6 +148,7 @@ class InteractiveBrokersClient(
         # Event flags
         self._is_client_ready: asyncio.Event = asyncio.Event()
         self._is_ib_connected: asyncio.Event = asyncio.Event()
+        self._is_shutting_down: bool = False
 
         # Hot caches
         self.registered_nautilus_clients: set = set()
@@ -179,6 +191,13 @@ class InteractiveBrokersClient(
         # Start client
         self._request_id_seq: int = 10000
 
+    @property
+    def is_ready(self) -> bool:
+        """
+        Return whether the Interactive Brokers client is ready for requests.
+        """
+        return self._is_client_ready.is_set()
+
     def _start(self) -> None:
         """
         Start the client.
@@ -196,9 +215,12 @@ class InteractiveBrokersClient(
 
     async def _start_async(self):
         self._log.info(f"Starting InteractiveBrokersClient ({self._client_id})...")
+        self._is_shutting_down = False
+
         while not self._is_ib_connected.is_set():
             try:
                 self._connection_attempts += 1
+
                 if (
                     not self._indefinite_reconnect
                     and self._connection_attempts > self._max_connection_attempts
@@ -214,6 +236,10 @@ class InteractiveBrokersClient(
                     await asyncio.sleep(self._reconnect_delay)
 
                 await self._connect()
+                if not self._eclient.isConnected():
+                    raise ConnectionError(
+                        f"Failed to connect to Interactive Brokers at {self._host}:{self._port}",
+                    )
                 self._start_tws_incoming_msg_reader()
                 self._start_internal_msg_queue_processor()
                 self._eclient.startApi()
@@ -281,6 +307,7 @@ class InteractiveBrokersClient(
 
     async def _stop_async(self) -> None:
         self._log.info(f"Stopping InteractiveBrokersClient ({self._client_id})...")
+        self._is_shutting_down = True
 
         if self._is_client_ready.is_set():
             self._is_client_ready.clear()
@@ -293,6 +320,7 @@ class InteractiveBrokersClient(
             self._internal_msg_queue_processor_task,
             self._msg_handler_processor_task,
         ]
+
         for task in tasks:
             if task and not task.cancelled():
                 task.cancel()
@@ -304,9 +332,14 @@ class InteractiveBrokersClient(
         except Exception as e:
             self._log.exception(f"Error occurred while canceling tasks: {e}", e)
 
+        await self._clear_bar_tracking_state()
         self._eclient.disconnect()
         self._account_ids = set()
         self.registered_nautilus_clients = set()
+
+    def _dispose(self) -> None:
+        self._is_shutting_down = True
+        super()._dispose()
 
     def _reset(self) -> None:
         """
@@ -375,6 +408,7 @@ class InteractiveBrokersClient(
                 await asyncio.wait_for(self._is_client_ready.wait(), timeout)
         except TimeoutError as e:
             self._log.error(f"Client is not ready: {e}")
+            raise
 
     async def _run_connection_watchdog(self) -> None:
         """
@@ -407,8 +441,22 @@ class InteractiveBrokersClient(
             self._is_ib_connected.clear()
 
         self._last_disconnection_ns = self._clock.timestamp_ns()
+        await self._clear_bar_tracking_state()
         await asyncio.sleep(5)
         await self._handle_reconnect()
+
+    async def _clear_bar_tracking_state(self) -> None:
+        tasks = list(self._bar_timeout_tasks.values())
+
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+        self._bar_timeout_tasks.clear()
+        self._bar_type_to_last_bar.clear()
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _create_task(
         self,
@@ -588,6 +636,7 @@ class InteractiveBrokersClient(
                 request.future.set_result(request.result)
             else:
                 request.cancel()
+
                 if exception:
                     request.future.set_exception(exception)
 
@@ -602,7 +651,9 @@ class InteractiveBrokersClient(
         buf = b""
 
         try:
-            while self._eclient.conn and self._eclient.conn.isConnected():
+            while not self._is_message_processing_stopping() and (
+                self._eclient.conn and self._eclient.conn.isConnected()
+            ):
                 data = await asyncio.to_thread(self._eclient.conn.recvMsg)
                 buf += data
 
@@ -618,6 +669,11 @@ class InteractiveBrokersClient(
                         break
         except asyncio.CancelledError:
             self._log.debug("Client TWS incoming message reader was cancelled")
+        except RuntimeError as e:
+            if self._is_executor_shutdown_error(e):
+                self._log.debug("Client TWS incoming message reader stopped during shutdown")
+            else:
+                self._log.exception("Unhandled exception in Client TWS incoming message reader", e)
         except Exception as e:
             self._log.exception("Unhandled exception in Client TWS incoming message reader", e)
         finally:
@@ -637,13 +693,24 @@ class InteractiveBrokersClient(
         self._log.debug("Client internal message queue processor started")
 
         try:
-            while (
-                self._eclient.conn and self._eclient.conn.isConnected()
-            ) or not self._internal_msg_queue.empty():
+            while not self._is_message_processing_stopping() and (
+                (self._eclient.conn and self._eclient.conn.isConnected())
+                or not self._internal_msg_queue.empty()
+            ):
                 msg = await self._internal_msg_queue.get()
 
-                if not await self._process_message(msg):
-                    break
+                try:
+                    if not await self._process_message(msg):
+                        break
+                except RuntimeError as e:
+                    if self._is_executor_shutdown_error(e):
+                        self._internal_msg_queue.task_done()
+                        self._log.debug(
+                            "Internal message queue processor stopped during shutdown",
+                        )
+                        break
+
+                    raise
 
                 self._internal_msg_queue.task_done()
         except asyncio.CancelledError:
@@ -657,6 +724,15 @@ class InteractiveBrokersClient(
             )
         finally:
             self._log.debug("Internal message queue processor stopped")
+
+    def _is_message_processing_stopping(self) -> bool:
+        return self._is_shutting_down or self.state in _SHUTDOWN_STATES
+
+    def _is_executor_shutdown_error(self, exc: RuntimeError) -> bool:
+        return (
+            self._is_message_processing_stopping()
+            and "cannot schedule new futures after shutdown" in str(exc)
+        )
 
     async def _process_message(self, msg: bytes) -> bool:
         """
@@ -682,7 +758,7 @@ class InteractiveBrokersClient(
 
             return False
 
-        if self._eclient.serverVersion() >= MIN_SERVER_VER_PROTOBUF:
+        if self._use_raw_int_msg_id():
             sMsgId = msg[:4]
             msgId = int.from_bytes(sMsgId, "big")
             msg = msg[4:]
@@ -787,10 +863,16 @@ class InteractiveBrokersClient(
         """
         Override the logging for ibapi EClient.sendMsg.
         """
-        useRawIntMsgId = self._eclient.serverVersion() >= MIN_SERVER_VER_PROTOBUF
+        useRawIntMsgId = self._use_raw_int_msg_id()
         full_msg = comm.make_msg(msgId, useRawIntMsgId, msg)
         self._log.debug(f"TWS API request sent: function={current_fn_name(1)} msg={full_msg}")
         self._eclient.conn.sendMsg(full_msg)
+
+    def _use_raw_int_msg_id(self) -> bool:
+        server_version = self._eclient.serverVersion()
+
+        # Treat unknown server versions as legacy framing until the handshake completes
+        return server_version is not None and server_version >= MIN_SERVER_VER_PROTOBUF
 
     def logRequest(self, fnName, fnParams):
         """

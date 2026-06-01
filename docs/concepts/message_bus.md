@@ -16,6 +16,42 @@ Messages exchanged via the `MessageBus` fall into three categories:
 - Events
 - Commands
 
+## Topic hierarchy
+
+Nautilus keeps market data topics under the `data` root. Live data publications use the direct
+`data.<kind>...` topics, for example `data.book.deltas.XCME.ESZ24`.
+
+When requested, replayed, or workflow-generated data flows over the message bus as
+topic-addressable data, the `DataEngine` publishes it under `data.pipeline.<kind>...`.
+Long requests, grouped requests, and aggregation chains can split, transform, and fan data back in
+before the parent request completes. These messages are still data messages, but they do not claim
+the same live ordering and timing semantics as normal real-time publications. For example, book
+deltas on the pipeline path use
+`data.pipeline.book.deltas.XCME.ESZ24`.
+
+Correlated request responses are delivered through response handlers keyed by correlation ID. The
+`data.response` topic is a capture channel for response publications, not the pipeline data path.
+
+## Message integrity
+
+Once a message is created, its fields must not be mutated. This includes container fields such as
+`params` maps. Components can read a message and derive local state from it, but they must not
+rewrite the original.
+
+Immutable messages keep every consumer seeing the same input, preserve what was true at emission
+time, and remove a class of shared-state races. Replay, debugging, and audit all depend on messages
+remaining stable after dispatch.
+
+Three ownership rules follow from this:
+
+- Caller-supplied request options stay on the message.
+- Response metadata returned to the caller stays on the response.
+- Component workflow state (bounded date ranges, grouping state, replay cursors, counters,
+  processing flags) stays in component-owned context keyed by message or request ID.
+
+When a component needs a derived message, it creates a new one with the required values instead of
+rewriting the original.
+
 ## Data and signal publishing
 
 While the `MessageBus` is a lower-level component that users typically interact with indirectly,
@@ -48,9 +84,9 @@ This guide explains the three primary messaging patterns available in NautilusTr
 
 | **Messaging Style**                          | **Purpose**                                 | **Best For**                                          |
 |:---------------------------------------------|:--------------------------------------------|:------------------------------------------------------|
-| **MessageBus - Publish/Subscribe to topics** | Low-level, direct access to the message bus | Custom events, system-level communication             |
-| **Actor-Based - Publish/Subscribe Data**     | Structured trading data exchange            | Trading metrics, indicators, data needing persistence |
-| **Actor-Based - Publish/Subscribe Signal**   | Lightweight notifications                   | Simple alerts, flags, status updates                  |
+| **MessageBus - Publish/Subscribe to topics** | Low‑level, direct access to the message bus | Custom events, system‑level communication             |
+| **Actor‑Based - Publish/Subscribe Data**     | Structured trading data exchange            | Trading metrics, indicators, data needing persistence |
+| **Actor‑Based - Publish/Subscribe Signal**   | Lightweight notifications                   | Simple alerts, flags, status updates                  |
 
 Each approach serves different purposes. This section helps you decide which pattern to use.
 
@@ -244,7 +280,7 @@ Here's a quick reference to help you decide which messaging style to use:
 
 | **Use Case**                                | **Recommended Approach**                                                        | **Setup required** |
 |:--------------------------------------------|:--------------------------------------------------------------------------------|:-------------------|
-| Custom events or system-level communication | `MessageBus` + Pub/Sub to topic                                                 | Topic + Handler management |
+| Custom events or system‑level communication | `MessageBus` + Pub/Sub to topic                                                 | Topic + Handler management |
 | Structured trading data                     | `Actor` + Pub/Sub Data + optional `@customdataclass` if serialization is needed | New class definition inheriting from `Data` (handler `on_data` is predefined) |
 | Simple alerts/notifications                 | `Actor` + Pub/Sub Signal                                                        | Signal name only |
 
@@ -439,7 +475,10 @@ to ensure a simple and predictable stream key that the consumer nodes can regist
 
 ```python
 message_bus=MessageBusConfig(
-    database=DatabaseConfig(timeout=2),
+    database=DatabaseConfig(
+        connection_timeout=2,
+        response_timeout=2,
+    ),
     use_trader_id=False,
     use_trader_prefix=False,
     use_instance_id=False,
@@ -462,7 +501,10 @@ data_engine=LiveDataEngineConfig(
     external_clients=[ClientId("BINANCE_EXT")],
 ),
 message_bus=MessageBusConfig(
-    database=DatabaseConfig(timeout=2),
+    database=DatabaseConfig(
+        connection_timeout=2,
+        response_timeout=2,
+    ),
     external_streams=["binance"],  # <---
 ),
 ```

@@ -47,7 +47,16 @@ use crate::{
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OrderBookDepth10 {
-    #[allow(clippy::too_many_arguments)]
+    /// Represents an aggregated order book update with a fixed depth of 10 levels per side.
+    ///
+    /// This structure is specifically designed for scenarios where a snapshot of the top 10 bid and
+    /// ask levels in an order book is needed. It differs from `OrderBookDelta` or `OrderBookDeltas`
+    /// in its fixed-depth nature and is optimized for cases where a full depth representation is not
+    /// required or practical.
+    ///
+    /// Note: This type is not compatible with `OrderBookDelta` or `OrderBookDeltas` due to
+    /// its specialized structure and limited depth use case.
+    #[expect(clippy::too_many_arguments)]
     #[new]
     fn py_new(
         instrument_id: InstrumentId,
@@ -155,6 +164,7 @@ impl OrderBookDepth10 {
         format!("{}:{}", PY_MODULE_MODEL, stringify!(OrderBookDepth10))
     }
 
+    /// Returns the metadata for the type, for use with serialization formats.
     #[staticmethod]
     #[pyo3(name = "get_metadata")]
     fn py_get_metadata(
@@ -165,6 +175,7 @@ impl OrderBookDepth10 {
         Self::get_metadata(instrument_id, price_precision, size_precision)
     }
 
+    /// Returns the field map for the type, for use with Arrow schemas.
     #[staticmethod]
     #[pyo3(name = "get_fields")]
     fn py_get_fields(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
@@ -192,37 +203,33 @@ impl OrderBookDepth10 {
         // Create bids
         let mut price = 99.00;
         let mut quantity = 100.0;
-        let mut order_id = 1;
 
-        for order in bids.iter_mut().take(DEPTH10_LEN) {
+        for (i, order) in bids.iter_mut().take(DEPTH10_LEN).enumerate() {
             *order = BookOrder::new(
                 OrderSide::Buy,
                 Price::new(price, 2),
                 Quantity::new(quantity, 0),
-                order_id,
+                (i + 1) as u64,
             );
 
             price -= 1.0;
             quantity += 100.0;
-            order_id += 1;
         }
 
         // Create asks
         let mut price = 100.00;
         let mut quantity = 100.0;
-        let mut order_id = 11;
 
-        for order in asks.iter_mut().take(DEPTH10_LEN) {
+        for (i, order) in asks.iter_mut().take(DEPTH10_LEN).enumerate() {
             *order = BookOrder::new(
                 OrderSide::Sell,
                 Price::new(price, 2),
                 Quantity::new(quantity, 0),
-                order_id,
+                (i + 11) as u64,
             );
 
             price += 1.0;
             quantity += 100.0;
-            order_id += 1;
         }
 
         let bid_counts: [u32; 10] = [1; 10];
@@ -280,7 +287,7 @@ impl OrderBookDepth10 {
         self.to_json_bytes().unwrap().into_py_any_unwrap(py)
     }
 
-    /// Return MsgPack encoded bytes representation of the object.
+    /// Return `MsgPack` encoded bytes representation of the object.
     #[pyo3(name = "to_msgpack_bytes")]
     fn py_to_msgpack_bytes(&self, py: Python<'_>) -> Py<PyAny> {
         self.to_msgpack_bytes().unwrap().into_py_any_unwrap(py)

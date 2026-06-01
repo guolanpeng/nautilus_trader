@@ -18,7 +18,7 @@ The custom-data architecture satisfies the following requirements:
 - Let users define custom data in pure Python without writing Rust code.
 - Let Rust-defined custom data use native Rust JSON and Arrow handlers.
 - Preserve a single user-facing `CustomData` wrapper at the PyO3 boundary.
-- Support persistence in `ParquetDataCatalogV2` using dynamic type registration
+- Support persistence in `ParquetDataCatalog` using dynamic type registration
   instead of hardcoded schemas.
 - Make custom data routable through the normal data-engine, actor, and strategy
   subscription flow.
@@ -30,7 +30,7 @@ There are two supported authoring modes:
 | Mode              | Example                                            | Registration path                                       | Encode/decode path              | Wrapper backend           |
 |-------------------|----------------------------------------------------|---------------------------------------------------------|---------------------------------|---------------------------|
 | Pure Python       | `@customdataclass_pyo3` class                      | `register_custom_data_class(...)`                       | Python callback + Arrow C FFI   | `PythonCustomDataWrapper` |
-| Same-binary Rust  | `#[custom_data]` or `#[custom_data(pyo3)]` type    | `ensure_custom_data_registered::<T>()` and native extractor | Native Rust                 | Native Rust payload       |
+| Same‑binary Rust  | `#[custom_data]` or `#[custom_data(pyo3)]` type    | `ensure_custom_data_registered::<T>()` and native extractor | Native Rust                 | Native Rust payload       |
 
 Both modes converge on the same outer PyO3 `CustomData` wrapper and the same
 `DataType` identity model.
@@ -90,7 +90,7 @@ metadata.
 The outer PyO3 `CustomData` wrapper is the common container that crosses the
 FFI boundary.
 
-Constructor signature: `CustomData(data_type, data)` -- the `DataType` comes
+Constructor signature: `CustomData(data_type, data)` where `DataType` comes
 first, then the inner payload.
 
 It contains:
@@ -246,7 +246,7 @@ custom data dynamically using the registered `type_name`.
 
 ### Catalog write flow
 
-`ParquetDataCatalogV2` expects custom writes to come in as `CustomData` values.
+`ParquetDataCatalog` expects custom writes to come in as `CustomData` values.
 
 The custom-data write path:
 
@@ -372,18 +372,15 @@ Current behavior:
   (type_name, metadata, identifier) and return results sorted by `ts_init`;
   this is exposed via the PyO3 `RedisCacheDatabase` API.
 
-## Relationship to legacy Cython custom data
+## Cython custom data
 
-Legacy Cython `@customdataclass` remains separate from this architecture.
-
+The Cython `@customdataclass` system is separate from this architecture.
 This document describes the PyO3 custom-data system:
 
 - PyO3 `CustomData`.
 - Dynamic runtime registration.
 - Arrow/Parquet persistence.
 - Native Rust execution paths.
-
-Legacy Cython support is intentionally left unchanged.
 
 ## Practical implications
 

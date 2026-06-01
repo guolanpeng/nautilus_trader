@@ -19,16 +19,54 @@ use std::{
     ffi::CStr,
     fmt::{Debug, Display},
     hash::Hash,
-    io::{Cursor, Write},
     str::FromStr,
 };
 
+#[cfg(all(feature = "simulation", madsim))]
+use madsim::rand::RngCore as MadsimRngCore;
 use rand::Rng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
+use crate::hex::ENCODE_PAIR;
+
 /// The maximum length of ASCII characters for a `UUID4` string value (includes null terminator).
 pub(crate) const UUID4_LEN: usize = 37;
+
+fn format_uuid4_bytes(bytes: [u8; 16]) -> [u8; UUID4_LEN] {
+    let mut value = [0u8; UUID4_LEN];
+    let mut pos = 0;
+
+    for (idx, byte) in bytes.into_iter().enumerate() {
+        if matches!(idx, 4 | 6 | 8 | 10) {
+            value[pos] = b'-';
+            pos += 1;
+        }
+
+        value[pos..pos + 2].copy_from_slice(&ENCODE_PAIR[byte as usize]);
+        pos += 2;
+    }
+
+    value[36] = 0; // Add the null terminator
+
+    debug_assert_eq!(pos, 36, "Invariant: UUID text must be 36 bytes");
+    debug_assert!(
+        value[14] == b'4',
+        "Invariant: UUID version digit must be '4' (was {})",
+        value[14] as char
+    );
+    debug_assert!(
+        matches!(value[19], b'8' | b'9' | b'a' | b'b'),
+        "Invariant: UUID variant byte must be RFC 4122 (was {})",
+        value[19] as char
+    );
+    debug_assert!(
+        value[36] == 0,
+        "Invariant: UUID null terminator must be at index 36"
+    );
+
+    value
+}
 
 /// Represents a Universally Unique Identifier (UUID)
 /// version 4 based on a 128-bit label as specified in RFC 4122.
@@ -53,32 +91,46 @@ impl UUID4 {
     /// The UUID value is stored as a fixed-length C string byte array.
     #[must_use]
     pub fn new() -> Self {
-        let mut rng = rand::rng();
+        let bytes = Self::new_bytes();
+        Self {
+            value: format_uuid4_bytes(bytes),
+        }
+    }
+
+    /// Creates raw `UUIDv4` bytes.
+    #[must_use]
+    pub fn new_bytes() -> [u8; 16] {
         let mut bytes = [0u8; 16];
-        rng.fill_bytes(&mut bytes);
+        #[cfg(all(feature = "simulation", madsim))]
+        {
+            // Deterministic RNG when running inside a madsim runtime; otherwise
+            // (e.g. plain `#[rstest]` tests under `cfg(madsim)`) fall back to
+            // the host RNG. Production paths under simulation always run inside
+            // a runtime, so they continue to consume seeded bytes.
+            if madsim::runtime::Handle::try_current().is_ok() {
+                MadsimRngCore::fill_bytes(&mut madsim::rand::thread_rng(), &mut bytes);
+            } else {
+                rand::rng().fill_bytes(&mut bytes); // dst-ok: tests outside a madsim runtime
+            }
+        }
+        #[cfg(not(all(feature = "simulation", madsim)))]
+        rand::rng().fill_bytes(&mut bytes);
 
         bytes[6] = (bytes[6] & 0x0F) | 0x40; // Set the version to 4
         bytes[8] = (bytes[8] & 0x3F) | 0x80; // Set the variant to RFC 4122
 
-        let mut value = [0u8; UUID4_LEN];
-        let mut cursor = Cursor::new(&mut value[..36]);
+        bytes
+    }
 
-        write!(
-            cursor,
-            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            u16::from_be_bytes([bytes[4], bytes[5]]),
-            u16::from_be_bytes([bytes[6], bytes[7]]),
-            u16::from_be_bytes([bytes[8], bytes[9]]),
-            u64::from_be_bytes([
-                bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15], 0, 0
-            ]) >> 16
-        )
-        .expect("Error writing UUID string to buffer");
-
-        value[36] = 0; // Add the null terminator
-
-        Self { value }
+    /// Creates a [`UUID4`] from raw 16-byte representation.
+    ///
+    /// Sets the version-4 nibble and the RFC 4122 variant bits before constructing,
+    /// so any 16 bytes produce a valid v4 UUID.
+    #[must_use]
+    pub fn from_bytes(mut bytes: [u8; 16]) -> Self {
+        bytes[6] = (bytes[6] & 0x0F) | 0x40;
+        bytes[8] = (bytes[8] & 0x3F) | 0x80;
+        Self::from_validated_uuid(&Uuid::from_bytes(bytes))
     }
 
     /// Converts the [`UUID4`] to a C string reference.
@@ -94,6 +146,11 @@ impl UUID4 {
     }
 
     /// Returns the UUID as a string slice.
+    ///
+    /// # Panics
+    ///
+    /// Never panics in practice: the stored byte representation is constructed
+    /// from valid ASCII UUID strings by [`UUID4::new`] or deserialization paths.
     #[must_use]
     pub fn as_str(&self) -> &str {
         // We always store valid ASCII UUID strings
@@ -104,6 +161,11 @@ impl UUID4 {
     ///
     /// This method is optimized for serialization where the UUID bytes
     /// are needed directly without string conversion overhead.
+    ///
+    /// # Panics
+    ///
+    /// Never panics in practice: the stored byte representation is a valid
+    /// UTF-8 UUID v4 string produced by [`UUID4::new`] or deserialization paths.
     #[must_use]
     pub fn as_bytes(&self) -> [u8; 16] {
         // Parse the string representation to extract the raw bytes
@@ -232,8 +294,8 @@ impl<'de> Deserialize<'de> for UUID4 {
     where
         D: Deserializer<'de>,
     {
-        let uuid4_str: &str = Deserialize::deserialize(deserializer)?;
-        uuid4_str.parse().map_err(serde::de::Error::custom)
+        let uuid4_str: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
+        uuid4_str.as_ref().parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -241,6 +303,7 @@ impl<'de> Deserialize<'de> for UUID4 {
 mod tests {
     use std::{
         collections::hash_map::DefaultHasher,
+        ffi::CStr,
         hash::{Hash, Hasher},
     };
 
@@ -266,6 +329,16 @@ mod tests {
     }
 
     #[rstest]
+    fn test_new_bytes() {
+        let bytes = UUID4::new_bytes();
+        let uuid = UUID4::from_bytes(bytes);
+
+        assert_eq!(bytes[6] >> 4, 4);
+        assert!(matches!(bytes[8] >> 6, 0b10));
+        assert_eq!(uuid.as_bytes(), bytes);
+    }
+
+    #[rstest]
     fn test_uuid_format() {
         let uuid = UUID4::new();
         let bytes = uuid.value;
@@ -281,6 +354,23 @@ mod tests {
 
         let s = uuid.to_string();
         assert_eq!(s.chars().nth(14).unwrap(), '4');
+    }
+
+    #[rstest]
+    fn test_format_uuid4_bytes_golden() {
+        let bytes = [
+            0x2d, 0x89, 0x66, 0x6b, 0x1a, 0x1e, 0x4a, 0x75, 0xb1, 0x93, 0x4e, 0xb3, 0xb4, 0x54,
+            0xc7, 0x57,
+        ];
+
+        let formatted = format_uuid4_bytes(bytes);
+        let text = CStr::from_bytes_with_nul(&formatted)
+            .unwrap()
+            .to_str()
+            .unwrap();
+
+        assert_eq!(text, "2d89666b-1a1e-4a75-b193-4eb3b454c757");
+        assert_eq!(formatted[36], 0);
     }
 
     #[rstest]
@@ -430,6 +520,15 @@ mod tests {
     }
 
     #[rstest]
+    fn test_deserialize_from_owned_value() {
+        let uuid_string = "2d89666b-1a1e-4a75-b193-4eb3b454c757";
+        let value = serde_json::Value::String(uuid_string.to_string());
+
+        let deserialized: UUID4 = serde_json::from_value(value).unwrap();
+        assert_eq!(deserialized.to_string(), uuid_string);
+    }
+
+    #[rstest]
     fn test_serialize_deserialize_round_trip() {
         let uuid = UUID4::new();
 
@@ -465,6 +564,67 @@ mod tests {
     }
 
     #[rstest]
+    fn test_from_bytes_basic() {
+        // A well-formed v4 / RFC 4122 input should be preserved verbatim.
+        let bytes = [
+            0x2d, 0x89, 0x66, 0x6b, 0x1a, 0x1e, 0x4a, 0x75, 0xb1, 0x93, 0x4e, 0xb3, 0xb4, 0x54,
+            0xc7, 0x57,
+        ];
+        let uuid = UUID4::from_bytes(bytes);
+        assert_eq!(uuid.to_string(), "2d89666b-1a1e-4a75-b193-4eb3b454c757");
+        assert_eq!(uuid.as_bytes(), bytes);
+    }
+
+    #[rstest]
+    fn test_from_bytes_normalizes_version() {
+        // Input has version bits indicating v1 (0x10..): `from_bytes` must coerce to v4.
+        let mut bytes = [0u8; 16];
+        bytes[6] = 0x1a; // High nibble is version; 1 means v1
+        bytes[8] = 0x80; // Already RFC 4122
+        let uuid = UUID4::from_bytes(bytes);
+        assert_eq!(&uuid.to_string()[14..15], "4");
+        let parsed = Uuid::parse_str(uuid.as_str()).unwrap();
+        assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
+    }
+
+    #[rstest]
+    fn test_from_bytes_normalizes_variant() {
+        // Input has variant bits indicating non-RFC-4122 (0x00..): `from_bytes` must coerce.
+        let mut bytes = [0u8; 16];
+        bytes[6] = 0x40; // Already v4
+        bytes[8] = 0x00; // Non-RFC-4122 variant
+        let uuid = UUID4::from_bytes(bytes);
+        let parsed = Uuid::parse_str(uuid.as_str()).unwrap();
+        assert_eq!(parsed.get_variant(), uuid::Variant::RFC4122);
+    }
+
+    #[rstest]
+    fn test_from_bytes_all_zero_is_valid_v4() {
+        let uuid = UUID4::from_bytes([0u8; 16]);
+        // After normalization, byte 6 is 0x40 and byte 8 is 0x80, so the canonical representation
+        // is "00000000-0000-4000-8000-000000000000", still a valid v4 UUID.
+        assert_eq!(uuid.to_string(), "00000000-0000-4000-8000-000000000000");
+    }
+
+    #[rstest]
+    fn test_from_bytes_all_ones_is_valid_v4() {
+        let uuid = UUID4::from_bytes([0xFFu8; 16]);
+        let parsed = Uuid::parse_str(uuid.as_str()).unwrap();
+        assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
+        assert_eq!(parsed.get_variant(), uuid::Variant::RFC4122);
+    }
+
+    #[rstest]
+    fn test_from_bytes_round_trip() {
+        // For inputs whose bits 6 and 8 are already v4/RFC-4122, `as_bytes` ∘ `from_bytes` is the
+        // identity.
+        let original = UUID4::new();
+        let bytes = original.as_bytes();
+        let reconstructed = UUID4::from_bytes(bytes);
+        assert_eq!(original, reconstructed);
+    }
+
+    #[rstest]
     #[case("\"not-a-uuid\"")] // Invalid format
     #[case("\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"")] // v1 UUID (wrong version)
     #[case("\"\"")] // Empty string
@@ -476,11 +636,7 @@ mod tests {
     fn uuid4_strategy() -> impl Strategy<Value = UUID4> {
         // Build from proptest-generated bytes for deterministic
         // reproduction and shrinking on failure
-        any::<[u8; 16]>().prop_map(|mut bytes| {
-            bytes[6] = (bytes[6] & 0x0F) | 0x40; // Version 4
-            bytes[8] = (bytes[8] & 0x3F) | 0x80; // Variant RFC 4122
-            UUID4::from(uuid::Uuid::from_bytes(bytes))
-        })
+        any::<[u8; 16]>().prop_map(UUID4::from_bytes)
     }
 
     proptest! {
@@ -552,6 +708,27 @@ mod tests {
         fn prop_uuid4_from_str_never_panics(s: String) {
             // Fuzzing the parser with arbitrary strings
             let _ = UUID4::from_str(&s);
+        }
+
+        #[rstest]
+        fn prop_from_bytes_always_yields_v4(bytes in any::<[u8; 16]>()) {
+            // Any 16-byte input must produce a UUID that passes both v4 and RFC 4122 checks,
+            // because `from_bytes` unconditionally normalizes the version and variant nibbles.
+            let uuid = UUID4::from_bytes(bytes);
+            let parsed = uuid::Uuid::parse_str(uuid.as_str()).unwrap();
+            prop_assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
+            prop_assert_eq!(parsed.get_variant(), uuid::Variant::RFC4122);
+        }
+
+        #[rstest]
+        fn prop_from_bytes_as_bytes_roundtrip(bytes in any::<[u8; 16]>()) {
+            // `as_bytes` must reflect exactly the bits `from_bytes` produced: the input
+            // bytes after version/variant normalization.
+            let mut expected = bytes;
+            expected[6] = (expected[6] & 0x0F) | 0x40;
+            expected[8] = (expected[8] & 0x3F) | 0x80;
+            let uuid = UUID4::from_bytes(bytes);
+            prop_assert_eq!(uuid.as_bytes(), expected);
         }
     }
 }

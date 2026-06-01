@@ -15,8 +15,7 @@
 
 use std::fmt::{Debug, Display};
 
-use derive_builder::Builder;
-use nautilus_core::{UUID4, UnixNanos, serialization::from_bool_as_u8};
+use nautilus_core::{UUID4, UnixNanos};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
@@ -35,9 +34,8 @@ use crate::{
 };
 
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Builder)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
-#[cfg_attr(any(test, feature = "stubs"), builder(default))]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
@@ -67,6 +65,9 @@ pub struct OrderUpdated {
     pub trigger_price: Option<Price>,
     /// The order calculated protection price.
     pub protection_price: Option<Price>,
+    /// If the order quantity is denominated in the quote currency.
+    #[serde(default)]
+    pub is_quote_quantity: bool,
     /// The unique identifier for the event.
     pub event_id: UUID4,
     /// UNIX timestamp (nanoseconds) when the event occurred.
@@ -74,13 +75,16 @@ pub struct OrderUpdated {
     /// UNIX timestamp (nanoseconds) when the event was initialized.
     pub ts_init: UnixNanos,
     /// If the event was generated during reconciliation.
-    #[serde(deserialize_with = "from_bool_as_u8")]
-    pub reconciliation: u8, // TODO: Change to bool once Cython removed
+    pub reconciliation: bool,
+    /// The causation ID associated with the event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl OrderUpdated {
     /// Creates a new [`OrderUpdated`] instance.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
+    #[must_use]
     pub fn new(
         trader_id: TraderId,
         strategy_id: StrategyId,
@@ -96,6 +100,7 @@ impl OrderUpdated {
         price: Option<Price>,
         trigger_price: Option<Price>,
         protection_price: Option<Price>,
+        is_quote_quantity: bool,
     ) -> Self {
         Self {
             trader_id,
@@ -106,12 +111,14 @@ impl OrderUpdated {
             event_id,
             ts_event,
             ts_init,
-            reconciliation: u8::from(reconciliation),
+            reconciliation,
             venue_order_id,
             account_id,
             price,
             trigger_price,
             protection_price,
+            is_quote_quantity,
+            causation_id: None,
         }
     }
 }
@@ -243,11 +250,11 @@ impl OrderEvent for OrderUpdated {
     }
 
     fn quote_quantity(&self) -> Option<bool> {
-        None
+        Some(self.is_quote_quantity)
     }
 
     fn reconciliation(&self) -> bool {
-        self.reconciliation != 0
+        self.reconciliation
     }
 
     fn price(&self) -> Option<Price> {
@@ -360,5 +367,13 @@ mod tests {
             display,
             "OrderUpdated(instrument_id=BTCUSDT.COINBASE, client_order_id=O-19700101-000000-001-001-1, venue_order_id=001, account_id=SIM-001, quantity=100, price=22_000, trigger_price=None, protection_price=None, ts_event=0)"
         );
+    }
+
+    #[rstest]
+    fn test_order_updated_serialization() {
+        let original = OrderUpdated::default();
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: OrderUpdated = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
     }
 }

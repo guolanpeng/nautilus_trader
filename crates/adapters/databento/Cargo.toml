@@ -18,29 +18,32 @@ workspace = true
 
 [lib]
 name = "nautilus_databento"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [features]
 default = ["live", "high-precision"]
 arrow = ["dep:arrow", "nautilus-serialization"]
 extension-module = [
   "nautilus-core/extension-module",
+  "nautilus-live?/extension-module",
   "nautilus-model/extension-module",
   "python",
   "pyo3/extension-module",
 ]
-live = ["nautilus-live", "nautilus-system", "dotenvy"]
+live = ["nautilus-live", "nautilus-live/node", "nautilus-system", "dotenvy"]
 python = [
   "arrow",
   "live",
   "nautilus-core/ffi",
   "nautilus-core/python",
+  "nautilus-live/python",
   "nautilus-model/ffi",
   "nautilus-model/python",
   "nautilus-serialization/python",
   "nautilus-system/python",
   "pyo3",
   "pyo3-async-runtimes",
+  "pyo3-stub-gen",
 ]
 high-precision = [
   "nautilus-model/high-precision",
@@ -83,19 +86,25 @@ arrow = { workspace = true, optional = true }
 dotenvy = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-async-runtimes = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
-nautilus-testkit = { workspace = true }
+proptest = { workspace = true }
 rstest = { workspace = true }
-
-[[bin]]
-name = "databento-sandbox"
-path = "bin/sandbox.rs"
-required-features = ["python"]
-doc = false
+tokio = { workspace = true, features = ["test-util"] }
 
 [[example]]
 name = "databento-data-tester"
 path = "examples/node_data_tester.rs"
 required-features = ["live"]
 doc = false
+
+[[test]]
+name = "feed_handler"
+path = "tests/feed_handler.rs"
+required-features = ["live"]
+
+[[test]]
+name = "python"
+path = "tests/python.rs"
+required-features = ["python"]

@@ -15,7 +15,6 @@
 
 use std::fmt::{Debug, Display};
 
-use derive_builder::Builder;
 use indexmap::IndexMap;
 use nautilus_core::{UUID4, UnixNanos};
 use rust_decimal::Decimal;
@@ -32,7 +31,7 @@ use crate::{
         AccountId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId, PositionId,
         StrategyId, TradeId, TraderId, VenueOrderId,
     },
-    orders::OrderAny,
+    orders::{OrderAny, OrderError},
     types::{Currency, Money, Price, Quantity},
 };
 
@@ -43,9 +42,8 @@ use crate::{
 /// 'over the wire' and have a valid order created with exactly the same
 /// properties as if it had been instantiated locally.
 #[repr(C)]
-#[derive(Clone, PartialEq, Eq, Builder, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
-#[cfg_attr(any(test, feature = "stubs"), builder(default))]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
@@ -121,11 +119,19 @@ pub struct OrderInitialized {
     pub exec_spawn_id: Option<ClientOrderId>,
     /// The custom user tags for the order.
     pub tags: Option<Vec<Ustr>>,
+    /// The causation ID associated with the event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl OrderInitialized {
     /// Creates a new [`OrderInitialized`] instance.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "domain event constructor requires multiple boolean flags"
+    )]
+    #[must_use]
     pub fn new(
         trader_id: TraderId,
         strategy_id: StrategyId,
@@ -195,6 +201,7 @@ impl OrderInitialized {
             exec_algorithm_params,
             exec_spawn_id,
             tags,
+            causation_id: None,
         }
     }
 }
@@ -545,19 +552,21 @@ impl OrderEvent for OrderInitialized {
     }
 }
 
-impl From<OrderInitialized> for OrderAny {
-    fn from(order: OrderInitialized) -> Self {
-        match order.order_type {
-            OrderType::Limit => Self::Limit(order.into()),
-            OrderType::Market => Self::Market(order.into()),
-            OrderType::StopMarket => Self::StopMarket(order.into()),
-            OrderType::StopLimit => Self::StopLimit(order.into()),
-            OrderType::LimitIfTouched => Self::LimitIfTouched(order.into()),
-            OrderType::TrailingStopLimit => Self::TrailingStopLimit(order.into()),
-            OrderType::TrailingStopMarket => Self::TrailingStopMarket(order.into()),
-            OrderType::MarketToLimit => Self::MarketToLimit(order.into()),
-            OrderType::MarketIfTouched => Self::MarketIfTouched(order.into()),
-        }
+impl TryFrom<OrderInitialized> for OrderAny {
+    type Error = OrderError;
+
+    fn try_from(order: OrderInitialized) -> Result<Self, Self::Error> {
+        Ok(match order.order_type {
+            OrderType::Limit => Self::Limit(order.try_into()?),
+            OrderType::Market => Self::Market(order.try_into()?),
+            OrderType::StopMarket => Self::StopMarket(order.try_into()?),
+            OrderType::StopLimit => Self::StopLimit(order.try_into()?),
+            OrderType::LimitIfTouched => Self::LimitIfTouched(order.try_into()?),
+            OrderType::TrailingStopLimit => Self::TrailingStopLimit(order.try_into()?),
+            OrderType::TrailingStopMarket => Self::TrailingStopMarket(order.try_into()?),
+            OrderType::MarketToLimit => Self::MarketToLimit(order.try_into()?),
+            OrderType::MarketIfTouched => Self::MarketIfTouched(order.try_into()?),
+        })
     }
 }
 
@@ -577,5 +586,13 @@ mod test {
             contingency_type=OTO, order_list_id=1, linked_order_ids=[O-2020872378424], parent_order_id=None, \
             exec_algorithm_id=None, exec_algorithm_params=None, exec_spawn_id=None, tags=None)"
         );
+    }
+
+    #[rstest]
+    fn test_order_initialized_serialization() {
+        let original = OrderInitialized::default();
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: OrderInitialized = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
     }
 }

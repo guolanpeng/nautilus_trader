@@ -38,6 +38,7 @@ use nautilus_architect_ax::{
     websocket::{AxDataWsMessage, data::AxMdWebSocketClient},
 };
 use nautilus_core::time::get_atomic_clock_realtime;
+use nautilus_network::websocket::TransportBackend;
 use rust_decimal::Decimal;
 
 #[tokio::main]
@@ -67,10 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_client = AxRawHttpClient::new(
         Some(environment.http_url().to_string()),
         Some(environment.orders_url().to_string()),
-        Some(30),
-        None,
-        None,
-        None,
+        30,
+        3,
+        1000,
+        10_000,
         None,
     )?;
 
@@ -110,7 +111,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = AxMdWebSocketClient::new(
         environment.ws_md_url().to_string(),
         auth_response.token,
-        Some(30),
+        30,
+        TransportBackend::default(),
+        None,
     );
 
     let test_symbol = "EURUSD-PERP";

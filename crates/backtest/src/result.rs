@@ -27,6 +27,10 @@ use nautilus_core::{UUID4, UnixNanos};
         skip_from_py_object
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.backtest")
+)]
 pub struct BacktestResult {
     pub trader_id: String,
     pub machine_id: String,
@@ -42,6 +46,7 @@ pub struct BacktestResult {
     pub total_events: usize,
     pub total_orders: usize,
     pub total_positions: usize,
+    pub summary: AHashMap<String, String>,
     pub stats_pnls: AHashMap<String, AHashMap<String, f64>>,
     pub stats_returns: AHashMap<String, f64>,
     pub stats_general: AHashMap<String, f64>,

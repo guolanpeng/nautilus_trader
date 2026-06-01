@@ -17,15 +17,16 @@
 //!
 //! This module provides JSON-RPC client implementations for communicating with various
 //! blockchain networks via HTTP and WebSocket connections. It includes specialized
-//! clients for different networks (Ethereum, Polygon, Arbitrum, Base) and common
+//! clients for different networks (Ethereum, Polygon, Arbitrum, Base, BSC) and common
 //! utilities for handling RPC requests and responses.
 
 use enum_dispatch::enum_dispatch;
+use nautilus_network::websocket::TransportBackend;
 
 use crate::rpc::{
     chains::{
-        arbitrum::ArbitrumRpcClient, base::BaseRpcClient, ethereum::EthereumRpcClient,
-        polygon::PolygonRpcClient,
+        arbitrum::ArbitrumRpcClient, base::BaseRpcClient, bsc::BscRpcClient,
+        ethereum::EthereumRpcClient, polygon::PolygonRpcClient,
     },
     error::BlockchainRpcClientError,
     types::BlockchainMessage,
@@ -45,6 +46,7 @@ pub mod utils;
 pub enum BlockchainRpcClientAny {
     Arbitrum(ArbitrumRpcClient),
     Base(BaseRpcClient),
+    Bsc(BscRpcClient),
     Ethereum(EthereumRpcClient),
     Polygon(PolygonRpcClient),
 }
@@ -62,4 +64,5 @@ pub trait BlockchainRpcClient {
         todo!("Not implemented")
     }
     async fn next_rpc_message(&mut self) -> Result<BlockchainMessage, BlockchainRpcClientError>;
+    fn set_transport_backend(&mut self, backend: TransportBackend);
 }

@@ -39,7 +39,6 @@ from nautilus_trader.model.identifiers cimport PositionId
 from nautilus_trader.model.identifiers cimport StrategyId
 from nautilus_trader.model.identifiers cimport Venue
 from nautilus_trader.model.instruments.base cimport Instrument
-from nautilus_trader.model.objects cimport Price
 from nautilus_trader.model.objects cimport Quantity
 from nautilus_trader.model.orders.base cimport Order
 from nautilus_trader.model.position cimport Position
@@ -68,8 +67,6 @@ cdef class ExecutionEngine(Component):
     """If debug mode is active (will provide extra debug logging).\n\n:returns: `bool`"""
     cdef readonly bint allow_overfills
     """If order fills exceeding order quantity are allowed (logs warning instead of raising).\n\n:returns: `bool`"""
-    cdef readonly bint convert_quote_qty_to_base
-    """If quote-denominated order quantities should be converted to base units before submission.\n\n:returns: `bool`"""
     cdef readonly bint manage_own_order_books
     """If the execution engine should maintain own order books based on commands and events.\n\n:returns: `bool`"""
     cdef readonly bint snapshot_orders
@@ -78,6 +75,20 @@ cdef class ExecutionEngine(Component):
     """If position state snapshots should be persisted.\n\n:returns: `bool`"""
     cdef readonly double snapshot_positions_interval_secs
     """The interval (seconds) at which additional position state snapshots are persisted.\n\n:returns: `double`"""
+    cdef readonly object purge_closed_orders_interval_mins
+    """The interval (minutes) between purging closed orders from the cache.\n\n:returns: `int or None`"""
+    cdef readonly object purge_closed_orders_buffer_mins
+    """The buffer (minutes) from when an order was closed before it can be purged.\n\n:returns: `int or None`"""
+    cdef readonly object purge_closed_positions_interval_mins
+    """The interval (minutes) between purging closed positions from the cache.\n\n:returns: `int or None`"""
+    cdef readonly object purge_closed_positions_buffer_mins
+    """The buffer (minutes) from when a position was closed before it can be purged.\n\n:returns: `int or None`"""
+    cdef readonly object purge_account_events_interval_mins
+    """The interval (minutes) between purging account events from the cache.\n\n:returns: `int or None`"""
+    cdef readonly object purge_account_events_lookback_mins
+    """The lookback window (minutes) for account events before they can be purged.\n\n:returns: `int or None`"""
+    cdef readonly bint purge_from_database
+    """If purging operations will also delete from the backing database.\n\n:returns: `bool`"""
     cdef readonly int command_count
     """The total count of commands received by the engine.\n\n:returns: `int`"""
     cdef readonly int event_count
@@ -95,7 +106,6 @@ cdef class ExecutionEngine(Component):
     cpdef set[InstrumentId] get_external_order_claims_instruments(self)
     cpdef set[ExecutionClient] get_clients_for_orders(self, list[Order] orders)
     cpdef void set_manage_own_order_books(self, bint value)
-    cpdef void set_convert_quote_qty_to_base(self, bint value)
 
 # -- REGISTRATION ---------------------------------------------------------------------------------
 
@@ -121,8 +131,6 @@ cdef class ExecutionEngine(Component):
     cpdef ExecutionClient _find_client_for_command(self, Command command)
 
     cpdef void _set_position_id_counts(self)
-    cpdef Price _last_px_for_conversion(self, InstrumentId instrument_id, OrderSide order_side)
-    cpdef void _set_order_base_qty(self, Order order, Quantity base_qty)
     cpdef void _deny_order(self, Order order, str reason)
     cpdef object _get_or_init_own_order_book(self, InstrumentId instrument_id)
     cpdef void _add_own_book_order(self, Order order)
@@ -149,6 +157,15 @@ cdef class ExecutionEngine(Component):
 
 # -- EVENT HANDLERS -------------------------------------------------------------------------------
 
+    cdef str _check_position_id_against_oms(
+        self,
+        InstrumentId instrument_id,
+        StrategyId strategy_id,
+        PositionId position_id,
+        ExecutionClient client,
+    )
+    cdef OmsType _resolve_oms_type(self, StrategyId strategy_id, ExecutionClient client)
+
     cpdef void _handle_event(self, OrderEvent event)
     cpdef OmsType _determine_oms_type(self, OrderFilled fill)
     cpdef void _determine_position_id(self, OrderFilled fill, OmsType oms_type, Order order=*)
@@ -158,7 +175,10 @@ cdef class ExecutionEngine(Component):
     cpdef bint _apply_event_to_order(self, Order order, OrderEvent event)
     cpdef void _handle_order_fill(self, Order order, OrderFilled fill, OmsType oms_type)
     cdef bint _is_leg_fill(self, OrderFilled fill)
+    cdef void _send_fill_to_portfolio_before_position_update(self, OrderFilled fill)
     cdef void _handle_position_update(self, Instrument instrument, OrderFilled fill, OmsType oms_type)
+    cdef bint _reject_reduce_only_netting_position_open(self, OrderFilled fill, OmsType oms_type)
+    cdef str _reduce_only_open_position_details(self, list positions_open)
     cpdef void _handle_leg_fill_without_order(self, OrderFilled fill)
     cpdef void _open_position(self, Instrument instrument, Position position, OrderFilled fill, OmsType oms_type)
     cpdef void _reopen_position(self, Position position, OmsType oms_type)
@@ -168,3 +188,6 @@ cdef class ExecutionEngine(Component):
     cpdef void _create_order_state_snapshot(self, Order order)
     cpdef void _create_position_state_snapshot(self, Position position, bint open_only)
     cpdef void _snapshot_open_position_states(self, TimeEvent event)
+    cpdef void _purge_closed_orders(self, TimeEvent event)
+    cpdef void _purge_closed_positions(self, TimeEvent event)
+    cpdef void _purge_account_events(self, TimeEvent event)

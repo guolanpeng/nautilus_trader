@@ -37,6 +37,7 @@ use futures_util::StreamExt;
 use nautilus_bitmex::websocket::{client::BitmexWebSocketClient, messages::BitmexWsMessage};
 use nautilus_common::testing::wait_until_async;
 use nautilus_model::identifiers::{AccountId, InstrumentId};
+use nautilus_network::websocket::TransportBackend;
 use rstest::rstest;
 use serde_json::json;
 
@@ -640,7 +641,9 @@ async fn test_bitmex_websocket_client_creation() {
         Some("test_key".to_string()),    // api_key
         Some("test_secret".to_string()), // api_secret
         Some(get_test_account_id()),     // account_id
-        None,                            // heartbeat
+        5,                               // heartbeat,
+        TransportBackend::default(),
+        None,
     )
     .unwrap();
 
@@ -658,6 +661,8 @@ async fn test_websocket_connection() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -703,6 +708,8 @@ async fn test_client_replies_to_server_ping() {
         None,
         None,
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -737,6 +744,8 @@ async fn test_subscribe_to_public_data() {
         None, // No API key for public data
         None, // No API secret for public data
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -783,6 +792,8 @@ async fn test_subscribe_to_orderbook() {
         None,
         None,
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -831,6 +842,8 @@ async fn test_subscribe_to_private_data() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -889,6 +902,8 @@ async fn test_reconnection_scenario() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -998,6 +1013,8 @@ async fn test_reconnection_emits_reconnected_message() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1058,6 +1075,8 @@ async fn test_unsubscribe() {
         None,
         None,
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1122,6 +1141,8 @@ async fn test_wait_until_active_timeout() {
         Some("test_key".to_string()),
         Some("test_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1144,6 +1165,8 @@ async fn test_multiple_symbols_subscription() {
         None,
         None,
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1203,6 +1226,8 @@ async fn test_true_auto_reconnect_with_verification() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1353,6 +1378,8 @@ async fn test_auth_and_subscription_restoration_order() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1409,6 +1436,8 @@ async fn test_subscription_restoration_tracking() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1491,6 +1520,8 @@ async fn test_reconnection_retries_failed_subscriptions() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1603,6 +1634,8 @@ async fn test_reconnection_waits_for_delayed_auth_ack() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1716,6 +1749,8 @@ async fn test_unauthenticated_private_channel_rejection() {
         None, // No credentials
         None,
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1750,7 +1785,9 @@ async fn test_heartbeat_timeout_reconnection() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
-        Some(1), // Very short heartbeat interval (1 second)
+        1, // Very short heartbeat interval (1 second),
+        TransportBackend::default(),
+        None,
     )
     .unwrap();
 
@@ -1786,6 +1823,8 @@ async fn test_rapid_consecutive_reconnections() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1899,6 +1938,8 @@ async fn test_multiple_partial_subscription_failures() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1996,6 +2037,8 @@ async fn test_reconnection_race_condition() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -2084,7 +2127,9 @@ async fn test_subscribe_after_stream_call() {
         None,
         None,
         Some(AccountId::from("TEST-001")),
-        Some(1),
+        1,
+        TransportBackend::default(),
+        None,
     )
     .unwrap();
 
@@ -2124,7 +2169,9 @@ async fn test_is_active_false_after_close() {
         None,
         None,
         Some(AccountId::from("TEST-001")),
-        Some(1),
+        1,
+        TransportBackend::default(),
+        None,
     )
     .unwrap();
 
@@ -2159,6 +2206,8 @@ async fn test_is_active_lifecycle() {
         Some("test_key".to_string()),
         Some("test_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -2202,6 +2251,8 @@ async fn test_is_active_false_during_reconnection() {
         Some("test_key".to_string()),
         Some("test_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -2250,6 +2301,8 @@ async fn test_unsubscribed_private_channel_not_resubscribed_after_disconnect() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -2359,6 +2412,8 @@ async fn test_login_failure_emits_error() {
         Some("invalid_key".to_string()),
         Some("invalid_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -2393,7 +2448,9 @@ async fn test_sends_pong_for_text_ping() {
         None,
         None,
         Some(AccountId::new("BITMEX-001")),
-        Some(1), // 1 second heartbeat
+        1, // 1 second heartbeat,
+        TransportBackend::default(),
+        None,
     )
     .unwrap();
 
@@ -2421,6 +2478,8 @@ async fn test_sends_pong_for_control_ping() {
         None,
         None,
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();

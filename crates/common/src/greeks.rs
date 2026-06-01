@@ -17,19 +17,26 @@
 
 use std::{cell::RefCell, collections::HashMap, fmt::Debug, rc::Rc};
 
-use derive_builder::Builder;
+use ahash::AHashMap;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::greeks::{
         GreeksData, OptionGreekValues, PortfolioGreeks, black_scholes_greeks, imply_vol_and_greeks,
+        refine_vol_and_greeks,
     },
-    enums::{InstrumentClass, OptionKind, PositionSide, PriceType},
+    enums::{AssetClass, InstrumentClass, OptionKind, PositionSide, PriceType},
     identifiers::{InstrumentId, StrategyId, Venue},
-    instruments::Instrument,
+    instruments::{Instrument, any::InstrumentAny},
     position::Position,
+    types::Price,
 };
 
-use crate::{cache::Cache, clock::Clock, msgbus, msgbus::TypedHandler};
+use crate::{
+    cache::{Cache, refs::PositionRef},
+    clock::Clock,
+    msgbus,
+    msgbus::TypedHandler,
+};
 
 /// Type alias for a greeks filter function.
 pub type GreeksFilter = Box<dyn Fn(&GreeksData) -> bool>;
@@ -65,7 +72,7 @@ impl GreeksFilterCallback {
         }
     }
 
-    /// Convert to the original GreeksFilter type.
+    /// Convert to the original `GreeksFilter` type.
     pub fn to_greeks_filter(self) -> GreeksFilter {
         match self {
             Self::Function(f) => Box::new(f),
@@ -87,53 +94,53 @@ impl Debug for GreeksFilterCallback {
 }
 
 /// Builder for instrument greeks calculation parameters.
-#[derive(Debug, Builder)]
-#[builder(setter(into), derive(Debug))]
+#[derive(Debug, bon::Builder)]
 pub struct InstrumentGreeksParams {
     /// The instrument ID to calculate greeks for
     pub instrument_id: InstrumentId,
     /// Flat interest rate (default: 0.0425)
-    #[builder(default = "0.0425")]
+    #[builder(default = 0.0425)]
     pub flat_interest_rate: f64,
     /// Flat dividend yield
-    #[builder(default)]
     pub flat_dividend_yield: Option<f64>,
     /// Spot price shock (default: 0.0)
-    #[builder(default = "0.0")]
+    #[builder(default = 0.0)]
     pub spot_shock: f64,
     /// Volatility shock (default: 0.0)
-    #[builder(default = "0.0")]
+    #[builder(default = 0.0)]
     pub vol_shock: f64,
     /// Time to expiry shock (default: 0.0)
-    #[builder(default = "0.0")]
+    #[builder(default = 0.0)]
     pub time_to_expiry_shock: f64,
     /// Whether to use cached greeks (default: false)
-    #[builder(default = "false")]
+    #[builder(default = false)]
     pub use_cached_greeks: bool,
+    /// Whether to update vol from cached greeks (default: false)
+    #[builder(default = false)]
+    pub update_vol: bool,
     /// Whether to cache greeks (default: false)
-    #[builder(default = "false")]
+    #[builder(default = false)]
     pub cache_greeks: bool,
     /// Whether to publish greeks (default: false)
-    #[builder(default = "false")]
+    #[builder(default = false)]
     pub publish_greeks: bool,
     /// Event timestamp
-    #[builder(default)]
     pub ts_event: Option<UnixNanos>,
     /// Position for PnL calculation
-    #[builder(default)]
     pub position: Option<Position>,
     /// Whether to compute percent greeks (default: false)
-    #[builder(default = "false")]
+    #[builder(default = false)]
     pub percent_greeks: bool,
     /// Index instrument ID for beta weighting
-    #[builder(default)]
     pub index_instrument_id: Option<InstrumentId>,
     /// Beta weights for portfolio calculations
-    #[builder(default)]
     pub beta_weights: Option<HashMap<InstrumentId, f64>>,
     /// Base value in days for time-weighting vega
-    #[builder(default)]
     pub vega_time_weight_base: Option<i32>,
+    /// Volatility index instrument ID for vega beta weighting, for example VIX.
+    pub vol_index_instrument_id: Option<InstrumentId>,
+    /// Volatility beta weights for portfolio vega calculations
+    pub vol_beta_weights: Option<HashMap<InstrumentId, f64>>,
 }
 
 impl InstrumentGreeksParams {
@@ -151,6 +158,7 @@ impl InstrumentGreeksParams {
             Some(self.vol_shock),
             Some(self.time_to_expiry_shock),
             Some(self.use_cached_greeks),
+            Some(self.update_vol),
             Some(self.cache_greeks),
             Some(self.publish_greeks),
             self.ts_event,
@@ -159,68 +167,66 @@ impl InstrumentGreeksParams {
             self.index_instrument_id,
             self.beta_weights.as_ref(),
             self.vega_time_weight_base,
+            self.vol_index_instrument_id,
+            self.vol_beta_weights.as_ref(),
         )
     }
 }
 
 /// Builder for portfolio greeks calculation parameters.
-#[derive(Builder)]
-#[builder(setter(into))]
+#[derive(bon::Builder)]
 pub struct PortfolioGreeksParams {
     /// List of underlying symbols to filter by
-    #[builder(default)]
     pub underlyings: Option<Vec<String>>,
     /// Venue to filter positions by
-    #[builder(default)]
     pub venue: Option<Venue>,
     /// Instrument ID to filter positions by
-    #[builder(default)]
     pub instrument_id: Option<InstrumentId>,
     /// Strategy ID to filter positions by
-    #[builder(default)]
     pub strategy_id: Option<StrategyId>,
-    /// Position side to filter by (default: NoPositionSide)
-    #[builder(default)]
+    /// Position side to filter by (default: `NoPositionSide`)
     pub side: Option<PositionSide>,
     /// Flat interest rate (default: 0.0425)
-    #[builder(default = "0.0425")]
+    #[builder(default = 0.0425)]
     pub flat_interest_rate: f64,
     /// Flat dividend yield
-    #[builder(default)]
     pub flat_dividend_yield: Option<f64>,
     /// Spot price shock (default: 0.0)
-    #[builder(default = "0.0")]
+    #[builder(default = 0.0)]
     pub spot_shock: f64,
     /// Volatility shock (default: 0.0)
-    #[builder(default = "0.0")]
+    #[builder(default = 0.0)]
     pub vol_shock: f64,
     /// Time to expiry shock (default: 0.0)
-    #[builder(default = "0.0")]
+    #[builder(default = 0.0)]
     pub time_to_expiry_shock: f64,
     /// Whether to use cached greeks (default: false)
-    #[builder(default = "false")]
+    #[builder(default = false)]
     pub use_cached_greeks: bool,
+    /// Whether to update vol from cached greeks (default: false)
+    #[builder(default = false)]
+    pub update_vol: bool,
     /// Whether to cache greeks (default: false)
-    #[builder(default = "false")]
+    #[builder(default = false)]
     pub cache_greeks: bool,
     /// Whether to publish greeks (default: false)
-    #[builder(default = "false")]
+    #[builder(default = false)]
     pub publish_greeks: bool,
     /// Whether to compute percent greeks (default: false)
-    #[builder(default = "false")]
+    #[builder(default = false)]
     pub percent_greeks: bool,
     /// Index instrument ID for beta weighting
-    #[builder(default)]
     pub index_instrument_id: Option<InstrumentId>,
     /// Beta weights for portfolio calculations
-    #[builder(default)]
     pub beta_weights: Option<HashMap<InstrumentId, f64>>,
     /// Filter function for greeks
-    #[builder(default)]
     pub greeks_filter: Option<GreeksFilterCallback>,
     /// Base value in days for time-weighting vega
-    #[builder(default)]
     pub vega_time_weight_base: Option<i32>,
+    /// Volatility index instrument ID for vega beta weighting, for example VIX.
+    pub vol_index_instrument_id: Option<InstrumentId>,
+    /// Volatility beta weights for portfolio vega calculations
+    pub vol_beta_weights: Option<HashMap<InstrumentId, f64>>,
 }
 
 impl Debug for PortfolioGreeksParams {
@@ -237,12 +243,16 @@ impl Debug for PortfolioGreeksParams {
             .field("vol_shock", &self.vol_shock)
             .field("time_to_expiry_shock", &self.time_to_expiry_shock)
             .field("use_cached_greeks", &self.use_cached_greeks)
+            .field("update_vol", &self.update_vol)
             .field("cache_greeks", &self.cache_greeks)
             .field("publish_greeks", &self.publish_greeks)
             .field("percent_greeks", &self.percent_greeks)
             .field("index_instrument_id", &self.index_instrument_id)
             .field("beta_weights", &self.beta_weights)
             .field("greeks_filter", &self.greeks_filter)
+            .field("vega_time_weight_base", &self.vega_time_weight_base)
+            .field("vol_index_instrument_id", &self.vol_index_instrument_id)
+            .field("vol_beta_weights", &self.vol_beta_weights)
             .finish()
     }
 }
@@ -271,6 +281,7 @@ impl PortfolioGreeksParams {
             Some(self.vol_shock),
             Some(self.time_to_expiry_shock),
             Some(self.use_cached_greeks),
+            Some(self.update_vol),
             Some(self.cache_greeks),
             Some(self.publish_greeks),
             Some(self.percent_greeks),
@@ -278,6 +289,8 @@ impl PortfolioGreeksParams {
             self.beta_weights.as_ref(),
             greeks_filter.as_ref(),
             self.vega_time_weight_base,
+            self.vol_index_instrument_id,
+            self.vol_beta_weights.as_ref(),
         )
     }
 }
@@ -301,12 +314,17 @@ impl PortfolioGreeksParams {
 pub struct GreeksCalculator {
     cache: Rc<RefCell<Cache>>,
     clock: Rc<RefCell<dyn Clock>>,
+    cached_futures_spreads: RefCell<AHashMap<InstrumentId, (InstrumentId, Price)>>,
 }
 
 impl GreeksCalculator {
     /// Creates a new [`GreeksCalculator`] instance.
     pub fn new(cache: Rc<RefCell<Cache>>, clock: Rc<RefCell<dyn Clock>>) -> Self {
-        Self { cache, clock }
+        Self {
+            cache,
+            clock,
+            cached_futures_spreads: RefCell::new(AHashMap::new()),
+        }
     }
 
     /// Calculates option or underlying greeks for a given instrument and a quantity of 1.
@@ -314,16 +332,13 @@ impl GreeksCalculator {
     /// Additional features:
     /// - Apply shocks to the spot value of the instrument's underlying, implied volatility or time to expiry.
     /// - Compute percent greeks.
-    /// - Compute beta-weighted delta and gamma with respect to an index.
+    /// - Compute beta-weighted delta, gamma and vega with respect to an index.
     ///
     /// # Errors
     ///
-    /// Returns an error if the instrument definition is not found or greeks calculation fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the instrument has no underlying identifier.
-    #[allow(clippy::too_many_arguments)]
+    /// Returns an error if the instrument definition is not found, an option instrument
+    /// has no underlying identifier, or greeks calculation fails.
+    #[expect(clippy::too_many_arguments)]
     pub fn instrument_greeks(
         &self,
         instrument_id: InstrumentId,
@@ -333,6 +348,7 @@ impl GreeksCalculator {
         vol_shock: Option<f64>,
         time_to_expiry_shock: Option<f64>,
         use_cached_greeks: Option<bool>,
+        update_vol: Option<bool>,
         cache_greeks: Option<bool>,
         publish_greeks: Option<bool>,
         ts_event: Option<UnixNanos>,
@@ -341,6 +357,8 @@ impl GreeksCalculator {
         index_instrument_id: Option<InstrumentId>,
         beta_weights: Option<&HashMap<InstrumentId, f64>>,
         vega_time_weight_base: Option<i32>,
+        vol_index_instrument_id: Option<InstrumentId>,
+        vol_beta_weights: Option<&HashMap<InstrumentId, f64>>,
     ) -> anyhow::Result<GreeksData> {
         // Set default values
         let flat_interest_rate = flat_interest_rate.unwrap_or(0.0425);
@@ -348,254 +366,419 @@ impl GreeksCalculator {
         let vol_shock = vol_shock.unwrap_or(0.0);
         let time_to_expiry_shock = time_to_expiry_shock.unwrap_or(0.0);
         let use_cached_greeks = use_cached_greeks.unwrap_or(false);
+        let update_vol = update_vol.unwrap_or(false);
         let cache_greeks = cache_greeks.unwrap_or(false);
         let publish_greeks = publish_greeks.unwrap_or(false);
         let ts_event = ts_event.unwrap_or_default();
         let percent_greeks = percent_greeks.unwrap_or(false);
 
-        let cache = self.cache.borrow();
-        let instrument = cache.instrument(&instrument_id);
-        let instrument = match instrument {
-            Some(instrument) => instrument,
-            None => anyhow::bail!(format!(
-                "Instrument definition for {instrument_id} not found."
-            )),
+        let instrument = {
+            let cache = self.cache.borrow();
+            match cache.instrument(&instrument_id) {
+                Some(instrument) => instrument.clone(),
+                None => anyhow::bail!("Instrument definition for {instrument_id} not found"),
+            }
         };
 
         if instrument.instrument_class() != InstrumentClass::Option {
-            let multiplier = instrument.multiplier();
-            let underlying_instrument_id = instrument.id();
-            let underlying_price = cache
-                .price(&underlying_instrument_id, PriceType::Last)
-                .unwrap_or_default()
-                .as_f64();
-            let (delta, _, _) = self.modify_greeks(
-                1.0,
-                0.0,
-                underlying_instrument_id,
-                underlying_price + spot_shock,
-                underlying_price,
-                percent_greeks,
-                index_instrument_id,
-                beta_weights,
-                0.0,
-                0.0,
-                0,
-                None,
-            );
-            let mut greeks_data =
-                GreeksData::from_delta(instrument_id, delta, multiplier.as_f64(), ts_event);
-
-            if let Some(pos) = position {
-                greeks_data.pnl = (underlying_price + spot_shock) - pos.avg_px_open;
-                greeks_data.price = greeks_data.pnl;
-            }
-
-            return Ok(greeks_data);
-        }
-
-        let mut greeks_data = None;
-        let underlying = instrument.underlying().unwrap();
-        let underlying_str = format!("{}.{}", underlying, instrument_id.venue);
-        let underlying_instrument_id = InstrumentId::from(underlying_str);
-
-        // Use cached greeks if requested
-        if use_cached_greeks && let Some(cached_greeks) = cache.greeks(&instrument_id) {
-            greeks_data = Some(cached_greeks);
-        }
-
-        if greeks_data.is_none() {
-            let utc_now_ns = if ts_event == UnixNanos::default() {
-                self.clock.borrow().timestamp_ns()
-            } else {
-                ts_event
-            };
-
-            let utc_now = utc_now_ns.to_datetime_utc();
-            let expiry_utc = instrument
-                .expiration_ns()
-                .map(|ns| ns.to_datetime_utc())
-                .unwrap_or_default();
-            let expiry_int = expiry_utc
-                .format("%Y%m%d")
-                .to_string()
-                .parse::<i32>()
-                .unwrap_or(0);
-            let raw_days = (expiry_utc - utc_now).num_days();
-            let expiry_in_days = raw_days.max(1) as i32;
-            let expiry_in_years = expiry_in_days as f64 / 365.25;
-            let currency = instrument.quote_currency().code.to_string();
-            let interest_rate = match cache.yield_curve(&currency) {
-                Some(yield_curve) => yield_curve(expiry_in_years),
-                None => flat_interest_rate,
-            };
-
-            // cost of carry is 0 for futures
-            let mut cost_of_carry = 0.0;
-
-            if let Some(dividend_curve) = cache.yield_curve(&underlying_instrument_id.to_string()) {
-                let dividend_yield = dividend_curve(expiry_in_years);
-                cost_of_carry = interest_rate - dividend_yield;
-            } else if let Some(div_yield) = flat_dividend_yield {
-                // Use a dividend rate of 0. to have a cost of carry of interest rate for options on stocks
-                cost_of_carry = interest_rate - div_yield;
-            }
-
-            let multiplier = instrument.multiplier();
-            let is_call = instrument.option_kind().unwrap_or(OptionKind::Call) == OptionKind::Call;
-            let strike = instrument.strike_price().unwrap_or_default().as_f64();
-            let option_mid_price = cache
-                .price(&instrument_id, PriceType::Mid)
-                .unwrap_or_default()
-                .as_f64();
-            let underlying_price = cache
-                .price(&underlying_instrument_id, PriceType::Last)
-                .unwrap_or_default()
-                .as_f64();
-
-            let greeks = imply_vol_and_greeks(
-                underlying_price,
-                interest_rate,
-                cost_of_carry,
-                is_call,
-                strike,
-                expiry_in_years,
-                option_mid_price,
-            );
-            let (delta, gamma, vega) = self.modify_greeks(
-                greeks.delta,
-                greeks.gamma,
-                underlying_instrument_id,
-                underlying_price,
-                underlying_price,
-                percent_greeks,
-                index_instrument_id,
-                beta_weights,
-                greeks.vega,
-                greeks.vol,
-                expiry_in_days,
-                vega_time_weight_base,
-            );
-            greeks_data = Some(GreeksData::new(
-                utc_now_ns,
-                utc_now_ns,
+            return self.calculate_non_option_greeks(
+                &instrument,
                 instrument_id,
-                is_call,
-                strike,
-                expiry_int,
-                expiry_in_days,
-                expiry_in_years,
-                multiplier.as_f64(),
-                1.0,
-                underlying_price,
-                interest_rate,
-                cost_of_carry,
-                greeks.vol,
-                0.0,
-                greeks.price,
-                OptionGreekValues {
-                    delta,
-                    gamma,
-                    vega,
-                    theta: greeks.theta,
-                    rho: 0.0,
-                },
-                greeks.itm_prob,
-            ));
-
-            // Adding greeks to cache if requested
-            if cache_greeks {
-                let mut cache = self.cache.borrow_mut();
-                cache
-                    .add_greeks(greeks_data.clone().unwrap())
-                    .unwrap_or_default();
-            }
-
-            // Publishing greeks on the message bus if requested
-            if publish_greeks {
-                let topic = format!(
-                    "data.GreeksData.instrument_id={}",
-                    instrument_id.symbol.as_str()
-                )
-                .into();
-                msgbus::publish_greeks(topic, &greeks_data.clone().unwrap());
-            }
+                spot_shock,
+                ts_event,
+                position,
+                percent_greeks,
+                index_instrument_id,
+                beta_weights,
+            );
         }
 
-        let mut greeks_data = greeks_data.unwrap();
+        let underlying_instrument_id =
+            Self::resolve_underlying_instrument_id(&instrument, instrument_id)?;
+        let mut greeks_data = self.calculate_option_greeks(
+            &instrument,
+            instrument_id,
+            underlying_instrument_id,
+            flat_interest_rate,
+            flat_dividend_yield,
+            use_cached_greeks,
+            update_vol,
+            cache_greeks,
+            publish_greeks,
+            ts_event,
+            percent_greeks,
+            index_instrument_id,
+            beta_weights,
+            vega_time_weight_base,
+            vol_index_instrument_id,
+            vol_beta_weights,
+        )?;
 
         if spot_shock != 0.0 || vol_shock != 0.0 || time_to_expiry_shock != 0.0 {
-            let underlying_price = greeks_data.underlying_price;
-            let shocked_underlying_price = underlying_price + spot_shock;
-            let shocked_vol = greeks_data.vol + vol_shock;
-            let shocked_time_to_expiry = greeks_data.expiry_in_years - time_to_expiry_shock;
-            let shocked_expiry_in_days = (shocked_time_to_expiry * 365.25) as i32;
-
-            let greeks = black_scholes_greeks(
-                shocked_underlying_price,
-                greeks_data.interest_rate,
-                greeks_data.cost_of_carry,
-                shocked_vol,
-                greeks_data.is_call,
-                greeks_data.strike,
-                shocked_time_to_expiry,
-            );
-            let (delta, gamma, vega) = self.modify_greeks(
-                greeks.delta,
-                greeks.gamma,
+            greeks_data = self.apply_option_greeks_shocks(
+                &greeks_data,
                 underlying_instrument_id,
-                shocked_underlying_price,
-                underlying_price,
+                spot_shock,
+                vol_shock,
+                time_to_expiry_shock,
                 percent_greeks,
                 index_instrument_id,
                 beta_weights,
-                greeks.vega,
-                shocked_vol,
-                shocked_expiry_in_days,
                 vega_time_weight_base,
-            );
-            greeks_data = GreeksData::new(
-                greeks_data.ts_event,
-                greeks_data.ts_event,
-                greeks_data.instrument_id,
-                greeks_data.is_call,
-                greeks_data.strike,
-                greeks_data.expiry,
-                shocked_expiry_in_days,
-                shocked_time_to_expiry,
-                greeks_data.multiplier,
-                greeks_data.quantity,
-                shocked_underlying_price,
-                greeks_data.interest_rate,
-                greeks_data.cost_of_carry,
-                shocked_vol,
-                0.0,
-                greeks.price,
-                OptionGreekValues {
-                    delta,
-                    gamma,
-                    vega,
-                    theta: greeks.theta,
-                    rho: 0.0,
-                },
-                greeks.itm_prob,
-            );
+                vol_index_instrument_id,
+                vol_beta_weights,
+            )?;
         }
 
         if let Some(pos) = position {
-            greeks_data.pnl = greeks_data.price - greeks_data.multiplier * pos.avg_px_open;
+            greeks_data.pnl = greeks_data.price - pos.avg_px_open;
         }
 
         Ok(greeks_data)
     }
 
-    /// Modifies delta and gamma based on beta weighting and percentage calculations.
+    fn resolve_underlying_instrument_id(
+        instrument: &InstrumentAny,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<InstrumentId> {
+        let Some(underlying) = instrument.underlying() else {
+            anyhow::bail!("Instrument {instrument_id} has no underlying identifier");
+        };
+
+        Ok(InstrumentId::from(format!(
+            "{}.{}",
+            underlying, instrument_id.venue
+        )))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn calculate_non_option_greeks(
+        &self,
+        instrument: &InstrumentAny,
+        instrument_id: InstrumentId,
+        spot_shock: f64,
+        ts_event: UnixNanos,
+        position: Option<Position>,
+        percent_greeks: bool,
+        index_instrument_id: Option<InstrumentId>,
+        beta_weights: Option<&HashMap<InstrumentId, f64>>,
+    ) -> anyhow::Result<GreeksData> {
+        let multiplier = instrument.multiplier();
+        let underlying_instrument_id = instrument.id();
+        let underlying_price = self
+            .get_price(&underlying_instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("No price available for {underlying_instrument_id}"))?;
+        let (delta, _, _) = self.modify_greeks(
+            1.0,
+            0.0,
+            underlying_instrument_id,
+            underlying_price + spot_shock,
+            underlying_price,
+            percent_greeks,
+            index_instrument_id,
+            beta_weights,
+            0.0,
+            0.0,
+            0,
+            None,
+            0.0,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        let mut greeks_data =
+            GreeksData::from_delta(instrument_id, delta, multiplier.as_f64(), ts_event);
+
+        if let Some(pos) = position {
+            greeks_data.pnl = (underlying_price + spot_shock) - pos.avg_px_open;
+            greeks_data.price = greeks_data.pnl;
+        }
+
+        Ok(greeks_data)
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn calculate_option_greeks(
+        &self,
+        instrument: &InstrumentAny,
+        instrument_id: InstrumentId,
+        underlying_instrument_id: InstrumentId,
+        flat_interest_rate: f64,
+        flat_dividend_yield: Option<f64>,
+        use_cached_greeks: bool,
+        update_vol: bool,
+        cache_greeks: bool,
+        publish_greeks: bool,
+        ts_event: UnixNanos,
+        percent_greeks: bool,
+        index_instrument_id: Option<InstrumentId>,
+        beta_weights: Option<&HashMap<InstrumentId, f64>>,
+        vega_time_weight_base: Option<i32>,
+        vol_index_instrument_id: Option<InstrumentId>,
+        vol_beta_weights: Option<&HashMap<InstrumentId, f64>>,
+    ) -> anyhow::Result<GreeksData> {
+        if use_cached_greeks {
+            let cache = self.cache.borrow();
+            if let Some(cached_greeks) = cache.greeks(&instrument_id) {
+                return Ok(cached_greeks);
+            }
+        }
+
+        let utc_now_ns = if ts_event == UnixNanos::default() {
+            self.clock.borrow().timestamp_ns()
+        } else {
+            ts_event
+        };
+        let utc_now = utc_now_ns.to_datetime_utc();
+        let expiry_utc = instrument
+            .expiration_ns()
+            .map(|ns| ns.to_datetime_utc())
+            .unwrap_or_default();
+        let expiry_int = expiry_utc
+            .format("%Y%m%d")
+            .to_string()
+            .parse::<i32>()
+            .unwrap_or(0);
+        let raw_days = (expiry_utc - utc_now).num_days();
+        let expiry_in_days = raw_days.max(1) as i32;
+        let expiry_in_years = expiry_in_days as f64 / 365.25;
+        let currency = instrument.quote_currency().code.to_string();
+
+        let cache = self.cache.borrow();
+        let yield_curve = cache.yield_curve(&currency);
+        let interest_rate = match yield_curve {
+            Some(yield_curve) => yield_curve(expiry_in_years),
+            None => flat_interest_rate,
+        };
+        let dividend_curve = cache.yield_curve(&underlying_instrument_id.to_string());
+        drop(cache);
+
+        let mut cost_of_carry = 0.0;
+
+        if let Some(dividend_curve) = dividend_curve {
+            cost_of_carry = interest_rate - dividend_curve(expiry_in_years);
+        } else if let Some(div_yield) = flat_dividend_yield {
+            cost_of_carry = interest_rate - div_yield;
+        }
+
+        let multiplier = instrument.multiplier();
+        let is_call = instrument.option_kind().unwrap_or(OptionKind::Call) == OptionKind::Call;
+        let strike = instrument.strike_price().unwrap_or_default().as_f64();
+        let option_price = self
+            .get_price(&instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("No price available for {instrument_id}"))?;
+        let underlying_price = self.get_underlying_price(&underlying_instrument_id)?;
+
+        if let Some(vol_index_id) = vol_index_instrument_id {
+            self.get_price(&vol_index_id)
+                .ok_or_else(|| anyhow::anyhow!("No price available for {vol_index_id}"))?;
+        }
+        let greeks = if update_vol {
+            let cached_greeks = self.cache.borrow().greeks(&instrument_id);
+            match cached_greeks {
+                Some(cached_greeks) => refine_vol_and_greeks(
+                    underlying_price,
+                    interest_rate,
+                    cost_of_carry,
+                    is_call,
+                    strike,
+                    expiry_in_years,
+                    option_price,
+                    cached_greeks.vol,
+                ),
+                None => imply_vol_and_greeks(
+                    underlying_price,
+                    interest_rate,
+                    cost_of_carry,
+                    is_call,
+                    strike,
+                    expiry_in_years,
+                    option_price,
+                ),
+            }
+        } else {
+            imply_vol_and_greeks(
+                underlying_price,
+                interest_rate,
+                cost_of_carry,
+                is_call,
+                strike,
+                expiry_in_years,
+                option_price,
+            )
+        };
+        let (delta, gamma, vega) = self.modify_greeks(
+            greeks.delta,
+            greeks.gamma,
+            underlying_instrument_id,
+            underlying_price,
+            underlying_price,
+            percent_greeks,
+            index_instrument_id,
+            beta_weights,
+            greeks.vega,
+            greeks.vol,
+            expiry_in_days,
+            vega_time_weight_base,
+            greeks.vol,
+            vol_index_instrument_id,
+            vol_beta_weights,
+            None,
+            None,
+        )?;
+        let greeks_data = GreeksData::new(
+            utc_now_ns,
+            utc_now_ns,
+            instrument_id,
+            is_call,
+            strike,
+            expiry_int,
+            expiry_in_days,
+            expiry_in_years,
+            multiplier.as_f64(),
+            1.0,
+            underlying_price,
+            interest_rate,
+            cost_of_carry,
+            greeks.vol,
+            0.0,
+            greeks.price,
+            OptionGreekValues {
+                delta,
+                gamma,
+                vega,
+                theta: greeks.theta,
+                rho: 0.0,
+            },
+            greeks.itm_prob,
+        );
+
+        if cache_greeks {
+            let mut cache = self.cache.borrow_mut();
+            cache.add_greeks(greeks_data.clone()).unwrap_or_default();
+        }
+
+        if publish_greeks {
+            let topic = format!(
+                "data.GreeksData.instrument_id={}",
+                instrument_id.symbol.as_str()
+            )
+            .into();
+            msgbus::publish_greeks(topic, &greeks_data);
+        }
+
+        Ok(greeks_data)
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn apply_option_greeks_shocks(
+        &self,
+        greeks_data: &GreeksData,
+        underlying_instrument_id: InstrumentId,
+        spot_shock: f64,
+        vol_shock: f64,
+        time_to_expiry_shock: f64,
+        percent_greeks: bool,
+        index_instrument_id: Option<InstrumentId>,
+        beta_weights: Option<&HashMap<InstrumentId, f64>>,
+        vega_time_weight_base: Option<i32>,
+        vol_index_instrument_id: Option<InstrumentId>,
+        vol_beta_weights: Option<&HashMap<InstrumentId, f64>>,
+    ) -> anyhow::Result<GreeksData> {
+        let underlying_price = greeks_data.underlying_price;
+        let shocked_underlying_price = underlying_price + spot_shock;
+        let shocked_vol = greeks_data.vol + vol_shock;
+        let shocked_time_to_expiry = greeks_data.expiry_in_years - time_to_expiry_shock;
+        let shocked_expiry_in_days = (shocked_time_to_expiry * 365.25) as i32;
+
+        let greeks = black_scholes_greeks(
+            shocked_underlying_price,
+            greeks_data.interest_rate,
+            greeks_data.cost_of_carry,
+            shocked_vol,
+            greeks_data.is_call,
+            greeks_data.strike,
+            shocked_time_to_expiry,
+        );
+        let (delta, gamma, vega) = self.modify_greeks(
+            greeks.delta,
+            greeks.gamma,
+            underlying_instrument_id,
+            shocked_underlying_price,
+            underlying_price,
+            percent_greeks,
+            index_instrument_id,
+            beta_weights,
+            greeks.vega,
+            shocked_vol,
+            shocked_expiry_in_days,
+            vega_time_weight_base,
+            greeks_data.vol,
+            vol_index_instrument_id,
+            vol_beta_weights,
+            None,
+            None,
+        )?;
+        Ok(GreeksData::new(
+            greeks_data.ts_event,
+            greeks_data.ts_event,
+            greeks_data.instrument_id,
+            greeks_data.is_call,
+            greeks_data.strike,
+            greeks_data.expiry,
+            shocked_expiry_in_days,
+            shocked_time_to_expiry,
+            greeks_data.multiplier,
+            greeks_data.quantity,
+            shocked_underlying_price,
+            greeks_data.interest_rate,
+            greeks_data.cost_of_carry,
+            shocked_vol,
+            0.0,
+            greeks.price,
+            OptionGreekValues {
+                delta,
+                gamma,
+                vega,
+                theta: greeks.theta,
+                rho: 0.0,
+            },
+            greeks.itm_prob,
+        ))
+    }
+
+    fn get_underlying_price(&self, underlying_instrument_id: &InstrumentId) -> anyhow::Result<f64> {
+        if let Some(underlying_price) = self.get_price(underlying_instrument_id) {
+            return Ok(underlying_price);
+        }
+
+        // Only fall back to cached futures spread when the underlying is a future
+        // (or absent from the cache, since the spread was explicitly cached).
+        let is_future_or_absent = {
+            let cache = self.cache.borrow();
+            cache
+                .instrument(underlying_instrument_id)
+                .is_none_or(|inst| inst.instrument_class() == InstrumentClass::Future)
+        };
+
+        if is_future_or_absent
+            && let Some(underlying_price) =
+                self.get_cached_futures_spread_price(*underlying_instrument_id)
+        {
+            return Ok(underlying_price.as_f64());
+        }
+
+        anyhow::bail!("No price available for {underlying_instrument_id}")
+    }
+
+    /// Modifies delta, gamma and vega based on beta weighting and percentage calculations.
     ///
     /// The beta weighting of delta and gamma follows this equation linking the returns of a stock x to the ones of an index I:
     /// (x - x0) / x0 = alpha + beta (I - I0) / I0 + epsilon
     ///
-    /// beta can be obtained by linear regression of stock_return = alpha + beta index_return, it's equal to:
-    /// beta = Covariance(stock_returns, index_returns) / Variance(index_returns)
+    /// beta can be obtained by linear regression of `stock_return` = alpha + beta `index_return`, it's equal to:
+    /// beta = Covariance(`stock_returns`, `index_returns`) / Variance(`index_returns`)
     ///
     /// Considering alpha == 0:
     /// x = x0 + beta x0 / I0 (I-I0)
@@ -604,10 +787,17 @@ impl GreeksCalculator {
     /// These two last equations explain the beta weighting below, considering the price of an option is V(x) and delta and gamma
     /// are the first and second derivatives respectively of V.
     ///
+    /// Vega beta weighting follows the same change of variable with implied volatility and a volatility index.
+    ///
     /// Also percent greeks assume a change of variable to percent returns by writing:
-    /// V(x = x0 * (1 + stock_percent_return / 100))
-    /// or V(I = I0 * (1 + index_percent_return / 100))
-    #[allow(clippy::too_many_arguments)]
+    /// V(x = x0 * (1 + `stock_percent_return` / 100))
+    /// or V(I = I0 * (1 + `index_percent_return` / 100))
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `vol_index_instrument_id` is supplied and no explicit or cached
+    /// volatility index price is available.
+    #[expect(clippy::too_many_arguments)]
     pub fn modify_greeks(
         &self,
         delta_input: f64,
@@ -622,22 +812,29 @@ impl GreeksCalculator {
         vol: f64,
         expiry_in_days: i32,
         vega_time_weight_base: Option<i32>,
-    ) -> (f64, f64, f64) {
+        unshocked_vol: f64,
+        vol_index_instrument_id: Option<InstrumentId>,
+        vol_beta_weights: Option<&HashMap<InstrumentId, f64>>,
+        index_price: Option<f64>,
+        vol_index_price: Option<f64>,
+    ) -> anyhow::Result<(f64, f64, f64)> {
         let mut delta = delta_input;
         let mut gamma = gamma_input;
         let mut vega = vega_input;
 
-        let mut index_price = None;
-
-        if let Some(index_id) = index_instrument_id {
-            let cache = self.cache.borrow();
-            index_price = Some(
-                cache
-                    .price(&index_id, PriceType::Last)
-                    .unwrap_or_default()
-                    .as_f64(),
+        let mut used_index_price = index_price
+            .or_else(|| index_instrument_id.and_then(|index_id| self.get_price(&index_id)));
+        let mut used_index_vol = vol_index_price;
+        if used_index_vol.is_none()
+            && let Some(vol_index_id) = vol_index_instrument_id
+        {
+            used_index_vol = Some(
+                self.get_price(&vol_index_id)
+                    .ok_or_else(|| anyhow::anyhow!("No price available for {vol_index_id}"))?,
             );
+        }
 
+        if used_index_price.is_some() {
             let mut beta = 1.0;
 
             if let Some(weights) = beta_weights
@@ -646,7 +843,8 @@ impl GreeksCalculator {
                 beta = weight;
             }
 
-            if let Some(ref mut idx_price) = index_price {
+            if let Some(ref mut idx_price) = used_index_price {
+                #[allow(clippy::float_cmp, reason = "exact-equality baseline check")]
                 if underlying_price != unshocked_underlying_price {
                     *idx_price += 1.0 / beta
                         * (*idx_price / unshocked_underlying_price)
@@ -659,8 +857,37 @@ impl GreeksCalculator {
             }
         }
 
+        if used_index_vol.is_some() {
+            let mut vega_beta = 1.0;
+            let used_vol = if unshocked_vol == 0.0 {
+                vol
+            } else {
+                unshocked_vol
+            };
+
+            if let Some(weights) = vol_beta_weights
+                && let Some(&weight) = weights.get(&underlying_instrument_id)
+            {
+                vega_beta = weight;
+            }
+
+            if let Some(ref mut idx_vol) = used_index_vol {
+                *idx_vol *= 0.01;
+
+                #[allow(clippy::float_cmp, reason = "exact-equality baseline check")]
+                if vol != used_vol && used_vol != 0.0 {
+                    *idx_vol += 1.0 / vega_beta * (*idx_vol / used_vol) * (vol - used_vol);
+                }
+
+                #[allow(clippy::float_cmp, reason = "zero price guard")]
+                if *idx_vol != 0.0 {
+                    vega *= vega_beta * vol / *idx_vol;
+                }
+            }
+        }
+
         if percent_greeks {
-            if let Some(idx_price) = index_price {
+            if let Some(idx_price) = used_index_price {
                 delta *= idx_price / 100.0;
                 gamma *= (idx_price / 100.0).powi(2);
             } else {
@@ -668,8 +895,11 @@ impl GreeksCalculator {
                 gamma *= (underlying_price / 100.0).powi(2);
             }
 
-            // Apply percent vega when percent_greeks is True
-            vega *= vol / 100.0;
+            if let Some(idx_vol) = used_index_vol {
+                vega *= idx_vol / 100.0;
+            } else {
+                vega *= vol / 100.0;
+            }
         }
 
         // Apply time weighting to vega if vega_time_weight_base is provided
@@ -680,7 +910,7 @@ impl GreeksCalculator {
             vega *= time_weight;
         }
 
-        (delta, gamma, vega)
+        Ok((delta, gamma, vega))
     }
 
     /// Calculates the portfolio Greeks for a given set of positions.
@@ -690,14 +920,13 @@ impl GreeksCalculator {
     /// Additional features:
     /// - Apply shocks to the spot value of an instrument's underlying, implied volatility or time to expiry.
     /// - Compute percent greeks.
-    /// - Compute beta-weighted delta and gamma with respect to an index.
+    /// - Compute beta-weighted delta, gamma and vega with respect to an index.
     ///
     /// # Errors
     ///
     /// Returns an error if any underlying greeks calculation fails.
     ///
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::missing_panics_doc)] // Guarded by is_none check
+    #[expect(clippy::too_many_arguments)]
     pub fn portfolio_greeks(
         &self,
         underlyings: Option<&[String]>,
@@ -711,6 +940,7 @@ impl GreeksCalculator {
         vol_shock: Option<f64>,
         time_to_expiry_shock: Option<f64>,
         use_cached_greeks: Option<bool>,
+        update_vol: Option<bool>,
         cache_greeks: Option<bool>,
         publish_greeks: Option<bool>,
         percent_greeks: Option<bool>,
@@ -718,6 +948,8 @@ impl GreeksCalculator {
         beta_weights: Option<&HashMap<InstrumentId, f64>>,
         greeks_filter: Option<&GreeksFilter>,
         vega_time_weight_base: Option<i32>,
+        vol_index_instrument_id: Option<InstrumentId>,
+        vol_beta_weights: Option<&HashMap<InstrumentId, f64>>,
     ) -> anyhow::Result<PortfolioGreeks> {
         let ts_event = self.clock.borrow().timestamp_ns();
         let mut portfolio_greeks =
@@ -729,6 +961,7 @@ impl GreeksCalculator {
         let vol_shock = vol_shock.unwrap_or(0.0);
         let time_to_expiry_shock = time_to_expiry_shock.unwrap_or(0.0);
         let use_cached_greeks = use_cached_greeks.unwrap_or(false);
+        let update_vol = update_vol.unwrap_or(false);
         let cache_greeks = cache_greeks.unwrap_or(false);
         let publish_greeks = publish_greeks.unwrap_or(false);
         let percent_greeks = percent_greeks.unwrap_or(false);
@@ -742,7 +975,8 @@ impl GreeksCalculator {
             None, // account_id
             Some(side),
         );
-        let open_positions: Vec<Position> = open_positions.iter().map(|&p| p.clone()).collect();
+        let open_positions: Vec<Position> =
+            open_positions.iter().map(PositionRef::cloned).collect();
 
         for position in open_positions {
             let position_instrument_id = position.instrument_id;
@@ -775,6 +1009,7 @@ impl GreeksCalculator {
                 Some(vol_shock),
                 Some(time_to_expiry_shock),
                 Some(use_cached_greeks),
+                Some(update_vol),
                 Some(cache_greeks),
                 Some(publish_greeks),
                 Some(ts_event),
@@ -783,16 +1018,210 @@ impl GreeksCalculator {
                 index_instrument_id,
                 beta_weights,
                 vega_time_weight_base,
+                vol_index_instrument_id,
+                vol_beta_weights,
             )?;
-            let position_greeks = (quantity * &instrument_greeks).into();
+            let position_greeks = quantity * &instrument_greeks;
 
             // Apply greeks filter if provided
-            if greeks_filter.is_none() || greeks_filter.unwrap()(&instrument_greeks) {
-                portfolio_greeks = portfolio_greeks + position_greeks;
+            if greeks_filter.is_none_or(|filter| filter(&position_greeks)) {
+                portfolio_greeks = portfolio_greeks + PortfolioGreeks::from(position_greeks);
             }
         }
 
         Ok(portfolio_greeks)
+    }
+
+    /// Cache a futures spread derived from a call/put pair against a reference future.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if instruments or prices are missing or inconsistent.
+    pub fn cache_futures_spread(
+        &self,
+        call_instrument_id: InstrumentId,
+        put_instrument_id: InstrumentId,
+        futures_instrument_id: InstrumentId,
+    ) -> anyhow::Result<Price> {
+        let cache = self.cache.borrow();
+        let call_instrument = cache.instrument(&call_instrument_id).cloned();
+        let put_instrument = cache.instrument(&put_instrument_id).cloned();
+        let reference_future_instrument = cache.instrument(&futures_instrument_id).cloned();
+        drop(cache);
+
+        let Some(call_instrument) = call_instrument else {
+            anyhow::bail!(
+                "Cannot cache futures spread: missing option instrument {call_instrument_id}"
+            );
+        };
+        let Some(put_instrument) = put_instrument else {
+            anyhow::bail!(
+                "Cannot cache futures spread: missing option instrument {put_instrument_id}"
+            );
+        };
+        let Some(reference_future_instrument) = reference_future_instrument else {
+            anyhow::bail!(
+                "Cannot cache futures spread: no reference futures instrument for {futures_instrument_id}"
+            );
+        };
+
+        if call_instrument.instrument_class() != InstrumentClass::Option
+            || put_instrument.instrument_class() != InstrumentClass::Option
+        {
+            anyhow::bail!(
+                "Cannot cache futures spread: non-option instruments provided call_instrument_id={call_instrument_id} put_instrument_id={put_instrument_id}"
+            );
+        }
+
+        if call_instrument.option_kind() != Some(OptionKind::Call)
+            || put_instrument.option_kind() != Some(OptionKind::Put)
+        {
+            anyhow::bail!(
+                "Cannot cache futures spread: expected call/put pair call_instrument_id={call_instrument_id} put_instrument_id={put_instrument_id}"
+            );
+        }
+
+        let Some(call_underlying) = call_instrument.underlying() else {
+            anyhow::bail!(
+                "Cannot cache futures spread: missing call underlying for {call_instrument_id}"
+            );
+        };
+        let Some(put_underlying) = put_instrument.underlying() else {
+            anyhow::bail!(
+                "Cannot cache futures spread: missing put underlying for {put_instrument_id}"
+            );
+        };
+
+        if call_underlying != put_underlying {
+            anyhow::bail!(
+                "Cannot cache futures spread: option underlyings differ call_instrument_id={call_instrument_id} put_instrument_id={put_instrument_id}"
+            );
+        }
+
+        if call_instrument.strike_price() != put_instrument.strike_price() {
+            anyhow::bail!(
+                "Cannot cache futures spread: strike prices differ call_instrument_id={call_instrument_id} put_instrument_id={put_instrument_id}"
+            );
+        }
+
+        if call_instrument.expiration_ns() != put_instrument.expiration_ns() {
+            anyhow::bail!(
+                "Cannot cache futures spread: expiration dates differ call_instrument_id={call_instrument_id} put_instrument_id={put_instrument_id}"
+            );
+        }
+
+        let reference_future_price = self.get_price_object(&futures_instrument_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot cache futures spread: no reference futures price for {futures_instrument_id}"
+            )
+        })?;
+        let call_price = self.get_price(&call_instrument_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot cache futures spread: missing option price for {call_instrument_id}"
+            )
+        })?;
+        let put_price = self.get_price(&put_instrument_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot cache futures spread: missing option price for {put_instrument_id}"
+            )
+        })?;
+
+        let underlying_instrument_id =
+            InstrumentId::from(format!("{call_underlying}.{}", call_instrument_id.venue));
+
+        // Reject if the underlying is present in cache but is not a future
+        {
+            let cache = self.cache.borrow();
+            if let Some(underlying) = cache.instrument(&underlying_instrument_id)
+                && underlying.instrument_class() != InstrumentClass::Future
+            {
+                anyhow::bail!(
+                    "Cannot cache futures spread: underlying {underlying_instrument_id} is not a futures contract"
+                );
+            }
+        }
+
+        let implied_future_price =
+            self.calculate_implied_future_price(&call_instrument, call_price, put_price);
+        let spread = implied_future_price - reference_future_price.as_f64();
+        let spread_price = reference_future_instrument.make_price(spread);
+
+        self.cached_futures_spreads.borrow_mut().insert(
+            underlying_instrument_id,
+            (futures_instrument_id, spread_price),
+        );
+
+        Ok(reference_future_price + spread_price)
+    }
+
+    fn calculate_implied_future_price(
+        &self,
+        call_instrument: &InstrumentAny,
+        call_price: f64,
+        put_price: f64,
+    ) -> f64 {
+        let expiry_utc = call_instrument
+            .expiration_ns()
+            .map(|ns| ns.to_datetime_utc())
+            .unwrap_or_default();
+        let expiry_in_days = (expiry_utc - self.clock.borrow().timestamp_ns().to_datetime_utc())
+            .num_days()
+            .max(1) as i32;
+        let expiry_in_years = expiry_in_days as f64 / 365.25;
+        let currency = call_instrument.quote_currency().code.to_string();
+        let interest_rate = self
+            .cache
+            .borrow()
+            .yield_curve(&currency)
+            .map_or(0.0425, |yield_curve| yield_curve(expiry_in_years));
+        let strike = call_instrument.strike_price().unwrap_or_default().as_f64();
+
+        strike + (interest_rate * expiry_in_years).exp() * (call_price - put_price)
+    }
+
+    /// Resolve a cached futures spread price for an underlying future.
+    #[must_use]
+    pub fn get_cached_futures_spread_price(
+        &self,
+        underlying_instrument_id: InstrumentId,
+    ) -> Option<Price> {
+        let (futures_instrument_id, spread) = self
+            .cached_futures_spreads
+            .borrow()
+            .get(&underlying_instrument_id)
+            .copied()?;
+        let reference_future_price = self.get_price_object(&futures_instrument_id)?;
+
+        Some(reference_future_price + spread)
+    }
+
+    fn get_price_object(&self, instrument_id: &InstrumentId) -> Option<Price> {
+        let cache = self.cache.borrow();
+        let price = cache
+            .price(instrument_id, PriceType::Mid)
+            .or_else(|| cache.price(instrument_id, PriceType::Last));
+
+        // For index-class futures, prefer tradable quotes over the published index
+        // price since index price is the spot level and may diverge from futures basis.
+        // For true index instruments (non-futures), prefer the published index price.
+        if let Some(instrument) = cache.instrument(instrument_id)
+            && instrument.asset_class() == AssetClass::Index
+        {
+            if instrument.instrument_class() == InstrumentClass::Future && price.is_some() {
+                return price;
+            }
+
+            if let Some(index_price) = cache.index_price(instrument_id) {
+                return Some(index_price.value);
+            }
+        }
+
+        price
+    }
+
+    fn get_price(&self, instrument_id: &InstrumentId) -> Option<f64> {
+        self.get_price_object(instrument_id)
+            .map(|price| price.as_f64())
     }
 
     /// Subscribes to Greeks data for a given underlying instrument.
@@ -824,10 +1253,10 @@ mod tests {
 
     use chrono::{TimeZone, Utc};
     use nautilus_model::{
-        data::QuoteTick,
+        data::{IndexPriceUpdate, QuoteTick},
         enums::{AssetClass, OptionKind, PositionSide},
         identifiers::{InstrumentId, StrategyId, Symbol, Venue},
-        instruments::{Equity, OptionContract, any::InstrumentAny},
+        instruments::{Equity, FuturesContract, OptionContract, any::InstrumentAny},
         types::{Currency, Price, Quantity},
     };
     use rstest::rstest;
@@ -871,10 +1300,9 @@ mod tests {
     fn test_instrument_greeks_params_builder_default() {
         let instrument_id = InstrumentId::from("AAPL.NASDAQ");
 
-        let params = InstrumentGreeksParamsBuilder::default()
+        let params = InstrumentGreeksParams::builder()
             .instrument_id(instrument_id)
-            .build()
-            .expect("Failed to build InstrumentGreeksParams");
+            .build();
 
         assert_eq!(params.instrument_id, instrument_id);
         assert_eq!(params.flat_interest_rate, 0.0425);
@@ -890,19 +1318,24 @@ mod tests {
         assert!(!params.percent_greeks);
         assert_eq!(params.index_instrument_id, None);
         assert_eq!(params.beta_weights, None);
+        assert_eq!(params.vol_index_instrument_id, None);
+        assert_eq!(params.vol_beta_weights, None);
     }
 
     #[rstest]
     fn test_instrument_greeks_params_builder_custom_values() {
         let instrument_id = InstrumentId::from("AAPL.NASDAQ");
         let index_id = InstrumentId::from("SPY.NASDAQ");
+        let vol_index_id = InstrumentId::from("VIX.XCBF");
         let mut beta_weights = HashMap::new();
         beta_weights.insert(instrument_id, 1.2);
+        let mut vol_beta_weights = HashMap::new();
+        vol_beta_weights.insert(instrument_id, 0.8);
 
-        let params = InstrumentGreeksParamsBuilder::default()
+        let params = InstrumentGreeksParams::builder()
             .instrument_id(instrument_id)
             .flat_interest_rate(0.05)
-            .flat_dividend_yield(Some(0.02))
+            .flat_dividend_yield(0.02)
             .spot_shock(0.01)
             .vol_shock(0.05)
             .time_to_expiry_shock(0.1)
@@ -910,10 +1343,11 @@ mod tests {
             .cache_greeks(true)
             .publish_greeks(true)
             .percent_greeks(true)
-            .index_instrument_id(Some(index_id))
-            .beta_weights(Some(beta_weights.clone()))
-            .build()
-            .expect("Failed to build InstrumentGreeksParams");
+            .index_instrument_id(index_id)
+            .beta_weights(beta_weights.clone())
+            .vol_index_instrument_id(vol_index_id)
+            .vol_beta_weights(vol_beta_weights.clone())
+            .build();
 
         assert_eq!(params.instrument_id, instrument_id);
         assert_eq!(params.flat_interest_rate, 0.05);
@@ -927,16 +1361,17 @@ mod tests {
         assert!(params.percent_greeks);
         assert_eq!(params.index_instrument_id, Some(index_id));
         assert_eq!(params.beta_weights, Some(beta_weights));
+        assert_eq!(params.vol_index_instrument_id, Some(vol_index_id));
+        assert_eq!(params.vol_beta_weights, Some(vol_beta_weights));
     }
 
     #[rstest]
     fn test_instrument_greeks_params_debug() {
         let instrument_id = InstrumentId::from("AAPL.NASDAQ");
 
-        let params = InstrumentGreeksParamsBuilder::default()
+        let params = InstrumentGreeksParams::builder()
             .instrument_id(instrument_id)
-            .build()
-            .expect("Failed to build InstrumentGreeksParams");
+            .build();
 
         let debug_str = format!("{params:?}");
         assert!(debug_str.contains("InstrumentGreeksParams"));
@@ -945,9 +1380,7 @@ mod tests {
 
     #[rstest]
     fn test_portfolio_greeks_params_builder_default() {
-        let params = PortfolioGreeksParamsBuilder::default()
-            .build()
-            .expect("Failed to build PortfolioGreeksParams");
+        let params = PortfolioGreeksParams::builder().build();
 
         assert_eq!(params.underlyings, None);
         assert_eq!(params.venue, None);
@@ -965,6 +1398,8 @@ mod tests {
         assert!(!params.percent_greeks);
         assert_eq!(params.index_instrument_id, None);
         assert_eq!(params.beta_weights, None);
+        assert_eq!(params.vol_index_instrument_id, None);
+        assert_eq!(params.vol_beta_weights, None);
     }
 
     #[rstest]
@@ -973,18 +1408,21 @@ mod tests {
         let instrument_id = InstrumentId::from("AAPL.NASDAQ");
         let strategy_id = StrategyId::from("test-strategy");
         let index_id = InstrumentId::from("SPY.NASDAQ");
+        let vol_index_id = InstrumentId::from("VIX.XCBF");
         let underlyings = vec!["AAPL".to_string(), "MSFT".to_string()];
         let mut beta_weights = HashMap::new();
         beta_weights.insert(instrument_id, 1.2);
+        let mut vol_beta_weights = HashMap::new();
+        vol_beta_weights.insert(instrument_id, 0.8);
 
-        let params = PortfolioGreeksParamsBuilder::default()
-            .underlyings(Some(underlyings.clone()))
-            .venue(Some(venue))
-            .instrument_id(Some(instrument_id))
-            .strategy_id(Some(strategy_id))
-            .side(Some(PositionSide::Long))
+        let params = PortfolioGreeksParams::builder()
+            .underlyings(underlyings.clone())
+            .venue(venue)
+            .instrument_id(instrument_id)
+            .strategy_id(strategy_id)
+            .side(PositionSide::Long)
             .flat_interest_rate(0.05)
-            .flat_dividend_yield(Some(0.02))
+            .flat_dividend_yield(0.02)
             .spot_shock(0.01)
             .vol_shock(0.05)
             .time_to_expiry_shock(0.1)
@@ -992,10 +1430,11 @@ mod tests {
             .cache_greeks(true)
             .publish_greeks(true)
             .percent_greeks(true)
-            .index_instrument_id(Some(index_id))
-            .beta_weights(Some(beta_weights.clone()))
-            .build()
-            .expect("Failed to build PortfolioGreeksParams");
+            .index_instrument_id(index_id)
+            .beta_weights(beta_weights.clone())
+            .vol_index_instrument_id(vol_index_id)
+            .vol_beta_weights(vol_beta_weights.clone())
+            .build();
 
         assert_eq!(params.underlyings, Some(underlyings));
         assert_eq!(params.venue, Some(venue));
@@ -1013,16 +1452,15 @@ mod tests {
         assert!(params.percent_greeks);
         assert_eq!(params.index_instrument_id, Some(index_id));
         assert_eq!(params.beta_weights, Some(beta_weights));
+        assert_eq!(params.vol_index_instrument_id, Some(vol_index_id));
+        assert_eq!(params.vol_beta_weights, Some(vol_beta_weights));
     }
 
     #[rstest]
     fn test_portfolio_greeks_params_debug() {
         let venue = Venue::from("NASDAQ");
 
-        let params = PortfolioGreeksParamsBuilder::default()
-            .venue(Some(venue))
-            .build()
-            .expect("Failed to build PortfolioGreeksParams");
+        let params = PortfolioGreeksParams::builder().venue(venue).build();
 
         let debug_str = format!("{params:?}");
         assert!(debug_str.contains("PortfolioGreeksParams"));
@@ -1030,23 +1468,15 @@ mod tests {
     }
 
     #[rstest]
-    fn test_instrument_greeks_params_builder_missing_required_field() {
-        // Test that building without required instrument_id fails
-        let result = InstrumentGreeksParamsBuilder::default().build();
-        assert!(result.is_err());
-    }
-
-    #[rstest]
     fn test_portfolio_greeks_params_builder_fluent_api() {
         let instrument_id = InstrumentId::from("AAPL.NASDAQ");
 
-        let params = PortfolioGreeksParamsBuilder::default()
-            .instrument_id(Some(instrument_id))
+        let params = PortfolioGreeksParams::builder()
+            .instrument_id(instrument_id)
             .flat_interest_rate(0.05)
             .spot_shock(0.01)
             .percent_greeks(true)
-            .build()
-            .expect("Failed to build PortfolioGreeksParams");
+            .build();
 
         assert_eq!(params.instrument_id, Some(instrument_id));
         assert_eq!(params.flat_interest_rate, 0.05);
@@ -1059,15 +1489,14 @@ mod tests {
         let instrument_id = InstrumentId::from("TSLA.NASDAQ");
 
         // Test fluent API chaining
-        let params = InstrumentGreeksParamsBuilder::default()
+        let params = InstrumentGreeksParams::builder()
             .instrument_id(instrument_id)
             .flat_interest_rate(0.03)
             .spot_shock(0.02)
             .vol_shock(0.1)
             .use_cached_greeks(true)
             .percent_greeks(true)
-            .build()
-            .expect("Failed to build InstrumentGreeksParams");
+            .build();
 
         assert_eq!(params.instrument_id, instrument_id);
         assert_eq!(params.flat_interest_rate, 0.03);
@@ -1081,11 +1510,10 @@ mod tests {
     fn test_portfolio_greeks_params_builder_with_underlyings() {
         let underlyings = vec!["AAPL".to_string(), "MSFT".to_string(), "GOOGL".to_string()];
 
-        let params = PortfolioGreeksParamsBuilder::default()
-            .underlyings(Some(underlyings.clone()))
+        let params = PortfolioGreeksParams::builder()
+            .underlyings(underlyings.clone())
             .flat_interest_rate(0.04)
-            .build()
-            .expect("Failed to build PortfolioGreeksParams");
+            .build();
 
         assert_eq!(params.underlyings, Some(underlyings));
         assert_eq!(params.flat_interest_rate, 0.04);
@@ -1096,42 +1524,42 @@ mod tests {
         let instrument_id = InstrumentId::from("NVDA.NASDAQ");
         let empty_beta_weights = HashMap::new();
 
-        let instrument_params = InstrumentGreeksParamsBuilder::default()
+        let instrument_params = InstrumentGreeksParams::builder()
             .instrument_id(instrument_id)
-            .beta_weights(Some(empty_beta_weights.clone()))
-            .build()
-            .expect("Failed to build InstrumentGreeksParams");
+            .beta_weights(empty_beta_weights.clone())
+            .vol_beta_weights(empty_beta_weights.clone())
+            .build();
 
-        let portfolio_params = PortfolioGreeksParamsBuilder::default()
-            .beta_weights(Some(empty_beta_weights.clone()))
-            .build()
-            .expect("Failed to build PortfolioGreeksParams");
+        let portfolio_params = PortfolioGreeksParams::builder()
+            .beta_weights(empty_beta_weights.clone())
+            .vol_beta_weights(empty_beta_weights.clone())
+            .build();
 
         assert_eq!(
             instrument_params.beta_weights,
             Some(empty_beta_weights.clone())
         );
         assert_eq!(portfolio_params.beta_weights, Some(empty_beta_weights));
+        assert_eq!(instrument_params.vol_beta_weights, Some(HashMap::new()));
+        assert_eq!(portfolio_params.vol_beta_weights, Some(HashMap::new()));
     }
 
     #[rstest]
     fn test_builders_with_all_shocks() {
         let instrument_id = InstrumentId::from("AMD.NASDAQ");
 
-        let instrument_params = InstrumentGreeksParamsBuilder::default()
+        let instrument_params = InstrumentGreeksParams::builder()
             .instrument_id(instrument_id)
             .spot_shock(0.05)
             .vol_shock(0.1)
             .time_to_expiry_shock(0.01)
-            .build()
-            .expect("Failed to build InstrumentGreeksParams");
+            .build();
 
-        let portfolio_params = PortfolioGreeksParamsBuilder::default()
+        let portfolio_params = PortfolioGreeksParams::builder()
             .spot_shock(0.05)
             .vol_shock(0.1)
             .time_to_expiry_shock(0.01)
-            .build()
-            .expect("Failed to build PortfolioGreeksParams");
+            .build();
 
         assert_eq!(instrument_params.spot_shock, 0.05);
         assert_eq!(instrument_params.vol_shock, 0.1);
@@ -1146,22 +1574,20 @@ mod tests {
     fn test_builders_with_all_boolean_flags() {
         let instrument_id = InstrumentId::from("META.NASDAQ");
 
-        let instrument_params = InstrumentGreeksParamsBuilder::default()
+        let instrument_params = InstrumentGreeksParams::builder()
             .instrument_id(instrument_id)
             .use_cached_greeks(true)
             .cache_greeks(true)
             .publish_greeks(true)
             .percent_greeks(true)
-            .build()
-            .expect("Failed to build InstrumentGreeksParams");
+            .build();
 
-        let portfolio_params = PortfolioGreeksParamsBuilder::default()
+        let portfolio_params = PortfolioGreeksParams::builder()
             .use_cached_greeks(true)
             .cache_greeks(true)
             .publish_greeks(true)
             .percent_greeks(true)
-            .build()
-            .expect("Failed to build PortfolioGreeksParams");
+            .build();
 
         assert!(instrument_params.use_cached_greeks);
         assert!(instrument_params.cache_greeks);
@@ -1248,11 +1674,10 @@ mod tests {
 
         let filter = GreeksFilterCallback::from_fn(filter_high_delta);
 
-        let params = PortfolioGreeksParamsBuilder::default()
-            .greeks_filter(Some(filter))
+        let params = PortfolioGreeksParams::builder()
+            .greeks_filter(filter)
             .flat_interest_rate(0.05)
-            .build()
-            .expect("Failed to build PortfolioGreeksParams");
+            .build();
 
         assert!(params.greeks_filter.is_some());
         assert_eq!(params.flat_interest_rate, 0.05);
@@ -1275,10 +1700,9 @@ mod tests {
         let filter =
             GreeksFilterCallback::from_closure(move |data: &GreeksData| data.gamma > min_gamma);
 
-        let params = PortfolioGreeksParamsBuilder::default()
-            .greeks_filter(Some(filter))
-            .build()
-            .expect("Failed to build PortfolioGreeksParams");
+        let params = PortfolioGreeksParams::builder()
+            .greeks_filter(filter)
+            .build();
 
         assert!(params.greeks_filter.is_some());
 
@@ -1360,6 +1784,90 @@ mod tests {
         )
     }
 
+    #[rstest]
+    fn test_resolve_underlying_instrument_id_errors_without_underlying() {
+        let instrument = InstrumentAny::Equity(equity_aapl_opra());
+        let error = GreeksCalculator::resolve_underlying_instrument_id(
+            &instrument,
+            InstrumentId::from("AAPL.OPRA"),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Instrument AAPL.OPRA has no underlying identifier"
+        );
+    }
+
+    fn future_with_expiration(
+        instrument_id: &str,
+        underlying: &str,
+        expiration_ns: UnixNanos,
+    ) -> FuturesContract {
+        FuturesContract::new(
+            InstrumentId::from(instrument_id),
+            Symbol::from(underlying),
+            AssetClass::Index,
+            Some(Ustr::from("XCME")),
+            Ustr::from(underlying),
+            UnixNanos::default(),
+            expiration_ns,
+            Currency::from("USD"),
+            2,
+            Price::from("0.25"),
+            Quantity::from(1),
+            Quantity::from(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        )
+    }
+
+    fn future_option_with_expiration(
+        instrument_id: &str,
+        raw_symbol: &str,
+        underlying: &str,
+        option_kind: OptionKind,
+        strike: &str,
+        expiration_ns: UnixNanos,
+    ) -> OptionContract {
+        OptionContract::new(
+            InstrumentId::from(instrument_id),
+            Symbol::from(raw_symbol),
+            AssetClass::Index,
+            Some(Ustr::from("XCME")),
+            Ustr::from(underlying),
+            option_kind,
+            Price::from(strike),
+            Currency::from("USD"),
+            UnixNanos::default(),
+            expiration_ns,
+            2,
+            Price::from("0.01"),
+            Quantity::from(1),
+            Quantity::from(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        )
+    }
+
     fn setup_cache_with_option_and_quotes(
         option: OptionContract,
         underlying_id: InstrumentId,
@@ -1422,7 +1930,10 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(now_ns),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1459,7 +1970,10 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(now_ns),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1470,5 +1984,715 @@ mod tests {
 
         assert_eq!(greeks.expiry_in_days, 1);
         assert!((greeks.expiry_in_years - 1.0 / 365.25).abs() < 1e-9);
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_beta_weights_vega_to_vol_index() {
+        let now = Utc.with_ymd_and_hms(2025, 3, 8, 12, 0, 0).unwrap();
+        let expiry = now + chrono::Duration::days(30);
+        let now_ns = UnixNanos::from(now);
+        let expiry_ns = UnixNanos::from(expiry);
+        let option = option_with_expiration("AAPL250417C00150000.OPRA", expiry_ns);
+        let option_id = option.id();
+        let underlying_id = InstrumentId::from("AAPL.OPRA");
+        let vol_index_id = InstrumentId::from("VIX.XCBF");
+        let cache = setup_cache_with_option_and_quotes(option, underlying_id, now_ns);
+        cache
+            .borrow_mut()
+            .add_quote(QuoteTick::new(
+                vol_index_id,
+                Price::from("25.00"),
+                Price::from("25.00"),
+                Quantity::from(100),
+                Quantity::from(100),
+                now_ns,
+                now_ns,
+            ))
+            .unwrap();
+
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let calculator = GreeksCalculator::new(cache, clock);
+        let greeks = calculator
+            .instrument_greeks(
+                option_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let mut vol_beta_weights = HashMap::new();
+        vol_beta_weights.insert(underlying_id, 0.75);
+        let vol_weighted_greeks = calculator
+            .instrument_greeks(
+                option_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(vol_index_id),
+                Some(&vol_beta_weights),
+            )
+            .unwrap();
+
+        let expected_vega = greeks.vega * 0.75 * (greeks.vol * 100.0) / 25.0;
+        assert_eq!(
+            (vol_weighted_greeks.delta * 1e12).round(),
+            (greeks.delta * 1e12).round()
+        );
+        assert_eq!(
+            (vol_weighted_greeks.gamma * 1e12).round(),
+            (greeks.gamma * 1e12).round()
+        );
+        assert_eq!(
+            (vol_weighted_greeks.vega * 1e12).round(),
+            (expected_vega * 1e12).round()
+        );
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_errors_when_vol_index_price_missing() {
+        let now = Utc.with_ymd_and_hms(2025, 3, 8, 12, 0, 0).unwrap();
+        let expiry = now + chrono::Duration::days(30);
+        let now_ns = UnixNanos::from(now);
+        let expiry_ns = UnixNanos::from(expiry);
+        let option = option_with_expiration("AAPL250417C00150000.OPRA", expiry_ns);
+        let option_id = option.id();
+        let underlying_id = InstrumentId::from("AAPL.OPRA");
+        let vol_index_id = InstrumentId::from("VIX.XCBF");
+        let cache = setup_cache_with_option_and_quotes(option, underlying_id, now_ns);
+
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let calculator = GreeksCalculator::new(cache, clock);
+        let error = calculator
+            .instrument_greeks(
+                option_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(vol_index_id),
+                None,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "No price available for VIX.XCBF");
+    }
+
+    #[rstest]
+    fn test_modify_greeks_errors_when_vol_index_price_missing() {
+        let calculator = create_test_calculator();
+        let underlying_id = InstrumentId::from("AAPL.OPRA");
+        let vol_index_id = InstrumentId::from("VIX.XCBF");
+
+        let error = calculator
+            .modify_greeks(
+                1.0,
+                2.0,
+                underlying_id,
+                150.0,
+                150.0,
+                false,
+                None,
+                None,
+                2.0,
+                0.30,
+                0,
+                None,
+                0.0,
+                Some(vol_index_id),
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "No price available for VIX.XCBF");
+    }
+
+    #[rstest]
+    fn test_modify_greeks_accepts_explicit_index_prices() {
+        let calculator = create_test_calculator();
+        let underlying_id = InstrumentId::from("AAPL.OPRA");
+        let mut beta_weights = HashMap::new();
+        beta_weights.insert(underlying_id, 0.5);
+        let mut vol_beta_weights = HashMap::new();
+        vol_beta_weights.insert(underlying_id, 0.75);
+
+        let (delta, gamma, vega) = calculator
+            .modify_greeks(
+                1.0,
+                2.0,
+                underlying_id,
+                150.0,
+                150.0,
+                false,
+                None,
+                Some(&beta_weights),
+                2.0,
+                0.30,
+                0,
+                None,
+                0.0,
+                None,
+                Some(&vol_beta_weights),
+                Some(200.0),
+                Some(25.0),
+            )
+            .unwrap();
+
+        assert_eq!((delta * 1e12).round(), 375_000_000_000.0);
+        assert_eq!((gamma * 1e12).round(), 281_250_000_000.0);
+        assert_eq!((vega * 1e12).round(), 1_800_000_000_000.0);
+
+        let (delta, gamma, vega) = calculator
+            .modify_greeks(
+                1.0,
+                2.0,
+                underlying_id,
+                150.0,
+                150.0,
+                true,
+                None,
+                Some(&beta_weights),
+                2.0,
+                0.30,
+                0,
+                None,
+                0.0,
+                None,
+                Some(&vol_beta_weights),
+                Some(200.0),
+                Some(25.0),
+            )
+            .unwrap();
+
+        assert_eq!((delta * 1e12).round(), 750_000_000_000.0);
+        assert_eq!((gamma * 1e12).round(), 1_125_000_000_000.0);
+        assert_eq!((vega * 1e12).round(), 4_500_000_000.0);
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_errors_when_future_underlying_price_missing_without_cached_spread() {
+        let now = Utc.with_ymd_and_hms(2024, 2, 14, 16, 0, 0).unwrap();
+        let expiry = Utc.with_ymd_and_hms(2024, 3, 15, 16, 0, 0).unwrap();
+        let now_ns = UnixNanos::from(now);
+        let expiry_ns = UnixNanos::from(expiry);
+
+        let future = future_with_expiration("ESH4.GLBX", "ESH4", expiry_ns);
+        let call_option = future_option_with_expiration(
+            "ESH4C150.GLBX",
+            "ESH4C150",
+            "ESH4",
+            OptionKind::Call,
+            "150.00",
+            expiry_ns,
+        );
+        let put_option = future_option_with_expiration(
+            "ESH4P150.GLBX",
+            "ESH4P150",
+            "ESH4",
+            OptionKind::Put,
+            "150.00",
+            expiry_ns,
+        );
+
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::FuturesContract(future))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::OptionContract(call_option.clone()))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::OptionContract(put_option.clone()))
+            .unwrap();
+
+        let call_quote = QuoteTick::new(
+            call_option.id(),
+            Price::from("8.50"),
+            Price::from("8.50"),
+            Quantity::from(100),
+            Quantity::from(100),
+            now_ns,
+            now_ns,
+        );
+        let put_quote = QuoteTick::new(
+            put_option.id(),
+            Price::from("3.33"),
+            Price::from("3.33"),
+            Quantity::from(100),
+            Quantity::from(100),
+            now_ns,
+            now_ns,
+        );
+        cache.borrow_mut().add_quote(call_quote).unwrap();
+        cache.borrow_mut().add_quote(put_quote).unwrap();
+
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        clock.borrow_mut().set_time(now_ns);
+        let calculator = GreeksCalculator::new(cache, clock);
+
+        let error = calculator
+            .instrument_greeks(
+                call_option.id(),
+                Some(0.0425),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "No price available for ESH4.GLBX");
+    }
+
+    #[rstest]
+    fn test_cache_futures_spread_returns_price_to_reference_future() {
+        let now = Utc.with_ymd_and_hms(2024, 2, 14, 16, 0, 0).unwrap();
+        let expiry = Utc.with_ymd_and_hms(2024, 3, 15, 16, 0, 0).unwrap();
+        let now_ns = UnixNanos::from(now);
+        let expiry_ns = UnixNanos::from(expiry);
+
+        let future = future_with_expiration("ESH4.GLBX", "ESH4", expiry_ns);
+        let reference_future = future_with_expiration("ESM4.GLBX", "ESM4", expiry_ns);
+        let call_option = future_option_with_expiration(
+            "ESH4C150.GLBX",
+            "ESH4C150",
+            "ESH4",
+            OptionKind::Call,
+            "150.00",
+            expiry_ns,
+        );
+        let put_option = future_option_with_expiration(
+            "ESH4P150.GLBX",
+            "ESH4P150",
+            "ESH4",
+            OptionKind::Put,
+            "150.00",
+            expiry_ns,
+        );
+
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::FuturesContract(future))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::FuturesContract(reference_future.clone()))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::OptionContract(call_option.clone()))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::OptionContract(put_option.clone()))
+            .unwrap();
+
+        let call_quote = QuoteTick::new(
+            call_option.id(),
+            Price::from("8.50"),
+            Price::from("8.50"),
+            Quantity::from(100),
+            Quantity::from(100),
+            now_ns,
+            now_ns,
+        );
+        let put_quote = QuoteTick::new(
+            put_option.id(),
+            Price::from("3.33"),
+            Price::from("3.33"),
+            Quantity::from(100),
+            Quantity::from(100),
+            now_ns,
+            now_ns,
+        );
+        let reference_future_quote = QuoteTick::new(
+            reference_future.id(),
+            Price::from("155.00"),
+            Price::from("155.00"),
+            Quantity::from(100),
+            Quantity::from(100),
+            now_ns,
+            now_ns,
+        );
+        cache.borrow_mut().add_quote(call_quote).unwrap();
+        cache.borrow_mut().add_quote(put_quote).unwrap();
+        cache
+            .borrow_mut()
+            .add_quote(reference_future_quote)
+            .unwrap();
+
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        clock.borrow_mut().set_time(now_ns);
+        let calculator = GreeksCalculator::new(cache, clock);
+
+        let cached_future_price = calculator
+            .cache_futures_spread(call_option.id(), put_option.id(), reference_future.id())
+            .unwrap();
+
+        let expected_underlying = 150.0 + (0.0425_f64 * (30.0 / 365.25)).exp() * (8.50 - 3.33);
+        let expected_cached_underlying = reference_future.make_price(expected_underlying);
+        assert_eq!(cached_future_price, expected_cached_underlying);
+        assert_eq!(
+            calculator.get_cached_futures_spread_price(InstrumentId::from("ESH4.GLBX")),
+            Some(expected_cached_underlying)
+        );
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_uses_cached_futures_spread_when_underlying_price_missing() {
+        let now = Utc.with_ymd_and_hms(2024, 2, 14, 16, 0, 0).unwrap();
+        let expiry = Utc.with_ymd_and_hms(2024, 3, 15, 16, 0, 0).unwrap();
+        let now_ns = UnixNanos::from(now);
+        let expiry_ns = UnixNanos::from(expiry);
+
+        let future = future_with_expiration("ESH4.GLBX", "ESH4", expiry_ns);
+        let reference_future = future_with_expiration("ESM4.GLBX", "ESM4", expiry_ns);
+        let call_option = future_option_with_expiration(
+            "ESH4C150.GLBX",
+            "ESH4C150",
+            "ESH4",
+            OptionKind::Call,
+            "150.00",
+            expiry_ns,
+        );
+        let put_option = future_option_with_expiration(
+            "ESH4P150.GLBX",
+            "ESH4P150",
+            "ESH4",
+            OptionKind::Put,
+            "150.00",
+            expiry_ns,
+        );
+        let target_call_option = future_option_with_expiration(
+            "ESH4C152.GLBX",
+            "ESH4C152",
+            "ESH4",
+            OptionKind::Call,
+            "152.00",
+            expiry_ns,
+        );
+
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::FuturesContract(future))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::FuturesContract(reference_future.clone()))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::OptionContract(call_option.clone()))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::OptionContract(put_option.clone()))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::OptionContract(target_call_option.clone()))
+            .unwrap();
+
+        let call_quote = QuoteTick::new(
+            call_option.id(),
+            Price::from("8.50"),
+            Price::from("8.50"),
+            Quantity::from(100),
+            Quantity::from(100),
+            now_ns,
+            now_ns,
+        );
+        let put_quote = QuoteTick::new(
+            put_option.id(),
+            Price::from("3.33"),
+            Price::from("3.33"),
+            Quantity::from(100),
+            Quantity::from(100),
+            now_ns,
+            now_ns,
+        );
+        let target_call_quote = QuoteTick::new(
+            target_call_option.id(),
+            Price::from("6.75"),
+            Price::from("6.75"),
+            Quantity::from(100),
+            Quantity::from(100),
+            now_ns,
+            now_ns,
+        );
+        let reference_future_quote = QuoteTick::new(
+            reference_future.id(),
+            Price::from("155.00"),
+            Price::from("155.00"),
+            Quantity::from(100),
+            Quantity::from(100),
+            now_ns,
+            now_ns,
+        );
+        cache.borrow_mut().add_quote(call_quote).unwrap();
+        cache.borrow_mut().add_quote(put_quote).unwrap();
+        cache.borrow_mut().add_quote(target_call_quote).unwrap();
+        cache
+            .borrow_mut()
+            .add_quote(reference_future_quote)
+            .unwrap();
+
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        clock.borrow_mut().set_time(now_ns);
+        let calculator = GreeksCalculator::new(cache, clock);
+        calculator
+            .cache_futures_spread(call_option.id(), put_option.id(), reference_future.id())
+            .unwrap();
+
+        let greeks = calculator
+            .instrument_greeks(
+                target_call_option.id(),
+                Some(0.0425),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let expected_underlying = reference_future
+            .make_price(150.0 + (0.0425_f64 * (30.0 / 365.25)).exp() * (8.50 - 3.33))
+            .as_f64();
+        assert_eq!(greeks.underlying_price, expected_underlying);
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_uses_index_price_for_index_underlying() {
+        let now = Utc.with_ymd_and_hms(2024, 2, 14, 16, 0, 0).unwrap();
+        let expiry = Utc.with_ymd_and_hms(2024, 3, 15, 16, 0, 0).unwrap();
+        let now_ns = UnixNanos::from(now);
+        let expiry_ns = UnixNanos::from(expiry);
+
+        let future = future_with_expiration("ESH4.GLBX", "ESH4", expiry_ns);
+        let call_option = future_option_with_expiration(
+            "ESH4C150.GLBX",
+            "ESH4C150",
+            "ESH4",
+            OptionKind::Call,
+            "150.00",
+            expiry_ns,
+        );
+
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::FuturesContract(future))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::OptionContract(call_option.clone()))
+            .unwrap();
+
+        let call_quote = QuoteTick::new(
+            call_option.id(),
+            Price::from("8.50"),
+            Price::from("8.50"),
+            Quantity::from(100),
+            Quantity::from(100),
+            now_ns,
+            now_ns,
+        );
+        cache.borrow_mut().add_quote(call_quote).unwrap();
+        cache
+            .borrow_mut()
+            .add_index_price(IndexPriceUpdate::new(
+                InstrumentId::from("ESH4.GLBX"),
+                Price::from("157.25"),
+                now_ns,
+                now_ns,
+            ))
+            .unwrap();
+
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        clock.borrow_mut().set_time(now_ns);
+        let calculator = GreeksCalculator::new(cache, clock);
+
+        let greeks = calculator
+            .instrument_greeks(
+                call_option.id(),
+                Some(0.0425),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(greeks.underlying_price, 157.25);
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_prefers_quote_over_index_price_for_index_future() {
+        let now = Utc.with_ymd_and_hms(2024, 2, 14, 16, 0, 0).unwrap();
+        let expiry = Utc.with_ymd_and_hms(2024, 3, 15, 16, 0, 0).unwrap();
+        let now_ns = UnixNanos::from(now);
+        let expiry_ns = UnixNanos::from(expiry);
+
+        let future = future_with_expiration("ESH4.GLBX", "ESH4", expiry_ns);
+        let call_option = future_option_with_expiration(
+            "ESH4C150.GLBX",
+            "ESH4C150",
+            "ESH4",
+            OptionKind::Call,
+            "150.00",
+            expiry_ns,
+        );
+
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::FuturesContract(future))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::OptionContract(call_option.clone()))
+            .unwrap();
+
+        // Both a quote and an index price for the underlying future
+        let future_quote = QuoteTick::new(
+            InstrumentId::from("ESH4.GLBX"),
+            Price::from("158.50"),
+            Price::from("159.50"),
+            Quantity::from(100),
+            Quantity::from(100),
+            now_ns,
+            now_ns,
+        );
+        cache.borrow_mut().add_quote(future_quote).unwrap();
+        cache
+            .borrow_mut()
+            .add_index_price(IndexPriceUpdate::new(
+                InstrumentId::from("ESH4.GLBX"),
+                Price::from("157.25"),
+                now_ns,
+                now_ns,
+            ))
+            .unwrap();
+
+        let call_quote = QuoteTick::new(
+            call_option.id(),
+            Price::from("8.50"),
+            Price::from("8.50"),
+            Quantity::from(100),
+            Quantity::from(100),
+            now_ns,
+            now_ns,
+        );
+        cache.borrow_mut().add_quote(call_quote).unwrap();
+
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        clock.borrow_mut().set_time(now_ns);
+        let calculator = GreeksCalculator::new(cache, clock);
+
+        let greeks = calculator
+            .instrument_greeks(
+                call_option.id(),
+                Some(0.0425),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Should use the MID quote (159.00), not the index price (157.25)
+        assert_eq!(greeks.underlying_price, 159.0);
     }
 }

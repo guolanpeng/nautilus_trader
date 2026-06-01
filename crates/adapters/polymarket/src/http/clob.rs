@@ -21,6 +21,12 @@ use nautilus_core::{
     consts::NAUTILUS_USER_AGENT,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_model::{
+    data::BookOrder,
+    enums::{BookType, OrderSide},
+    identifiers::InstrumentId,
+    orderbook::OrderBook,
+};
 use nautilus_network::http::{HttpClient, HttpClientError, Method, USER_AGENT};
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -28,7 +34,10 @@ use crate::{
     common::{credential::Credential, enums::PolymarketOrderType, urls::clob_http_url},
     http::{
         error::{Error, Result},
-        models::{PolymarketOpenOrder, PolymarketOrder, PolymarketTradeReport, TickSizeResponse},
+        models::{
+            ClobBookResponse, FeeRateResponse, PolymarketOpenOrder, PolymarketOrder,
+            PolymarketTradeReport, TickSizeResponse,
+        },
         query::{
             BalanceAllowance, BatchCancelResponse, CancelMarketOrdersParams, CancelResponse,
             GetBalanceAllowanceParams, GetOrdersParams, GetTradesParams, OrderResponse,
@@ -36,6 +45,7 @@ use crate::{
         },
         rate_limits::POLYMARKET_CLOB_REST_QUOTA,
     },
+    websocket::parse::{parse_price, parse_quantity},
 };
 
 const CURSOR_START: &str = "MA==";
@@ -69,7 +79,7 @@ struct CancelOrderBody<'a> {
 ///
 /// Handles HTTP transport, L2 HMAC-SHA256 auth signing, pagination, and raw
 /// API calls that closely match Polymarket endpoint specifications.
-/// Credential is always present — the CLOB API requires authentication.
+/// Credential is always present: the CLOB API requires authentication.
 #[derive(Debug, Clone)]
 pub struct PolymarketClobHttpClient {
     client: HttpClient,
@@ -89,7 +99,7 @@ impl PolymarketClobHttpClient {
         credential: Credential,
         address: String,
         base_url: Option<String>,
-        timeout_secs: Option<u64>,
+        timeout_secs: u64,
     ) -> StdResult<Self, HttpClientError> {
         Ok(Self {
             client: HttpClient::new(
@@ -97,7 +107,7 @@ impl PolymarketClobHttpClient {
                 vec![],
                 vec![],
                 Some(*POLYMARKET_CLOB_REST_QUOTA),
-                timeout_secs,
+                Some(timeout_secs),
                 None,
             )?,
             base_url: base_url
@@ -172,6 +182,42 @@ impl PolymarketClobHttpClient {
         }
     }
 
+    /// Like [`send_get`] but returns `Ok(None)` for empty or `null` response bodies
+    /// instead of a serde deserialization error.
+    async fn send_get_optional<P: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        params: Option<&P>,
+        auth: bool,
+    ) -> Result<Option<T>> {
+        let headers = if auth {
+            Some(self.auth_headers("GET", path, ""))
+        } else {
+            None
+        };
+        let url = self.url(path);
+        let response = self
+            .client
+            .request_with_params(Method::GET, url, params, headers, None, None, None)
+            .await
+            .map_err(Error::from_http_client)?;
+
+        if response.status.is_success() {
+            if response.body.is_empty() || response.body.as_ref() == b"null" {
+                Ok(None)
+            } else {
+                serde_json::from_slice(&response.body)
+                    .map(Some)
+                    .map_err(Error::Serde)
+            }
+        } else {
+            Err(Error::from_status_code(
+                response.status.as_u16(),
+                &response.body,
+            ))
+        }
+    }
+
     async fn send_post<T: DeserializeOwned>(&self, path: &str, body_bytes: Vec<u8>) -> Result<T> {
         let body_str =
             from_utf8(&body_bytes).map_err(|e| Error::decode(format!("UTF-8 error: {e}")))?;
@@ -238,6 +284,7 @@ impl PolymarketClobHttpClient {
             params.next_cursor = Some(CURSOR_START.to_string());
         }
         let mut all = Vec::new();
+
         loop {
             let page: PaginatedResponse<PolymarketOpenOrder> =
                 self.send_get(PATH_ORDERS, Some(&params), true).await?;
@@ -250,10 +297,20 @@ impl PolymarketClobHttpClient {
         Ok(all)
     }
 
-    /// Fetches a single open order by ID.
-    pub async fn get_order(&self, order_id: &str) -> Result<PolymarketOpenOrder> {
+    /// Fetches a single open order by ID, returning `None` for empty/null responses.
+    pub async fn get_order_optional(&self, order_id: &str) -> Result<Option<PolymarketOpenOrder>> {
         let path = format!("/data/order/{order_id}");
-        self.send_get::<(), _>(&path, None::<&()>, true).await
+        self.send_get_optional::<(), _>(&path, None::<&()>, true)
+            .await
+    }
+
+    /// Fetches a single open order by ID.
+    ///
+    /// Returns an error if the order is not found (empty/null response).
+    pub async fn get_order(&self, order_id: &str) -> Result<PolymarketOpenOrder> {
+        self.get_order_optional(order_id)
+            .await?
+            .ok_or_else(|| Error::decode(format!("Order {order_id} not found (empty response)")))
     }
 
     /// Fetches all trades matching the given parameters (auto-paginated).
@@ -265,6 +322,7 @@ impl PolymarketClobHttpClient {
             params.next_cursor = Some(CURSOR_START.to_string());
         }
         let mut all = Vec::new();
+
         loop {
             let page: PaginatedResponse<PolymarketTradeReport> =
                 self.send_get(PATH_TRADES, Some(&params), true).await?;
@@ -282,8 +340,22 @@ impl PolymarketClobHttpClient {
         &self,
         params: GetBalanceAllowanceParams,
     ) -> Result<BalanceAllowance> {
-        self.send_get(PATH_BALANCE_ALLOWANCE, Some(&params), true)
+        let headers = Some(self.auth_headers("GET", PATH_BALANCE_ALLOWANCE, ""));
+        let url = self.url(PATH_BALANCE_ALLOWANCE);
+        let response = self
+            .client
+            .request_with_params(Method::GET, url, Some(&params), headers, None, None, None)
             .await
+            .map_err(Error::from_http_client)?;
+
+        if response.status.is_success() {
+            serde_json::from_slice(&response.body).map_err(Error::Serde)
+        } else {
+            Err(Error::from_status_code(
+                response.status.as_u16(),
+                &response.body,
+            ))
+        }
     }
 
     /// Submits a single signed order to the exchange.
@@ -357,5 +429,205 @@ impl PolymarketClobHttpClient {
     pub async fn get_tick_size(&self, token_id: &str) -> Result<TickSizeResponse> {
         let params = [("token_id", token_id)];
         self.send_get("/tick-size", Some(&params), false).await
+    }
+
+    /// Fetches the fee rate (in basis points) for a token from the CLOB API.
+    pub async fn get_fee_rate(&self, token_id: &str) -> Result<FeeRateResponse> {
+        let params = [("token_id", token_id)];
+        self.send_get("/fee-rate", Some(&params), false).await
+    }
+
+    /// Fetches the order book for a token from the CLOB API (public endpoint).
+    pub async fn get_book(&self, token_id: &str) -> Result<ClobBookResponse> {
+        let params = [("token_id", token_id)];
+        self.send_get("/book", Some(&params), false).await
+    }
+}
+
+/// Provides an unauthenticated HTTP client for public CLOB endpoints.
+///
+/// Unlike [`PolymarketClobHttpClient`], this client does not require credentials
+/// and is suitable for the data client which only needs public market data.
+#[derive(Debug, Clone)]
+pub struct PolymarketClobPublicClient {
+    client: HttpClient,
+    base_url: String,
+}
+
+impl PolymarketClobPublicClient {
+    /// Creates a new [`PolymarketClobPublicClient`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn new(base_url: Option<String>, timeout_secs: u64) -> StdResult<Self, HttpClientError> {
+        Ok(Self {
+            client: HttpClient::new(
+                HashMap::from([
+                    (USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string()),
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                ]),
+                vec![],
+                vec![],
+                Some(*POLYMARKET_CLOB_REST_QUOTA),
+                Some(timeout_secs),
+                None,
+            )?,
+            base_url: base_url
+                .unwrap_or_else(|| clob_http_url().to_string())
+                .trim_end_matches('/')
+                .to_string(),
+        })
+    }
+
+    /// Fetches the order book for a token from the CLOB API.
+    pub async fn get_book(&self, token_id: &str) -> Result<ClobBookResponse> {
+        let params = [("token_id", token_id)];
+        let url = format!("{}/book", self.base_url);
+        let response = self
+            .client
+            .request_with_params(Method::GET, url, Some(&params), None, None, None, None)
+            .await
+            .map_err(Error::from_http_client)?;
+
+        if response.status.is_success() {
+            serde_json::from_slice(&response.body).map_err(Error::Serde)
+        } else {
+            Err(Error::from_status_code(
+                response.status.as_u16(),
+                &response.body,
+            ))
+        }
+    }
+
+    /// Requests an order book snapshot and builds an [`OrderBook`].
+    pub async fn request_book_snapshot(
+        &self,
+        instrument_id: InstrumentId,
+        token_id: &str,
+        price_precision: u8,
+        size_precision: u8,
+    ) -> anyhow::Result<OrderBook> {
+        let resp = self
+            .get_book(token_id)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+
+        for (i, level) in resp.bids.iter().enumerate() {
+            let price = parse_price(&level.price, price_precision)?;
+            let size = parse_quantity(&level.size, size_precision)?;
+            let order = BookOrder::new(OrderSide::Buy, price, size, i as u64);
+            book.add(order, 0, i as u64, Default::default());
+        }
+
+        let bids_len = resp.bids.len();
+        for (i, level) in resp.asks.iter().enumerate() {
+            let price = parse_price(&level.price, price_precision)?;
+            let size = parse_quantity(&level.size, size_precision)?;
+            let order = BookOrder::new(OrderSide::Sell, price, size, (bids_len + i) as u64);
+            book.add(order, 0, (bids_len + i) as u64, Default::default());
+        }
+
+        log::info!(
+            "Fetched order book for {} with {} bids and {} asks",
+            instrument_id,
+            resp.bids.len(),
+            resp.asks.len(),
+        );
+
+        Ok(book)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_model::{
+        enums::{BookType, OrderSide},
+        identifiers::InstrumentId,
+        types::{Price, Quantity},
+    };
+    use rstest::rstest;
+
+    use super::*;
+    use crate::http::models::{ClobBookLevel, ClobBookResponse};
+
+    fn build_book_from_response(resp: &ClobBookResponse) -> OrderBook {
+        let instrument_id = InstrumentId::from("TEST.POLYMARKET");
+        let price_precision = 2u8;
+        let size_precision = 2u8;
+        let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+
+        for (i, level) in resp.bids.iter().enumerate() {
+            let price = parse_price(&level.price, price_precision).unwrap();
+            let size = parse_quantity(&level.size, size_precision).unwrap();
+            let order = BookOrder::new(OrderSide::Buy, price, size, i as u64);
+            book.add(order, 0, i as u64, Default::default());
+        }
+
+        let bids_len = resp.bids.len();
+        for (i, level) in resp.asks.iter().enumerate() {
+            let price = parse_price(&level.price, price_precision).unwrap();
+            let size = parse_quantity(&level.size, size_precision).unwrap();
+            let order = BookOrder::new(OrderSide::Sell, price, size, (bids_len + i) as u64);
+            book.add(order, 0, (bids_len + i) as u64, Default::default());
+        }
+
+        book
+    }
+
+    #[rstest]
+    fn test_build_order_book_from_clob_response() {
+        let resp = ClobBookResponse {
+            bids: vec![
+                ClobBookLevel {
+                    price: "0.48".to_string(),
+                    size: "100.00".to_string(),
+                },
+                ClobBookLevel {
+                    price: "0.49".to_string(),
+                    size: "200.00".to_string(),
+                },
+                ClobBookLevel {
+                    price: "0.50".to_string(),
+                    size: "150.00".to_string(),
+                },
+            ],
+            asks: vec![
+                ClobBookLevel {
+                    price: "0.51".to_string(),
+                    size: "120.00".to_string(),
+                },
+                ClobBookLevel {
+                    price: "0.52".to_string(),
+                    size: "180.00".to_string(),
+                },
+            ],
+        };
+
+        let book = build_book_from_response(&resp);
+
+        assert_eq!(book.instrument_id, InstrumentId::from("TEST.POLYMARKET"));
+        assert_eq!(book.book_type, BookType::L2_MBP);
+        assert_eq!(book.best_bid_price(), Some(Price::from("0.50")));
+        assert_eq!(book.best_ask_price(), Some(Price::from("0.51")));
+        assert_eq!(book.best_bid_size(), Some(Quantity::from("150.00")));
+        assert_eq!(book.best_ask_size(), Some(Quantity::from("120.00")));
+        assert_eq!(book.bids(None).count(), 3);
+        assert_eq!(book.asks(None).count(), 2);
+    }
+
+    #[rstest]
+    fn test_build_order_book_empty_response() {
+        let resp = ClobBookResponse {
+            bids: vec![],
+            asks: vec![],
+        };
+
+        let book = build_book_from_response(&resp);
+
+        assert!(book.best_bid_price().is_none());
+        assert!(book.best_ask_price().is_none());
     }
 }

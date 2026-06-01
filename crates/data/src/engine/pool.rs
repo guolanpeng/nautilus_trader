@@ -25,7 +25,10 @@ use std::{cell::RefCell, rc::Rc};
 
 use nautilus_common::{cache::Cache, msgbus::Handler};
 use nautilus_model::{
-    defi::{PoolFeeCollect, PoolFlash, PoolLiquidityUpdate, PoolLiquidityUpdateType, PoolSwap},
+    defi::{
+        PoolFeeCollect, PoolFlash, PoolLiquidityUpdate, PoolLiquidityUpdateType, PoolProfiler,
+        PoolSwap,
+    },
     identifiers::InstrumentId,
 };
 use ustr::Ustr;
@@ -68,20 +71,12 @@ impl PoolUpdater {
     }
 
     /// Handles a pool liquidity update event.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `update.kind` is not `Mint` or `Burn`.
     pub fn handle_pool_liquidity_update(&self, update: &PoolLiquidityUpdate) {
         if let Some(pool_profiler) = self
             .cache
             .borrow_mut()
             .pool_profiler_mut(&self.instrument_id)
-            && let Err(e) = match update.kind {
-                PoolLiquidityUpdateType::Mint => pool_profiler.process_mint(update),
-                PoolLiquidityUpdateType::Burn => pool_profiler.process_burn(update),
-                _ => panic!("Liquidity update operation {} not implemented", update.kind),
-            }
+            && let Err(e) = process_pool_liquidity_update(pool_profiler, update)
         {
             log::error!("Failed to process pool liquidity update: {e}");
         }
@@ -112,7 +107,16 @@ impl PoolUpdater {
     }
 }
 
-// -- Typed handler wrappers -----------------------------------------------------
+fn process_pool_liquidity_update(
+    pool_profiler: &mut PoolProfiler,
+    update: &PoolLiquidityUpdate,
+) -> anyhow::Result<()> {
+    match update.kind {
+        PoolLiquidityUpdateType::Mint => pool_profiler.process_mint(update),
+        PoolLiquidityUpdateType::Burn => pool_profiler.process_burn(update),
+        _ => anyhow::bail!("Unsupported liquidity update operation {}", update.kind),
+    }
+}
 
 /// Handler for pool swap events that delegates to a [`PoolUpdater`].
 #[derive(Debug)]

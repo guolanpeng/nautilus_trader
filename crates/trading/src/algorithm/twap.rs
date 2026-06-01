@@ -30,16 +30,10 @@
 //! An order with `horizon_secs=60` and `interval_secs=10` will spawn 6 child
 //! orders over 60 seconds, one every 10 seconds.
 
-use std::{
-    ops::{Deref, DerefMut},
-    time::Duration,
-};
+use std::time::Duration;
 
 use ahash::AHashMap;
-use nautilus_common::{
-    actor::{DataActor, DataActorCore},
-    timer::TimeEvent,
-};
+use nautilus_common::{actor::DataActor, nautilus_actor, timer::TimeEvent};
 use nautilus_model::{
     enums::OrderType,
     identifiers::ClientOrderId,
@@ -88,20 +82,9 @@ impl TwapAlgorithm {
     }
 }
 
-impl Deref for TwapAlgorithm {
-    type Target = DataActorCore;
-    fn deref(&self) -> &Self::Target {
-        &self.core.actor
-    }
-}
-
-impl DerefMut for TwapAlgorithm {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.core.actor
-    }
-}
-
 impl DataActor for TwapAlgorithm {}
+
+nautilus_actor!(TwapAlgorithm);
 
 impl ExecutionAlgorithm for TwapAlgorithm {
     fn core_mut(&mut self) -> &mut ExecutionAlgorithmCore {
@@ -268,12 +251,6 @@ impl ExecutionAlgorithm for TwapAlgorithm {
         );
         self.submit_order(spawned.into(), None, None)?;
 
-        {
-            let cache_rc = self.core.cache_rc();
-            let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&order)?;
-        }
-
         self.core.clock().set_timer(
             primary_id.as_str(),
             Duration::from_secs_f64(interval_secs),
@@ -298,7 +275,7 @@ impl ExecutionAlgorithm for TwapAlgorithm {
 
         let primary = {
             let cache = self.core.cache();
-            cache.order(&primary_id).cloned()
+            cache.order(&primary_id).map(|o| o.clone())
         };
 
         let Some(primary) = primary else {
@@ -346,12 +323,6 @@ impl ExecutionAlgorithm for TwapAlgorithm {
         );
         self.submit_order(spawned.into(), None, None)?;
 
-        {
-            let cache_rc = self.core.cache_rc();
-            let mut cache = cache_rc.borrow_mut();
-            cache.update_order(&primary)?;
-        }
-
         Ok(())
     }
 
@@ -382,7 +353,7 @@ mod tests {
     use nautilus_core::UUID4;
     use nautilus_model::{
         enums::{OrderSide, TimeInForce},
-        events::OrderEventAny,
+        events::{OrderEventAny, order::spec::OrderCanceledSpec},
         identifiers::{ExecAlgorithmId, InstrumentId, StrategyId, TraderId},
         orders::{LimitOrder, MarketOrder},
         types::Price,
@@ -730,8 +701,6 @@ mod tests {
 
     #[rstest]
     fn test_twap_on_time_event_completes_when_primary_closed() {
-        use nautilus_model::events::OrderCanceled;
-
         let mut algo = create_twap_algorithm();
         register_algorithm(&mut algo);
 
@@ -751,22 +720,17 @@ mod tests {
         {
             let cache_rc = algo.core.cache_rc();
             let mut cache = cache_rc.borrow_mut();
-            let mut primary = cache.order(&primary_id).cloned().unwrap();
+            let primary = cache.order(&primary_id).map(|o| o.clone()).unwrap();
 
-            let canceled = OrderCanceled::new(
-                primary.trader_id(),
-                primary.strategy_id(),
-                primary.instrument_id(),
-                primary.client_order_id(),
-                UUID4::new(),
-                0.into(),
-                0.into(),
-                false,
-                None,
-                None,
-            );
-            primary.apply(OrderEventAny::Canceled(canceled)).unwrap();
-            cache.update_order(&primary).unwrap();
+            let canceled = OrderCanceledSpec::builder()
+                .trader_id(primary.trader_id())
+                .strategy_id(primary.strategy_id())
+                .instrument_id(primary.instrument_id())
+                .client_order_id(primary.client_order_id())
+                .build();
+            cache
+                .update_order(&OrderEventAny::Canceled(canceled))
+                .unwrap();
         }
 
         // Timer fires but primary is closed

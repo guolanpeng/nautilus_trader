@@ -23,15 +23,13 @@
 //! - `LiveNodeConfig` Configuration for live node deployment.
 //! - `AsyncRunner` for managing system real-time data flow.
 //!
-//! # Platform
+//! # NautilusTrader
 //!
-//! [NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
-//! algorithmic trading platform, providing quantitative traders with the ability to backtest
-//! portfolios of automated trading strategies on historical data with an event-driven engine,
-//! and also deploy those same strategies live, with no code changes.
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+//! engine for multi-asset, multi-venue trading systems.
 //!
-//! NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-//! highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+//! The system spans research, deterministic simulation, and live execution within a single
+//! event-driven architecture, providing research-to-live semantic parity.
 //!
 //! # Feature Flags
 //!
@@ -40,11 +38,42 @@
 //! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
 //! or as part of a Rust only build.
 //!
+//! - `node` (default): Enables the full live node, builder, config, and execution manager.
+//! - `plugin` (default): Enables the host-side plug-in adapters and loader from `nautilus-plugin`.
 //! - `ffi`: Enables the C foreign function interface (FFI) from [cbindgen](https://github.com/mozilla/cbindgen).
-//! - `streaming`: Enables `persistence` dependency for streaming configuration.
-//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs) (auto-enables `streaming`).
+//! - `streaming`: Enables `persistence` dependency for streaming configuration (requires `node`).
+//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs) (auto-enables `node` and `streaming`).
 //! - `defi`: Enables DeFi (Decentralized Finance) support.
 //! - `extension-module`: Builds the crate as a Python extension module.
+//!
+//! # Lean adapter builds
+//!
+//! Adapters and other consumers that only need the async event emitter, runner, and
+//! `ExecutionClientCore` re-export can opt out of the full kernel by disabling the
+//! `node` feature:
+//!
+//! ```toml
+//! nautilus-live = { workspace = true, default-features = false }
+//! ```
+//!
+//! With `node` disabled, this crate exposes only `emitter` and `runner`, and skips
+//! the transitive dependencies on `nautilus-system`, `nautilus-trading`,
+//! `nautilus-portfolio`, `nautilus-risk`, and `nautilus-data`.
+//!
+//! # Opting out of plug-in support
+//!
+//! Builds that statically link every actor and strategy can drop the plug-in
+//! adapter machinery (and its `libloading`-backed loader) by disabling the
+//! `plugin` feature:
+//!
+//! ```toml
+//! nautilus-live = { workspace = true, default-features = ["node"] }
+//! ```
+//!
+//! With `plugin` disabled, the `plugin` module is removed, the unsafe FFI
+//! surface that supports it does not link, and `nautilus-plugin` is not pulled
+//! into the dependency graph. A non-empty `LiveNodeConfig.plugins` list is
+//! rejected at build time under this configuration.
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]
@@ -55,17 +84,35 @@
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
-pub mod builder;
-pub mod config;
 pub mod emitter;
-pub mod manager;
-pub mod node;
 pub mod runner;
+
+#[cfg(feature = "node")]
+pub mod builder;
+
+#[cfg(feature = "node")]
+pub mod config;
+
+#[cfg(feature = "node")]
+pub mod manager;
+
+#[cfg(feature = "node")]
+pub mod node;
+
+/// Re-export of the shared plug-in host bridge.
+///
+/// The host-side adapters and `HostVTable` implementation live in
+/// `nautilus-plugin::bridge` so backtest and live engines can share them.
+/// This re-export preserves the historical `nautilus_live::plugin::*`
+/// import path that existing callers (configs, tests, downstream crates)
+/// already use.
+#[cfg(feature = "plugin")]
+pub use nautilus_plugin::bridge as plugin;
+
+#[cfg(feature = "python")]
+pub mod python;
 
 // Re-exports for adapters
 pub use emitter::ExecutionEventEmitter;
 pub use nautilus_common::factories::OrderEventFactory;
 pub use nautilus_execution::client::core::ExecutionClientCore;
-
-#[cfg(feature = "python")]
-pub mod python;

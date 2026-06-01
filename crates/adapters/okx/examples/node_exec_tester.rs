@@ -15,20 +15,24 @@
 
 //! Example demonstrating live execution testing with the OKX adapter.
 //!
-//! Run with: `cargo run --example okx-exec-tester --package nautilus-okx`
+//! Run with: `cargo run --example okx-exec-tester --package nautilus-okx --features examples`
 
 use nautilus_common::enums::Environment;
 use nautilus_live::node::LiveNode;
 use nautilus_model::{
-    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId},
+    identifiers::{AccountId, InstrumentId, StrategyId, TraderId},
     types::Quantity,
 };
 use nautilus_okx::{
-    common::enums::OKXInstrumentType,
+    common::{
+        consts::OKX_CLIENT_ID,
+        enums::{OKXEnvironment, OKXInstrumentType},
+    },
     config::{OKXDataClientConfig, OKXExecClientConfig},
     factories::{OKXDataClientFactory, OKXExecutionClientFactory},
 };
 use nautilus_testkit::testers::{ExecTester, ExecTesterConfig};
+use nautilus_trading::strategy::StrategyConfig;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -38,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("OKX-001");
     let node_name = "OKX-EXEC-TESTER-001".to_string();
-    let client_id = ClientId::new("OKX");
+    let client_id = *OKX_CLIENT_ID;
     let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
 
     let data_config = OKXDataClientConfig {
@@ -46,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api_secret: None,     // Will use 'OKX_API_SECRET' env var
         api_passphrase: None, // Will use 'OKX_API_PASSPHRASE' env var
         instrument_types: vec![OKXInstrumentType::Spot, OKXInstrumentType::Swap],
-        is_demo: false,
+        environment: OKXEnvironment::Live,
         ..Default::default()
     };
 
@@ -57,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api_secret: None,     // Will use 'OKX_API_SECRET' env var
         api_passphrase: None, // Will use 'OKX_API_PASSPHRASE' env var
         instrument_types: vec![OKXInstrumentType::Spot, OKXInstrumentType::Swap],
-        is_demo: false,
+        environment: OKXEnvironment::Live,
         ..Default::default()
     };
 
@@ -72,29 +76,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_delay_post_stop_secs(5)
         .build()?;
 
-    let mut tester_config = ExecTesterConfig::new(
-        StrategyId::from("EXEC_TESTER-001"),
-        instrument_id,
-        client_id,
-        Quantity::from("0.01"),
-    )
-    .with_log_data(false)
-    // .with_enable_limit_buys(false)
-    // .with_enable_limit_sells(false)
-    // .with_enable_stop_sells(true)
-    // .with_stop_order_type(OrderType::TrailingStopMarket)
-    // .with_trailing_offset(Decimal::from(100))
-    // .with_trailing_offset_type(TrailingOffsetType::BasisPoints)
-    // .with_stop_offset_ticks(50)
-    .with_cancel_orders_on_stop(true)
-    .with_close_positions_on_stop(true);
+    let order_qty = Quantity::from("0.01");
 
-    tester_config.base.external_order_claims = Some(vec![instrument_id]);
-
-    // Use UUIDs for unique client order IDs across restarts
-    tester_config.base.use_uuid_client_order_ids = true;
-    // OKX doesn't allow hyphens in client order IDs
-    tester_config.base.use_hyphens_in_client_order_ids = false;
+    let tester_config = ExecTesterConfig::builder()
+        .base(StrategyConfig {
+            strategy_id: Some(StrategyId::from("EXEC_TESTER-001")),
+            external_order_claims: Some(vec![instrument_id]),
+            // OKX doesn't allow hyphens in client order IDs
+            use_hyphens_in_client_order_ids: false,
+            ..Default::default()
+        })
+        .instrument_id(instrument_id)
+        .client_id(client_id)
+        .order_qty(order_qty)
+        .open_position_on_start_qty(order_qty.as_decimal())
+        .log_data(false)
+        // .enable_limit_buys(false)
+        // .enable_limit_sells(false)
+        // .enable_stop_sells(true)
+        // .stop_order_type(OrderType::TrailingStopMarket)
+        // .trailing_offset(Decimal::from(100))
+        // .trailing_offset_type(TrailingOffsetType::BasisPoints)
+        // .stop_offset_ticks(50)
+        .build();
 
     let tester = ExecTester::new(tester_config);
 
