@@ -45,13 +45,13 @@
 //!
 //! # Reconciliation
 //!
-//! Three sub-checks run on independent intervals: inflight orders, open order
-//! consistency, and position consistency. The shared maintenance timer in the
-//! select loop dispatches reconciliation at the minimum enabled interval.
-//! Each dispatch the handler checks which sub-checks are due based on elapsed
-//! nanoseconds and runs them in sequence. The open order and position checks
-//! query venues via async HTTP calls, blocking the select loop for the
-//! duration of each query.
+//! Continuous inflight and open-order checks run on independent intervals. The
+//! shared maintenance timer in the select loop dispatches reconciliation at
+//! the minimum enabled interval. Each dispatch the handler checks which
+//! sub-checks are due based on elapsed nanoseconds and schedules their work.
+//! Continuous checks do not await venue HTTP in the select loop: open-order
+//! checks poll a bulk venue report future from the loop, while position checks
+//! stay disabled until a non-blocking command path exists for them.
 //!
 //! # Maintenance dispatcher
 //!
@@ -76,12 +76,12 @@
 //! `inflight_check_interval_ms` and `own_books_audit_interval_secs` smaller)
 //! get rounded up to the next tick. Real workloads do not run venue or cache
 //! maintenance below 100ms (defaults are seconds to minutes). Cadence drifts
-//! by at most one body duration per fire; the recon body can await venue
-//! HTTP, so `now` is refreshed after that await before sync tasks evaluate
-//! due-status.
+//! by at most one body duration per fire.
 
 use std::{
     fmt::Debug,
+    future::Future,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -89,12 +89,6 @@ use std::{
     time::Duration,
 };
 
-#[cfg(feature = "plugin")]
-use ahash::AHashSet;
-#[cfg(feature = "plugin")]
-use anyhow::Context;
-#[cfg(feature = "plugin")]
-use aws_lc_rs::digest;
 use nautilus_common::{
     actor::{Actor, DataActor},
     cache::database::CacheDatabaseAdapter,
@@ -103,44 +97,32 @@ use nautilus_common::{
     live::dst,
     log_info,
     messages::{
-        DataEvent, ExecutionEvent, ExecutionReport, data::DataCommand, execution::TradingCommand,
+        DataEvent, ExecutionEvent, ExecutionReport,
+        data::DataCommand,
+        execution::{GenerateOrderStatusReports, TradingCommand},
     },
     timer::TimeEventHandler,
 };
-#[cfg(feature = "plugin")]
-use nautilus_core::hex;
 use nautilus_core::{
     UUID4, UnixNanos,
     datetime::{NANOSECONDS_IN_MILLISECOND, mins_to_secs, secs_to_nanos_unchecked},
 };
-#[cfg(feature = "plugin")]
-use nautilus_model::identifiers::{ActorId, StrategyId};
 use nautilus_model::{
     events::OrderEventAny,
     identifiers::{ClientOrderId, TraderId},
     orders::Order,
+    reports::OrderStatusReport,
 };
-#[cfg(feature = "plugin")]
-use nautilus_plugin::loader::PluginLoader;
 use nautilus_system::{config::NautilusKernelConfig, kernel::NautilusKernel};
-#[cfg(feature = "plugin")]
-use nautilus_trading::strategy::StrategyConfig;
 use nautilus_trading::{ExecutionAlgorithm, strategy::Strategy};
 use tabled::{Table, Tabled, settings::Style};
 
 use crate::{
     builder::LiveNodeBuilder,
-    config::LiveNodeConfig,
-    manager::{ExecutionManager, ExecutionManagerConfig},
+    config::{LiveNodeConfig, PluginConfig},
+    execution::LiveExecutionClient,
+    manager::{ExecutionManager, ExecutionManagerConfig, OpenOrderReportCheck},
     runner::{AsyncRunner, AsyncRunnerChannels},
-};
-#[cfg(feature = "plugin")]
-use crate::{
-    config::PluginConfig,
-    plugin::{
-        ConfiguredPluginEntry, PluginControllerAdapter, configured_entry, plugin_loader,
-        register_manifest_custom_data,
-    },
 };
 
 /// Lifecycle state of the `LiveNode` runner.
@@ -284,13 +266,10 @@ pub struct LiveNode {
     config: LiveNodeConfig,
     handle: LiveNodeHandle,
     exec_manager: ExecutionManager,
+    exec_clients: Vec<LiveExecutionClient>,
     shutdown_deadline: Option<dst::time::Instant>,
     #[cfg(feature = "plugin")]
-    plugin_loader: Option<PluginLoader>,
-    #[cfg(feature = "plugin")]
-    plugin_controllers: Vec<PluginControllerAdapter>,
-    #[cfg(feature = "plugin")]
-    plugin_controllers_started: bool,
+    plugins: crate::plugin::NodePlugins,
     #[cfg(feature = "python")]
     #[allow(dead_code)] // TODO: Under development
     python_actors: Vec<pyo3::Py<pyo3::PyAny>>,
@@ -306,6 +285,7 @@ impl LiveNode {
         runner: AsyncRunner,
         config: LiveNodeConfig,
         exec_manager: ExecutionManager,
+        exec_clients: Vec<LiveExecutionClient>,
     ) -> Self {
         Self {
             kernel,
@@ -313,13 +293,10 @@ impl LiveNode {
             config,
             handle: LiveNodeHandle::new(),
             exec_manager,
+            exec_clients,
             shutdown_deadline: None,
             #[cfg(feature = "plugin")]
-            plugin_loader: None,
-            #[cfg(feature = "plugin")]
-            plugin_controllers: Vec::new(),
-            #[cfg(feature = "plugin")]
-            plugin_controllers_started: false,
+            plugins: crate::plugin::NodePlugins::default(),
             #[cfg(feature = "python")]
             python_actors: Vec::new(),
         }
@@ -389,13 +366,10 @@ impl LiveNode {
             config,
             handle: LiveNodeHandle::new(),
             exec_manager,
+            exec_clients: Vec::new(),
             shutdown_deadline: None,
             #[cfg(feature = "plugin")]
-            plugin_loader: None,
-            #[cfg(feature = "plugin")]
-            plugin_controllers: Vec::new(),
-            #[cfg(feature = "plugin")]
-            plugin_controllers_started: false,
+            plugins: crate::plugin::NodePlugins::default(),
             #[cfg(feature = "python")]
             python_actors: Vec::new(),
         };
@@ -423,40 +397,14 @@ impl LiveNode {
             anyhow::bail!("Cannot load plug-ins after the node leaves Idle state");
         }
 
-        let mut loader = plugin_loader();
-        let mut loaded_paths = AHashSet::new();
+        let (loader, adapters) =
+            crate::plugin::load_configured_plugin_batch(&configs)?.into_parts();
 
-        for config in &configs {
-            verify_plugin_sha256(config)?;
-            if loaded_paths.insert(config.path.clone()) {
-                loader
-                    .load(&config.path)
-                    .with_context(|| format!("failed to load plug-in '{}'", config.path))?;
-            }
+        for adapter in adapters {
+            self.install_plugin_adapter(adapter)?;
         }
 
-        for loaded in loader.loaded() {
-            let registered = register_manifest_custom_data(loaded.validated_manifest())
-                .with_context(|| {
-                    format!(
-                        "failed to register custom data from plug-in '{}'",
-                        loaded.path().display()
-                    )
-                })?;
-
-            if registered > 0 {
-                log::info!(
-                    "Registered {registered} custom data type(s) from plug-in {}",
-                    loaded.path().display()
-                );
-            }
-        }
-
-        for config in &configs {
-            self.instantiate_configured_plugin(&loader, config)?;
-        }
-
-        self.plugin_loader = Some(loader);
+        self.plugins.set_loader(loader);
         Ok(())
     }
 
@@ -474,124 +422,53 @@ impl LiveNode {
         anyhow::bail!("LiveNodeConfig.plugins requires the `plugin` feature")
     }
 
+    /// Loads and registers one plug-in instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plug-in cannot be loaded, verified, resolved,
+    /// or registered.
     #[cfg(feature = "plugin")]
-    fn instantiate_configured_plugin(
-        &mut self,
-        loader: &PluginLoader,
-        config: &PluginConfig,
-    ) -> anyhow::Result<()> {
-        let loaded = loader
-            .loaded()
-            .iter()
-            .find(|loaded| loaded.path() == std::path::Path::new(&config.path))
-            .ok_or_else(|| anyhow::anyhow!("plug-in '{}' was not loaded", config.path))?;
+    pub fn add_plugin(&mut self, config: PluginConfig) -> anyhow::Result<()> {
+        config.validate_runtime_support(self.config.plugins.len())?;
 
-        let entry = configured_entry(loaded.validated_manifest(), &config.path, &config.type_name)?;
-        let config_json = serde_json::to_string(&config.config)?;
-
-        match entry {
-            ConfiguredPluginEntry::Actor(entry) => {
-                let actor_id = plugin_actor_id(config)?;
-                let adapter = entry
-                    .create_adapter(actor_id, &config_json)
-                    .with_context(|| {
-                        format!(
-                            "failed to instantiate plug-in actor '{}' from {}",
-                            config.type_name, config.path
-                        )
-                    })?;
-                self.add_actor(adapter)
-            }
-            ConfiguredPluginEntry::Strategy(entry) => {
-                let strategy_config = plugin_strategy_config(config)?;
-                let adapter = entry
-                    .create_adapter(strategy_config, &config_json)
-                    .with_context(|| {
-                        format!(
-                            "failed to instantiate plug-in strategy '{}' from {}",
-                            config.type_name, config.path
-                        )
-                    })?;
-                self.add_strategy(adapter)
-            }
-            ConfiguredPluginEntry::Controller(entry) => {
-                let adapter = entry.create_adapter(&config_json).with_context(|| {
-                    format!(
-                        "failed to instantiate plug-in controller '{}' from {}",
-                        config.type_name, config.path
-                    )
-                })?;
-                self.plugin_controllers.push(adapter);
-                Ok(())
-            }
-        }
-    }
-
-    #[cfg(feature = "plugin")]
-    fn start_plugin_controllers(&mut self) -> anyhow::Result<()> {
-        if self.plugin_controllers_started {
-            return Ok(());
+        if self.state() != NodeState::Idle {
+            anyhow::bail!("Cannot add plug-in after the node leaves Idle state");
         }
 
-        for index in 0..self.plugin_controllers.len() {
-            let result = {
-                let controller = &mut self.plugin_controllers[index];
-                controller.on_start().with_context(|| {
-                    format!(
-                        "failed to start plug-in controller '{}' from plug-in '{}'",
-                        controller.type_name(),
-                        controller.plugin_name()
-                    )
-                })
-            };
-
-            if let Err(start_err) = result {
-                for controller in self.plugin_controllers[..index].iter_mut().rev() {
-                    if let Err(stop_err) = controller.on_stop() {
-                        log::error!(
-                            "Failed to roll back plug-in controller '{}' from plug-in '{}': {stop_err}",
-                            controller.type_name(),
-                            controller.plugin_name()
-                        );
-                    }
-                }
-                return Err(start_err);
-            }
-        }
-
-        self.plugin_controllers_started = true;
+        let adapter = self.plugins.load_plugin(&config)?;
+        self.install_plugin_adapter(adapter)?;
+        self.config.plugins.push(config);
         Ok(())
     }
 
+    /// Rejects plug-in registration when the live crate is built without plug-in support.
+    ///
+    /// # Errors
+    ///
+    /// Always returns an error explaining that the `plugin` feature is required.
+    #[cfg(not(feature = "plugin"))]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "signature mirrors the plugin-enabled API"
+    )]
+    pub fn add_plugin(&mut self, config: PluginConfig) -> anyhow::Result<()> {
+        let _ = config;
+        anyhow::bail!("LiveNode::add_plugin requires the `plugin` feature")
+    }
+
     #[cfg(feature = "plugin")]
-    fn stop_plugin_controllers(&mut self) -> anyhow::Result<()> {
-        if !self.plugin_controllers_started {
-            return Ok(());
-        }
-
-        let mut first_error = None;
-
-        for controller in self.plugin_controllers.iter_mut().rev() {
-            if let Err(e) = controller.on_stop().with_context(|| {
-                format!(
-                    "failed to stop plug-in controller '{}' from plug-in '{}'",
-                    controller.type_name(),
-                    controller.plugin_name()
-                )
-            }) {
-                log::error!("{e}");
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
+    fn install_plugin_adapter(
+        &mut self,
+        adapter: crate::plugin::NodePluginAdapter,
+    ) -> anyhow::Result<()> {
+        match adapter {
+            crate::plugin::NodePluginAdapter::Actor(adapter) => self.add_actor(*adapter),
+            crate::plugin::NodePluginAdapter::Strategy(adapter) => self.add_strategy(*adapter),
+            crate::plugin::NodePluginAdapter::Controller(adapter) => {
+                self.plugins.push_controller(adapter);
+                Ok(())
             }
-        }
-
-        self.plugin_controllers_started = false;
-
-        if let Some(e) = first_error {
-            Err(e)
-        } else {
-            Ok(())
         }
     }
 
@@ -623,8 +500,8 @@ impl LiveNode {
 
         self.handle.set_state(NodeState::Starting);
 
-        self.kernel.start_async().await;
         self.kernel.reset_shutdown_flag();
+        self.kernel.start_async().await;
 
         if self.kernel.is_event_store_replay() {
             log::info!(
@@ -677,7 +554,7 @@ impl LiveNode {
 
         self.kernel.start_trader();
         #[cfg(feature = "plugin")]
-        if let Err(e) = self.start_plugin_controllers() {
+        if let Err(e) = self.plugins.start_controllers() {
             return self.abort_after_trader_start_failure(e).await;
         }
 
@@ -702,7 +579,7 @@ impl LiveNode {
         self.handle.set_state(NodeState::ShuttingDown);
 
         #[cfg(feature = "plugin")]
-        let controller_stop_result = self.stop_plugin_controllers();
+        let controller_stop_result = self.plugins.stop_controllers();
         #[cfg(not(feature = "plugin"))]
         let controller_stop_result: anyhow::Result<()> = Ok(());
 
@@ -857,7 +734,7 @@ impl LiveNode {
             .config
             .exec_engine
             .reconciliation_lookback_mins
-            .map(|m| m as u64);
+            .map(u64::from);
 
         let timeout = self.config.timeout_reconciliation;
         let start = dst::time::Instant::now();
@@ -993,8 +870,8 @@ impl LiveNode {
         log::info!("Event loop starting");
 
         self.handle.set_state(NodeState::Starting);
-        self.kernel.start_async().await;
         self.kernel.reset_shutdown_flag();
+        self.kernel.start_async().await;
 
         if self.kernel.is_event_store_replay() {
             log::info!(
@@ -1011,12 +888,11 @@ impl LiveNode {
         }
 
         let stop_handle = self.handle.clone();
-        let shutdown_flag = self.kernel.shutdown_flag();
         let mut pending = PendingEvents::default();
 
         // Startup phase 1: Connect data clients and drain instrument events into cache.
         // This ensures the cache is populated before execution clients connect.
-        // TODO: Add ctrl_c, stop_handle, and shutdown_flag monitoring here to
+        // TODO: Add ctrl_c, stop_handle, and shutdown monitoring here to
         // allow aborting a hanging connect future.
         drive_with_event_buffering(
             self.kernel.connect_data_clients(),
@@ -1069,7 +945,7 @@ impl LiveNode {
             .or_else(|| self.startup_abort_reason())
         {
             self.abort_startup(reason).await?;
-            self.drain_channels(
+            Self::drain_channels(
                 &mut time_evt_rx,
                 &mut data_evt_rx,
                 &mut data_cmd_rx,
@@ -1085,9 +961,9 @@ impl LiveNode {
             self.perform_startup_reconciliation().await?;
             self.kernel.start_trader();
             #[cfg(feature = "plugin")]
-            if let Err(e) = self.start_plugin_controllers() {
+            if let Err(e) = self.plugins.start_controllers() {
                 let result = self.abort_after_trader_start_failure(e).await;
-                self.drain_channels(
+                Self::drain_channels(
                     &mut time_evt_rx,
                     &mut data_evt_rx,
                     &mut data_cmd_rx,
@@ -1105,43 +981,35 @@ impl LiveNode {
 
         let exec_config = &self.config.exec_engine;
         let inflight_interval_ns =
-            (exec_config.inflight_check_interval_ms as u64) * NANOSECONDS_IN_MILLISECOND;
+            u64::from(exec_config.inflight_check_interval_ms) * NANOSECONDS_IN_MILLISECOND;
         let open_interval_ns = exec_config
             .open_check_interval_secs
             .filter(|&s| s > 0.0)
             .map_or(0, secs_to_nanos_unchecked);
-        let position_interval_ns = exec_config
+        let position_check_configured = exec_config
             .position_check_interval_secs
-            .filter(|&s| s > 0.0)
-            .map_or(0, secs_to_nanos_unchecked);
+            .is_some_and(|interval_secs| interval_secs > 0.0);
         let has_clients = !self
             .kernel
             .exec_engine
             .borrow()
             .get_all_clients()
             .is_empty();
-        let recon_enabled = has_clients
-            && (inflight_interval_ns > 0 || open_interval_ns > 0 || position_interval_ns > 0);
+        let recon_enabled = has_clients && (inflight_interval_ns > 0 || open_interval_ns > 0);
 
         let recon_min_interval = if recon_enabled {
             let mut intervals = Vec::new();
 
             if exec_config.inflight_check_interval_ms > 0 {
-                intervals.push(Duration::from_millis(
-                    exec_config.inflight_check_interval_ms as u64,
-                ));
+                intervals.push(Duration::from_millis(u64::from(
+                    exec_config.inflight_check_interval_ms,
+                )));
             }
 
             if let Some(s) = exec_config.open_check_interval_secs.filter(|&s| s > 0.0) {
                 intervals.push(Duration::from_secs_f64(s));
             }
 
-            if let Some(s) = exec_config
-                .position_check_interval_secs
-                .filter(|&s| s > 0.0)
-            {
-                intervals.push(Duration::from_secs_f64(s));
-            }
             intervals
                 .into_iter()
                 .min()
@@ -1164,11 +1032,10 @@ impl LiveNode {
 
         let mut ts_last_inflight = self.exec_manager.generate_timestamp_ns();
         let mut ts_last_open = ts_last_inflight;
-        let mut ts_last_position = ts_last_inflight;
 
         // Per-task `(interval, next_fire)` schedules dispatched by the
         // shared `maintenance_timer` below. See module docs for rationale.
-        let far_future = Duration::from_secs(86400 * 365 * 100);
+        let far_future = Duration::from_hours(24 * 365 * 100);
 
         let make_schedule = |opt_dur: Option<Duration>| -> (Duration, dst::time::Instant) {
             let dur = opt_dur.unwrap_or(far_future);
@@ -1185,21 +1052,21 @@ impl LiveNode {
             exec_config
                 .purge_closed_orders_interval_mins
                 .filter(|&m| m > 0)
-                .map(|m| Duration::from_secs(mins_to_secs(m as u64))),
+                .map(|m| Duration::from_secs(mins_to_secs(u64::from(m)))),
         );
 
         let (purge_positions_interval, mut purge_positions_next) = make_schedule(
             exec_config
                 .purge_closed_positions_interval_mins
                 .filter(|&m| m > 0)
-                .map(|m| Duration::from_secs(mins_to_secs(m as u64))),
+                .map(|m| Duration::from_secs(mins_to_secs(u64::from(m)))),
         );
 
         let (purge_account_interval, mut purge_account_next) = make_schedule(
             exec_config
                 .purge_account_events_interval_mins
                 .filter(|&m| m > 0)
-                .map(|m| Duration::from_secs(mins_to_secs(m as u64))),
+                .map(|m| Duration::from_secs(mins_to_secs(u64::from(m)))),
         );
 
         let (own_books_interval, mut own_books_next) = make_schedule(
@@ -1210,7 +1077,7 @@ impl LiveNode {
         );
 
         let (prune_fills_interval, mut prune_fills_next) =
-            make_schedule(Some(Duration::from_secs(60)));
+            make_schedule(Some(Duration::from_mins(1)));
 
         let mut maintenance_timer = dst::time::interval(Duration::from_millis(100));
         maintenance_timer.set_missed_tick_behavior(dst::time::MissedTickBehavior::Skip);
@@ -1224,8 +1091,16 @@ impl LiveNode {
 
         // Running phase: runs until shutdown deadline expires
         let mut residual_events = 0usize;
+        let mut open_order_report_task: Option<OpenOrderReportTask> = None;
         let ctrl_c = dst::signal::ctrl_c();
         tokio::pin!(ctrl_c);
+
+        if has_clients && position_check_configured {
+            log::warn!(
+                "Skipping continuous position reconciliation: no non-blocking position \
+                 reconciliation path is configured"
+            );
+        }
 
         loop {
             let shutdown_deadline = self.shutdown_deadline;
@@ -1247,7 +1122,7 @@ impl LiveNode {
                     if stop_handle.should_stop() {
                         log::info!("Received stop signal from handle");
                         self.initiate_shutdown();
-                    } else if shutdown_flag.get() {
+                    } else if self.kernel.is_shutdown_requested() {
                         log::info!("Received ShutdownSystem command, shutting down");
                         self.initiate_shutdown();
                     }
@@ -1260,6 +1135,18 @@ impl LiveNode {
                 }, if self.state() == NodeState::ShuttingDown => {
                     break;
                 }
+                result = async {
+                    match open_order_report_task.as_mut() {
+                        Some(task) => task.future.as_mut().await,
+                        None => std::future::pending::<OpenOrderReportResult>().await,
+                    }
+                }, if open_order_report_task.is_some() => {
+                    open_order_report_task = None;
+                    let events = self
+                        .exec_manager
+                        .reconcile_open_order_reports(&result.check, result.reports);
+                    self.process_reconciliation_events(&events);
+                }
 
                 // Maintenance dispatcher (before event processing to avoid
                 // starvation). See module docs for design rationale.
@@ -1267,16 +1154,21 @@ impl LiveNode {
                     let mut now = dst::time::Instant::now();
 
                     if recon_enabled && now >= recon_next {
-                        if let Err(e) = self.run_reconciliation_checks(
-                            inflight_interval_ns,
-                            open_interval_ns,
-                            position_interval_ns,
-                            &mut ts_last_inflight,
-                            &mut ts_last_open,
-                            &mut ts_last_position,
-                        ).await {
-                            log::error!("Reconciliation check error: {e}");
-                        }
+                        let recon_intervals = ReconciliationCheckIntervals {
+                            inflight_ns: inflight_interval_ns,
+                            open_ns: open_interval_ns,
+                        };
+                        let mut recon_state = ReconciliationCheckState {
+                            ts_last_inflight: &mut ts_last_inflight,
+                            ts_last_open: &mut ts_last_open,
+                            open_order_report_task: &mut open_order_report_task,
+                        };
+
+                        self.run_reconciliation_checks(
+                            recon_intervals,
+                            &mut recon_state,
+                        );
+
                         now = dst::time::Instant::now();
                         recon_next = now + recon_interval;
                     }
@@ -1339,12 +1231,8 @@ impl LiveNode {
                                     );
                                     self.exec_manager.mark_fill_processed(fill.trade_id);
                                 }
-                                OrderEventAny::Accepted(_) => {
-                                    self.exec_manager.clear_recon_tracking(
-                                        &order_evt.client_order_id(), true,
-                                    );
-                                }
-                                OrderEventAny::Rejected(_)
+                                OrderEventAny::Accepted(_)
+                                | OrderEventAny::Rejected(_)
                                 | OrderEventAny::Canceled(_)
                                 | OrderEventAny::Expired(_)
                                 | OrderEventAny::Denied(_) => {
@@ -1449,12 +1337,13 @@ impl LiveNode {
             log::debug!("Processed {residual_events} residual events during shutdown");
         }
 
+        drop(open_order_report_task.take());
         let _ = self.kernel.cache().borrow().check_residuals();
 
         self.finalize_stop().await?;
 
         // Handle events that arrived during finalize_stop
-        self.drain_channels(
+        Self::drain_channels(
             &mut time_evt_rx,
             &mut data_evt_rx,
             &mut data_cmd_rx,
@@ -1537,7 +1426,7 @@ impl LiveNode {
 
     fn initiate_shutdown(&mut self) {
         #[cfg(feature = "plugin")]
-        if let Err(e) = self.stop_plugin_controllers() {
+        if let Err(e) = self.plugins.stop_controllers() {
             log::error!("Error stopping plug-in controllers: {e}");
         }
         self.kernel.stop_trader();
@@ -1563,7 +1452,6 @@ impl LiveNode {
     }
 
     fn drain_channels(
-        &self,
         time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventHandler>,
         data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
         data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
@@ -1759,14 +1647,14 @@ impl LiveNode {
             .borrow()
             .prepare_strategy_for_registration(&mut strategy)?;
         if let Some(claims) = strategy.external_order_claims() {
-            for instrument_id in claims {
+            for instrument_id in &claims {
                 self.exec_manager
-                    .claim_external_orders(instrument_id, strategy_id);
+                    .claim_external_orders(*instrument_id, strategy_id)?;
             }
             log_info!(
                 "Registered external order claims for {}: {:?}",
                 strategy_id,
-                strategy.external_order_claims(),
+                claims,
                 color = LogColor::Blue
             );
         }
@@ -1800,148 +1688,115 @@ impl LiveNode {
             .add_exec_algorithm(exec_algorithm)
     }
 
-    // Runs up to three reconciliation sub-checks (inflight, open orders,
-    // positions), each gated by its own interval. The maintenance timer in
-    // the select! loop dispatches this method at the minimum enabled
-    // interval; the method then checks which sub-checks are actually due.
-    //
-    // The exec_engine borrow is held across the async venue queries because
-    // get_all_clients() returns references into the engine's client map.
-    // This is safe: select! runs one branch to completion, so no other
-    // branch can borrow the same RefCells concurrently.
-    #[expect(clippy::await_holding_refcell_ref)]
-    async fn run_reconciliation_checks(
+    // Runs reconciliation sub-checks, each gated by its own interval.
+    // Continuous checks only schedule venue work; they do not await venue I/O
+    // in the event loop.
+    fn run_reconciliation_checks(
         &mut self,
-        inflight_interval_ns: u64,
-        open_interval_ns: u64,
-        position_interval_ns: u64,
-        ts_last_inflight: &mut UnixNanos,
-        ts_last_open: &mut UnixNanos,
-        ts_last_position: &mut UnixNanos,
-    ) -> anyhow::Result<()> {
+        intervals: ReconciliationCheckIntervals,
+        state: &mut ReconciliationCheckState<'_>,
+    ) {
         let ts_now = self.exec_manager.generate_timestamp_ns();
 
-        if inflight_interval_ns > 0 && (ts_now - *ts_last_inflight).as_u64() >= inflight_interval_ns
-        {
+        if reconciliation_check_due(ts_now, *state.ts_last_inflight, intervals.inflight_ns) {
             if self.state() == NodeState::ShuttingDown {
-                return Ok(());
+                return;
             }
             let result = self.exec_manager.check_inflight_orders();
             self.process_reconciliation_events(&result.events);
             for cmd in result.queries {
                 AsyncRunner::handle_exec_command(cmd);
             }
-            *ts_last_inflight = ts_now;
+            *state.ts_last_inflight = ts_now;
         }
 
-        if open_interval_ns > 0 && (ts_now - *ts_last_open).as_u64() >= open_interval_ns {
+        if reconciliation_check_due(ts_now, *state.ts_last_open, intervals.open_ns) {
             if self.state() == NodeState::ShuttingDown {
-                return Ok(());
+                return;
             }
-            let eng_ref = self.kernel.exec_engine.borrow();
-            let clients = eng_ref.get_all_clients();
-            let events = self.exec_manager.check_open_orders(&clients).await;
-            drop(clients);
-            drop(eng_ref);
-            self.process_reconciliation_events(&events);
-            *ts_last_open = ts_now;
+
+            if state.open_order_report_task.is_none() {
+                *state.open_order_report_task = self.start_open_order_report_check();
+            } else {
+                log::debug!("Open-order reconciliation already in progress");
+            }
+
+            *state.ts_last_open = ts_now;
+        }
+    }
+
+    fn start_open_order_report_check(&self) -> Option<OpenOrderReportTask> {
+        if self.exec_clients.is_empty() {
+            log::debug!("No execution clients to check orders consistency");
+            return None;
         }
 
-        if position_interval_ns > 0 && (ts_now - *ts_last_position).as_u64() >= position_interval_ns
-        {
-            if self.state() == NodeState::ShuttingDown {
-                return Ok(());
+        let check = self
+            .exec_manager
+            .prepare_open_order_report_check(UUID4::new());
+        let command = check.command.clone();
+        let clients = self.exec_clients.clone();
+
+        Some(OpenOrderReportTask {
+            future: Box::pin(async move {
+                let reports = request_open_order_reports(clients, command).await;
+                OpenOrderReportResult { check, reports }
+            }),
+        })
+    }
+}
+
+async fn request_open_order_reports(
+    clients: Vec<LiveExecutionClient>,
+    command: GenerateOrderStatusReports,
+) -> Vec<OrderStatusReport> {
+    let mut all_reports = Vec::new();
+
+    for client in clients {
+        match client.generate_order_status_reports(&command).await {
+            Ok(reports) => {
+                all_reports.extend(reports);
             }
-            let eng_ref = self.kernel.exec_engine.borrow();
-            let clients = eng_ref.get_all_clients();
-            let events = self
-                .exec_manager
-                .check_positions_consistency(&clients)
-                .await;
-            drop(clients);
-            drop(eng_ref);
-            self.process_reconciliation_events(&events);
-            *ts_last_position = ts_now;
+            Err(e) => {
+                log::error!(
+                    "Failed to generate order status reports from {}: {e}",
+                    client.client_id()
+                );
+            }
         }
-
-        Ok(())
     }
+
+    all_reports
 }
 
-#[cfg(feature = "plugin")]
-fn verify_plugin_sha256(config: &PluginConfig) -> anyhow::Result<()> {
-    let Some(expected) = &config.sha256 else {
-        return Ok(());
-    };
-
-    let bytes = std::fs::read(&config.path)
-        .with_context(|| format!("failed to read plug-in '{}'", config.path))?;
-    let actual = hex::encode(digest::digest(&digest::SHA256, &bytes).as_ref());
-    if actual.eq_ignore_ascii_case(expected) {
-        return Ok(());
-    }
-
-    anyhow::bail!(
-        "plug-in '{}' SHA-256 mismatch: expected {}, actual {}",
-        config.path,
-        expected,
-        actual
-    )
+fn reconciliation_check_due(ts_now: UnixNanos, ts_last: UnixNanos, interval_ns: u64) -> bool {
+    interval_ns > 0
+        && ts_now
+            .duration_since(&ts_last)
+            .is_some_and(|elapsed_ns| elapsed_ns >= interval_ns)
 }
 
-#[cfg(feature = "plugin")]
-fn plugin_actor_id(config: &PluginConfig) -> anyhow::Result<ActorId> {
-    let actor_id = plugin_config_string(config, "actor_id")?.unwrap_or(&config.type_name);
-    ActorId::new_checked(actor_id)
-        .map_err(|e| anyhow::anyhow!("invalid actor_id for plug-in '{}': {e}", config.type_name))
+#[derive(Clone, Copy)]
+struct ReconciliationCheckIntervals {
+    inflight_ns: u64,
+    open_ns: u64,
 }
 
-#[cfg(feature = "plugin")]
-fn plugin_strategy_config(config: &PluginConfig) -> anyhow::Result<StrategyConfig> {
-    let mut strategy_config = if let Some(value) = config.config.get("strategy_config") {
-        serde_json::from_value::<StrategyConfig>(value.clone()).with_context(|| {
-            format!(
-                "invalid strategy_config for plug-in strategy '{}'",
-                config.type_name
-            )
-        })?
-    } else {
-        StrategyConfig::default()
-    };
-
-    if strategy_config.strategy_id.is_none() {
-        let strategy_id = plugin_config_string(config, "strategy_id")?
-            .map_or_else(|| format!("{}-001", config.type_name), str::to_string);
-        strategy_config.strategy_id = Some(StrategyId::new_checked(&strategy_id).map_err(|e| {
-            anyhow::anyhow!(
-                "invalid strategy_id for plug-in strategy '{}': {e}",
-                config.type_name
-            )
-        })?);
-    }
-
-    if strategy_config.order_id_tag.is_none()
-        && let Some(order_id_tag) = plugin_config_string(config, "order_id_tag")?
-    {
-        strategy_config.order_id_tag = Some(order_id_tag.to_string());
-    }
-
-    Ok(strategy_config)
+struct ReconciliationCheckState<'a> {
+    ts_last_inflight: &'a mut UnixNanos,
+    ts_last_open: &'a mut UnixNanos,
+    open_order_report_task: &'a mut Option<OpenOrderReportTask>,
 }
 
-#[cfg(feature = "plugin")]
-fn plugin_config_string<'a>(
-    config: &'a PluginConfig,
-    key: &'static str,
-) -> anyhow::Result<Option<&'a str>> {
-    match config.config.get(key) {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(value)) => Ok(Some(value.as_str())),
-        Some(_) => anyhow::bail!(
-            "plug-in '{}' config field '{key}' must be a string",
-            config.type_name
-        ),
-    }
+type OpenOrderReportFuture = Pin<Box<dyn Future<Output = OpenOrderReportResult>>>;
+
+struct OpenOrderReportTask {
+    future: OpenOrderReportFuture,
+}
+
+struct OpenOrderReportResult {
+    check: OpenOrderReportCheck,
+    reports: Vec<OrderStatusReport>,
 }
 
 /// Flushes data events and commands from both `pending` and the channel receivers
@@ -2193,8 +2048,6 @@ impl PendingEvents {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "plugin")]
-    use std::collections::HashMap;
     #[cfg(feature = "python")]
     use std::sync::Arc;
     use std::{cell::RefCell, rc::Rc};
@@ -2204,10 +2057,20 @@ mod tests {
         SyncDataCommandSender, SyncTradingCommandSender, replace_data_cmd_sender,
         replace_exec_cmd_sender,
     };
-    use nautilus_common::{cache::Cache, clock::Clock};
+    use nautilus_common::{
+        cache::Cache,
+        clock::Clock,
+        msgbus::{self, MessagingSwitchboard, TypedIntoHandler},
+    };
     use nautilus_core::{UUID4, UnixNanos};
-    use nautilus_execution::engine::SnapshotAnchorer;
-    use nautilus_model::identifiers::TraderId;
+    use nautilus_execution::engine::{ExecutionEngine, SnapshotAnchorer};
+    use nautilus_model::{
+        enums::OrderType,
+        identifiers::{AccountId, ClientId, InstrumentId, TraderId, VenueOrderId},
+        instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
+        orders::{OrderTestBuilder, stubs::TestOrderEventStubs},
+        types::{Price, Quantity},
+    };
     use nautilus_system::{KernelEventStore, RegisteredComponents, event_store::EventStoreConfig};
     use rstest::*;
 
@@ -2279,6 +2142,111 @@ mod tests {
             });
 
         builder.build().unwrap()
+    }
+
+    #[rstest]
+    fn test_run_reconciliation_checks_does_not_publish_open_order_queries() {
+        let config = LiveNodeConfig {
+            exec_engine: crate::config::LiveExecEngineConfig {
+                reconciliation: true,
+                open_check_interval_secs: Some(1.0),
+                position_check_interval_secs: Some(1.0),
+                max_single_order_queries_per_cycle: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut node =
+            LiveNode::build("ReconciliationFallbackNode".to_string(), Some(config)).unwrap();
+        let client_id = ClientId::from("TEST-QUERY");
+        let account_id = AccountId::from("TEST-QUERY-001");
+
+        let trading_commands = Rc::new(RefCell::new(Vec::new()));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_execute(),
+            TypedIntoHandler::from({
+                let trading_commands = trading_commands.clone();
+                move |command: TradingCommand| {
+                    trading_commands.borrow_mut().push(command);
+                }
+            }),
+        );
+
+        let venue_order_id = VenueOrderId::from("V-NODE-QUERY-001");
+        let instrument = crypto_perpetual_ethusdt();
+        let instrument_id = instrument.id();
+        let client_order_id = ClientOrderId::from("O-NODE-QUERY-001");
+
+        node.kernel
+            .cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CryptoPerpetual(instrument))
+            .unwrap();
+        insert_accepted_limit_order_in_node(
+            &node,
+            account_id,
+            client_id,
+            instrument_id,
+            client_order_id,
+            venue_order_id,
+        );
+
+        let mut ts_last_inflight = UnixNanos::default();
+        let mut ts_last_open = UnixNanos::default();
+        let mut open_order_report_task = None;
+
+        node.run_reconciliation_checks(
+            ReconciliationCheckIntervals {
+                inflight_ns: 0,
+                open_ns: 1,
+            },
+            &mut ReconciliationCheckState {
+                ts_last_inflight: &mut ts_last_inflight,
+                ts_last_open: &mut ts_last_open,
+                open_order_report_task: &mut open_order_report_task,
+            },
+        );
+
+        let commands = trading_commands.borrow();
+
+        assert!(commands.is_empty());
+        assert!(open_order_report_task.is_none());
+
+        ExecutionEngine::register_msgbus_handlers(&node.kernel.exec_engine);
+    }
+
+    fn insert_accepted_limit_order_in_node(
+        node: &LiveNode,
+        account_id: AccountId,
+        client_id: ClientId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+    ) {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(client_order_id)
+            .instrument_id(instrument_id)
+            .quantity(Quantity::from("10.0"))
+            .price(Price::from("100.0"))
+            .build();
+        let submitted = TestOrderEventStubs::submitted(&order, account_id);
+        node.kernel
+            .cache
+            .borrow_mut()
+            .add_order(order, None, Some(client_id), false)
+            .unwrap();
+        let order = node
+            .kernel
+            .cache
+            .borrow_mut()
+            .update_order(&submitted)
+            .unwrap();
+        let accepted = TestOrderEventStubs::accepted(&order, account_id, venue_order_id);
+        node.kernel
+            .cache
+            .borrow_mut()
+            .update_order(&accepted)
+            .unwrap();
     }
 
     #[rstest]
@@ -2603,72 +2571,6 @@ mod tests {
         assert_eq!(builder.name(), "TestNode");
     }
 
-    #[cfg(feature = "plugin")]
-    #[rstest]
-    fn test_plugin_actor_id_rejects_non_string_actor_id() {
-        let config = PluginConfig {
-            path: "./libexample.so".to_string(),
-            type_name: "ExampleActor".to_string(),
-            config: HashMap::from([("actor_id".to_string(), serde_json::json!(42))]),
-            sha256: None,
-        };
-
-        let error = plugin_actor_id(&config).unwrap_err().to_string();
-
-        assert!(error.contains("actor_id"));
-        assert!(error.contains("must be a string"));
-    }
-
-    #[cfg(feature = "plugin")]
-    #[rstest]
-    fn test_plugin_strategy_config_accepts_nested_strategy_config() {
-        let config = PluginConfig {
-            path: "./libexample.so".to_string(),
-            type_name: "ExampleStrategy".to_string(),
-            config: HashMap::from([(
-                "strategy_config".to_string(),
-                serde_json::json!({
-                    "strategy_id": "NestedStrategy-001",
-                    "order_id_tag": "NEST",
-                }),
-            )]),
-            sha256: None,
-        };
-
-        let strategy_config = plugin_strategy_config(&config).unwrap();
-
-        assert_eq!(
-            strategy_config.strategy_id,
-            Some(StrategyId::from("NestedStrategy-001"))
-        );
-        assert_eq!(strategy_config.order_id_tag.as_deref(), Some("NEST"));
-    }
-
-    #[cfg(feature = "plugin")]
-    #[rstest]
-    fn test_plugin_strategy_config_uses_top_level_strategy_id_and_order_id_tag() {
-        let config = PluginConfig {
-            path: "./libexample.so".to_string(),
-            type_name: "ExampleStrategy".to_string(),
-            config: HashMap::from([
-                (
-                    "strategy_id".to_string(),
-                    serde_json::json!("TopLevelStrategy-001"),
-                ),
-                ("order_id_tag".to_string(), serde_json::json!("TOP")),
-            ]),
-            sha256: None,
-        };
-
-        let strategy_config = plugin_strategy_config(&config).unwrap();
-
-        assert_eq!(
-            strategy_config.strategy_id,
-            Some(StrategyId::from("TopLevelStrategy-001"))
-        );
-        assert_eq!(strategy_config.order_id_tag.as_deref(), Some("TOP"));
-    }
-
     #[cfg(feature = "python")]
     #[rstest]
     fn test_node_build_and_initial_state() {
@@ -2875,7 +2777,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_flush_all_pending_drains_all_channel_types() {
+    fn test_flush_all_pending_drains_buffered_channels() {
         let (time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventHandler>();
         let (data_evt_tx, mut data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
         let (data_cmd_tx, mut data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();

@@ -55,6 +55,7 @@ use super::{
     dispatch_tap_publish, dispatch_tap_response, dispatch_tap_send, get_message_bus,
     matching::is_matching_backtracking,
     mstr::{Endpoint, MStr, Pattern, Topic},
+    try_get_message_bus,
     typed_handler::{ShareableMessageHandler, TypedHandler, TypedIntoHandler},
 };
 #[cfg(feature = "defi")]
@@ -95,6 +96,15 @@ pub fn register_quote_endpoint(endpoint: MStr<Endpoint>, handler: TypedHandler<Q
         .borrow_mut()
         .endpoints_quotes
         .register(endpoint, handler);
+}
+
+/// Returns whether a quote tick handler is registered for the given endpoint.
+#[must_use]
+pub fn has_quote_endpoint(endpoint: MStr<Endpoint>) -> bool {
+    get_message_bus()
+        .borrow()
+        .endpoints_quotes
+        .is_registered(endpoint)
 }
 
 /// Registers a trade tick handler at an endpoint.
@@ -944,6 +954,40 @@ pub fn publish_any(topic: MStr<Topic>, message: &dyn Any) {
     ANY_HANDLERS.with_borrow_mut(|buf| *buf = handlers);
 }
 
+/// Tries to publish a message to the current thread's registered message bus.
+///
+/// Returns `false` when the thread has no bus or the bus is already borrowed.
+pub fn try_publish_any(topic: MStr<Topic>, message: &dyn Any) -> bool {
+    let Some(bus_rc) = try_get_message_bus() else {
+        return false;
+    };
+
+    if bus_rc.try_borrow_mut().is_err() {
+        return false;
+    }
+
+    dispatch_tap_publish(topic, message);
+
+    let Ok(mut bus) = bus_rc.try_borrow_mut() else {
+        return false;
+    };
+
+    // Take buffer (re-entrancy safe)
+    let mut handlers = ANY_HANDLERS.with_borrow_mut(std::mem::take);
+
+    bus.fill_matching_any_handlers(topic, &mut handlers);
+    bus.increment_pub_count();
+    drop(bus);
+
+    for handler in &handlers {
+        handler.0.handle(message);
+    }
+
+    handlers.clear(); // Release refs before restore
+    ANY_HANDLERS.with_borrow_mut(|buf| *buf = handlers);
+    true
+}
+
 /// Publishes an instrument to subscribers on a topic.
 pub fn publish_instrument(topic: MStr<Topic>, instrument: &InstrumentAny) {
     publish_typed(
@@ -1501,7 +1545,7 @@ mod tests {
     //! where `send_*` holds a borrow, calls the handler, and the handler needs to
     //! call `borrow_mut()` for topic getters or other operations.
 
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, rc::Rc, thread};
 
     use nautilus_core::UUID4;
     use nautilus_model::{
@@ -1521,7 +1565,9 @@ mod tests {
             },
             execution::{CancelAllOrders, TradingCommand},
         },
-        msgbus::{BusTap, clear_bus_tap, set_bus_tap},
+        msgbus::{
+            BusTap, clear_bus_tap, set_bus_tap, set_message_bus, stubs::get_call_check_handler,
+        },
     };
 
     #[rstest]
@@ -2227,6 +2273,64 @@ mod tests {
     }
 
     #[rstest]
+    fn try_publish_any_dispatches_handler_and_tap() {
+        let msgbus = Rc::new(RefCell::new(MessageBus::default()));
+        set_message_bus(msgbus.clone());
+        clear_bus_tap();
+
+        let tap = Rc::new(RecordingTap::default());
+        set_bus_tap(tap.clone());
+
+        let topic = "data.any.try.test";
+        let (handler, checker) = get_call_check_handler(None);
+        let pub_count = msgbus.borrow().pub_count();
+        subscribe_any(topic.into(), handler, None);
+
+        let payload: u32 = 42;
+        let published = try_publish_any(topic.into(), &payload);
+
+        clear_bus_tap();
+
+        assert!(published);
+        assert!(checker.was_called());
+        assert_eq!(msgbus.borrow().pub_count(), pub_count + 1);
+        assert_eq!(tap.publish_topics(), vec![topic]);
+    }
+
+    #[rstest]
+    fn try_publish_any_without_registered_bus_returns_false() {
+        let published = thread::spawn(|| {
+            let payload: u32 = 42;
+            try_publish_any("data.any.no-bus.test".into(), &payload)
+        })
+        .join()
+        .expect("thread should join");
+
+        assert!(!published);
+    }
+
+    #[rstest]
+    fn try_publish_any_with_borrowed_bus_returns_false_without_tap() {
+        let msgbus = Rc::new(RefCell::new(MessageBus::default()));
+        set_message_bus(msgbus.clone());
+        clear_bus_tap();
+
+        let tap = Rc::new(RecordingTap::default());
+        set_bus_tap(tap.clone());
+
+        let bus_borrow = msgbus.borrow_mut();
+        let payload: u32 = 42;
+        let published = try_publish_any("data.any.borrowed.test".into(), &payload);
+        drop(bus_borrow);
+
+        clear_bus_tap();
+
+        assert!(!published);
+        assert_eq!(msgbus.borrow().pub_count(), 0);
+        assert!(tap.publish_topics().is_empty());
+    }
+
+    #[rstest]
     fn set_bus_tap_then_publish_typed_invokes_tap() {
         let _msgbus = get_message_bus();
         let tap = Rc::new(RecordingTap::default());
@@ -2315,6 +2419,19 @@ mod tests {
         clear_bus_tap();
 
         assert_eq!(tap.send_endpoints(), vec!["endpoint.send.quote.test"]);
+    }
+
+    #[rstest]
+    fn has_quote_endpoint_returns_registration_state() {
+        let _msgbus = get_message_bus();
+        let endpoint: MStr<Endpoint> = "endpoint.has.quote.registered".into();
+
+        assert!(!has_quote_endpoint(endpoint));
+
+        let handler = TypedHandler::from_with_id(endpoint, |_quote: &QuoteTick| {});
+        register_quote_endpoint(endpoint, handler);
+
+        assert!(has_quote_endpoint(endpoint));
     }
 
     #[rstest]

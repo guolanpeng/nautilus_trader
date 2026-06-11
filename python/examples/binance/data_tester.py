@@ -52,13 +52,14 @@ def main() -> None:
         None,
         BinanceDataClientFactory(),
         BinanceDataClientConfig(
-            product_types=[BinanceProductType.SPOT],
+            product_type=BinanceProductType.SPOT,
             environment=BinanceEnvironment.LIVE,
         ),
     )
 
     node = builder.build()
     node.add_native_actor(
+        "DataTester",
         DataTesterConfig(
             client_id=ClientId.from_str(BINANCE),
             instrument_ids=[instrument_id],

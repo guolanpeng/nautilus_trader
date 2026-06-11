@@ -15,29 +15,50 @@
 
 //! Python bindings for fee model types.
 
-use nautilus_core::python::to_pyruntime_err;
+use nautilus_core::python::{to_pyruntime_err, to_pytype_err};
 use nautilus_model::types::Money;
 use pyo3::prelude::*;
+use rust_decimal::Decimal;
 
-use crate::models::fee::{FixedFeeModel, MakerTakerFeeModel, PerContractFeeModel};
+use crate::models::fee::{
+    CappedOptionFeeModel, FixedFeeModel, MakerTakerFeeModel, PerContractFeeModel,
+    TieredNotionalOptionFeeModel,
+};
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl FixedFeeModel {
     /// Creates a new `FixedFeeModel` instance.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `commission` is negative.
     #[new]
-    #[pyo3(signature = (commission, change_commission_once=None))]
-    fn py_new(commission: Money, change_commission_once: Option<bool>) -> PyResult<Self> {
-        Self::new(commission, change_commission_once).map_err(to_pyruntime_err)
+    #[pyo3(signature = (commission, charge_commission_once=None, change_commission_once=None))]
+    fn py_new(
+        commission: Money,
+        charge_commission_once: Option<bool>,
+        change_commission_once: Option<bool>,
+    ) -> PyResult<Self> {
+        let charge_commission_once = resolve_fixed_fee_charge_commission_once(
+            charge_commission_once,
+            change_commission_once,
+        )?;
+        Self::new(commission, charge_commission_once).map_err(to_pyruntime_err)
     }
 
     fn __repr__(&self) -> String {
         format!("{self:?}")
     }
+}
+
+fn resolve_fixed_fee_charge_commission_once(
+    charge_commission_once: Option<bool>,
+    change_commission_once: Option<bool>,
+) -> PyResult<Option<bool>> {
+    if charge_commission_once.is_some() && change_commission_once.is_some() {
+        return Err(to_pytype_err(
+            "Provide only one of `charge_commission_once` or `change_commission_once`",
+        ));
+    }
+
+    Ok(charge_commission_once.or(change_commission_once))
 }
 
 #[pymethods]
@@ -64,6 +85,44 @@ impl PerContractFeeModel {
     #[new]
     fn py_new(commission: Money) -> PyResult<Self> {
         Self::new(commission).map_err(to_pyruntime_err)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl CappedOptionFeeModel {
+    /// Creates a new `CappedOptionFeeModel` instance.
+    #[new]
+    #[pyo3(signature = (maker_rate=None, taker_rate=None, cap_rate=None))]
+    fn py_new(
+        maker_rate: Option<Decimal>,
+        taker_rate: Option<Decimal>,
+        cap_rate: Option<Decimal>,
+    ) -> PyResult<Self> {
+        Self::new(maker_rate, taker_rate, cap_rate).map_err(to_pyruntime_err)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl TieredNotionalOptionFeeModel {
+    /// Creates a new `TieredNotionalOptionFeeModel` instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any supplied rate is negative.
+    #[new]
+    #[pyo3(signature = (maker_rate=None, taker_rate=None))]
+    fn py_new(maker_rate: Option<Decimal>, taker_rate: Option<Decimal>) -> PyResult<Self> {
+        Self::new(maker_rate, taker_rate).map_err(to_pyruntime_err)
     }
 
     fn __repr__(&self) -> String {

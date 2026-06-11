@@ -119,6 +119,34 @@ pub struct LighterNextNonceQuery {
 
 #[derive(Clone, Debug, Deserialize, Serialize, Builder, PartialEq, Eq)]
 #[builder(setter(strip_option))]
+pub struct LighterMakerOnlyApiKeysQuery {
+    #[builder(default)]
+    #[builder(setter(into, strip_option))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<String>,
+    #[builder(default)]
+    #[builder(setter(into, strip_option))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    pub account_index: i64,
+}
+
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LighterAccountLookup {
+    #[default]
+    Index,
+    L1Address,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Builder, PartialEq, Eq)]
+pub struct LighterAccountQuery {
+    pub by: LighterAccountLookup,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Builder, PartialEq, Eq)]
+#[builder(setter(strip_option))]
 pub struct LighterAccountActiveOrdersQuery {
     #[builder(default)]
     #[builder(setter(into, strip_option))]

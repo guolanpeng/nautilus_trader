@@ -57,7 +57,7 @@ use nautilus_common::{
 };
 use nautilus_core::{
     UUID4, UnixNanos, WeakCell,
-    datetime::{mins_to_nanos, mins_to_secs},
+    datetime::{mins_to_nanos, mins_to_secs, secs_to_nanos},
 };
 use nautilus_model::{
     accounts::Account,
@@ -92,9 +92,21 @@ use crate::{
     },
 };
 
+const TIMER_SNAPSHOT_POSITIONS: &str = "ExecEngine_SNAPSHOT_POSITIONS";
 const TIMER_PURGE_CLOSED_ORDERS: &str = "ExecEngine_PURGE_CLOSED_ORDERS";
 const TIMER_PURGE_CLOSED_POSITIONS: &str = "ExecEngine_PURGE_CLOSED_POSITIONS";
 const TIMER_PURGE_ACCOUNT_EVENTS: &str = "ExecEngine_PURGE_ACCOUNT_EVENTS";
+
+/// Position state snapshot published to the `snapshots.positions.{position_id}` topic.
+#[derive(Debug, Clone)]
+pub struct PositionStateSnapshot {
+    /// The position state at the time of the snapshot.
+    pub position: Position,
+    /// The unrealized PnL for the position, when a current quote is available.
+    pub unrealized_pnl: Option<Money>,
+    /// UNIX timestamp (nanoseconds) when the snapshot was taken.
+    pub ts_snapshot: UnixNanos,
+}
 
 /// Callback that anchors cache snapshot metadata in an external store.
 pub type SnapshotAnchorer = Rc<dyn Fn(CacheSnapshotRef) -> anyhow::Result<()>>;
@@ -119,6 +131,7 @@ pub struct ExecutionEngine {
     command_count: Cell<u64>,
     event_count: u64,
     report_count: u64,
+    filtered_unclaimed_external_order_count: u64,
     snapshot_anchorer: Option<SnapshotAnchorer>,
 }
 
@@ -157,6 +170,7 @@ impl ExecutionEngine {
             command_count: Cell::new(0),
             event_count: 0,
             report_count: 0,
+            filtered_unclaimed_external_order_count: 0,
             snapshot_anchorer: None,
         }
     }
@@ -226,6 +240,12 @@ impl ExecutionEngine {
     #[must_use]
     pub const fn report_count(&self) -> u64 {
         self.report_count
+    }
+
+    /// Returns the count of unclaimed external venue orders filtered by execution reconciliation.
+    #[must_use]
+    pub const fn filtered_unclaimed_external_order_count(&self) -> u64 {
+        self.filtered_unclaimed_external_order_count
     }
 
     /// Subscribes to instrument updates for a venue via the message bus.
@@ -673,18 +693,66 @@ impl ExecutionEngine {
     }
 
     /// Starts the position snapshot timer if configured.
-    ///
-    /// Timer functionality requires a live execution context with an active clock.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "timer registration is not expected to fail"
+    )]
     pub fn start_snapshot_timer(&mut self) {
-        if let Some(interval_secs) = self.config.snapshot_positions_interval_secs {
+        if let Some(interval_secs) = self
+            .config
+            .snapshot_positions_interval_secs
+            .filter(|&secs| secs > 0.0)
+            && !self
+                .clock
+                .borrow()
+                .timer_names()
+                .contains(&TIMER_SNAPSHOT_POSITIONS)
+        {
+            let interval_ns = match secs_to_nanos(interval_secs) {
+                Ok(ns) => ns,
+                Err(e) => {
+                    log::error!("Cannot start position snapshots timer: {e}");
+                    return;
+                }
+            };
+            let clock = self.clock.clone();
+            let cache = self.cache.clone();
+            let debug = self.config.debug;
+
+            let callback_fn: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_event| {
+                Self::snapshot_open_positions(&clock, &cache, debug);
+            });
+            let callback = TimeEventCallback::from(callback_fn);
+
             log::info!("Starting position snapshots timer at {interval_secs} second intervals");
+            self.clock
+                .borrow_mut()
+                .set_timer_ns(
+                    TIMER_SNAPSHOT_POSITIONS,
+                    interval_ns,
+                    None,
+                    None,
+                    Some(callback),
+                    None,
+                    None,
+                )
+                .expect("Failed to set position snapshots timer");
         }
     }
 
     /// Stops the position snapshot timer if running.
     pub fn stop_snapshot_timer(&mut self) {
-        if self.config.snapshot_positions_interval_secs.is_some() {
+        let timer_registered = self
+            .clock
+            .borrow()
+            .timer_names()
+            .contains(&TIMER_SNAPSHOT_POSITIONS);
+
+        if timer_registered {
             log::info!("Canceling position snapshots timer");
+            self.clock
+                .borrow_mut()
+                .cancel_timer(TIMER_SNAPSHOT_POSITIONS);
         }
     }
 
@@ -847,8 +915,15 @@ impl ExecutionEngine {
 
     /// Creates snapshots of all open positions.
     pub fn snapshot_open_position_states(&self) {
-        let positions: Vec<Position> = self
-            .cache
+        Self::snapshot_open_positions(&self.clock, &self.cache, self.config.debug);
+    }
+
+    fn snapshot_open_positions(
+        clock: &Rc<RefCell<dyn Clock>>,
+        cache: &Rc<RefCell<Cache>>,
+        debug: bool,
+    ) {
+        let positions: Vec<Position> = cache
             .borrow()
             .positions_open(None, None, None, None, None)
             .into_iter()
@@ -856,7 +931,7 @@ impl ExecutionEngine {
             .collect();
 
         for position in positions {
-            self.create_position_state_snapshot(&position);
+            Self::publish_position_state_snapshot(clock, cache, debug, &position, true);
         }
     }
 
@@ -1021,11 +1096,46 @@ impl ExecutionEngine {
     /// Builds and registers an external order from an [`OrderStatusReport`] without
     /// emitting status events. Returns the registered order.
     fn materialize_external_order_from_status(
-        &self,
+        &mut self,
         report: &OrderStatusReport,
     ) -> Option<OrderAny> {
         let strategy_id = self.resolve_external_strategy(&report.instrument_id);
+        if self.should_filter_unclaimed_external_order(strategy_id) {
+            self.filtered_unclaimed_external_order_count += 1;
 
+            if self.filtered_unclaimed_external_order_count == 1 {
+                let external_order_id = report
+                    .client_order_id
+                    .map_or_else(|| report.venue_order_id.to_string(), |id| id.to_string());
+                log::info!(
+                    "Filtering unclaimed external orders; first filtered order {} ({}) for {}",
+                    external_order_id,
+                    report.venue_order_id,
+                    report.instrument_id,
+                );
+            } else {
+                let external_order_id = report
+                    .client_order_id
+                    .map_or_else(|| report.venue_order_id.to_string(), |id| id.to_string());
+                log::debug!(
+                    "Filtered unclaimed external order {} ({}) for {}",
+                    external_order_id,
+                    report.venue_order_id,
+                    report.instrument_id,
+                );
+            }
+
+            return None;
+        }
+
+        self.materialize_external_order_from_status_with_strategy(report, strategy_id)
+    }
+
+    fn materialize_external_order_from_status_with_strategy(
+        &self,
+        report: &OrderStatusReport,
+        strategy_id: StrategyId,
+    ) -> Option<OrderAny> {
         let client_order_id = report
             .client_order_id
             .unwrap_or_else(|| ClientOrderId::from(report.venue_order_id.as_str()));
@@ -1087,8 +1197,33 @@ impl ExecutionEngine {
     ///
     /// This handles venue-initiated fills (most commonly Hyperliquid liquidations)
     /// where the venue does not surface a user-level order on its order channel.
-    fn materialize_external_order_from_fill(&self, report: &FillReport) -> Option<OrderAny> {
+    fn materialize_external_order_from_fill(&mut self, report: &FillReport) -> Option<OrderAny> {
         let strategy_id = self.resolve_external_strategy(&report.instrument_id);
+        if self.should_filter_unclaimed_external_order(strategy_id) {
+            self.filtered_unclaimed_external_order_count += 1;
+
+            let external_order_id = report
+                .client_order_id
+                .map_or_else(|| report.venue_order_id.to_string(), |id| id.to_string());
+
+            if self.filtered_unclaimed_external_order_count == 1 {
+                log::info!(
+                    "Filtering unclaimed external orders; first filtered fill {} ({}) for {}",
+                    external_order_id,
+                    report.venue_order_id,
+                    report.instrument_id,
+                );
+            } else {
+                log::debug!(
+                    "Filtered unclaimed external fill {} ({}) for {}",
+                    external_order_id,
+                    report.venue_order_id,
+                    report.instrument_id,
+                );
+            }
+
+            return None;
+        }
 
         let client_order_id = report
             .client_order_id
@@ -1148,7 +1283,11 @@ impl ExecutionEngine {
         self.external_order_claims
             .get(instrument_id)
             .copied()
-            .unwrap_or_else(|| StrategyId::from("EXTERNAL"))
+            .unwrap_or_else(StrategyId::external)
+    }
+
+    fn should_filter_unclaimed_external_order(&self, strategy_id: StrategyId) -> bool {
+        self.config.filter_unclaimed_external_orders && strategy_id.is_external()
     }
 
     /// Adds an external order to the cache and registers it for adapter routing.
@@ -1595,6 +1734,7 @@ impl ExecutionEngine {
         );
 
         let mut external_venue_ids = AHashSet::new();
+        let mut filtered_venue_ids = AHashSet::new();
 
         for order_report in mass_status.order_reports().values() {
             let existed = {
@@ -1609,11 +1749,31 @@ impl ExecutionEngine {
                     })
                     .is_some()
             };
+            let filtered_count = self.filtered_unclaimed_external_order_count;
 
             self.reconcile_order_status_report(order_report);
 
             if !existed {
-                external_venue_ids.insert(order_report.venue_order_id);
+                if self.filtered_unclaimed_external_order_count > filtered_count {
+                    filtered_venue_ids.insert(order_report.venue_order_id);
+                } else {
+                    let exists_after = {
+                        let cache = self.cache.borrow();
+                        order_report
+                            .client_order_id
+                            .and_then(|id| cache.order(&id).map(|o| o.clone()))
+                            .or_else(|| {
+                                cache
+                                    .client_order_id(&order_report.venue_order_id)
+                                    .and_then(|cid| cache.order(cid).map(|o| o.clone()))
+                            })
+                            .is_some()
+                    };
+
+                    if exists_after {
+                        external_venue_ids.insert(order_report.venue_order_id);
+                    }
+                }
             }
         }
 
@@ -1629,6 +1789,16 @@ impl ExecutionEngine {
 
                     log::debug!(
                         "Skipping fill report for external order {}: covered by inferred fill",
+                        fill_report.venue_order_id
+                    );
+                    continue;
+                }
+
+                if filtered_venue_ids.contains(&fill_report.venue_order_id) {
+                    msgbus::publish_any(raw_fill_topic, fill_report);
+
+                    log::debug!(
+                        "Skipping fill report for filtered unclaimed external order {}",
                         fill_report.venue_order_id
                     );
                     continue;
@@ -1731,6 +1901,7 @@ impl ExecutionEngine {
         self.command_count.set(0);
         self.event_count = 0;
         self.report_count = 0;
+        self.filtered_unclaimed_external_order_count = 0;
 
         log::info!("Reset");
     }
@@ -2199,15 +2370,50 @@ impl ExecutionEngine {
         }
     }
 
-    fn create_position_state_snapshot(&self, position: &Position) {
-        if self.config.debug {
+    fn create_position_state_snapshot(&self, position: &Position, open_only: bool) {
+        Self::publish_position_state_snapshot(
+            &self.clock,
+            &self.cache,
+            self.config.debug,
+            position,
+            open_only,
+        );
+    }
+
+    fn publish_position_state_snapshot(
+        clock: &Rc<RefCell<dyn Clock>>,
+        cache: &Rc<RefCell<Cache>>,
+        debug: bool,
+        position: &Position,
+        open_only: bool,
+    ) {
+        if debug {
             log::debug!("Creating position state snapshot for {position}");
         }
 
-        // let mut position: Position = position.clone();
-        // if let Some(pnl) = self.cache.borrow().calculate_unrealized_pnl(&position) {
-        //     position.unrealized_pnl(last)
-        // }
+        let ts_snapshot = clock.borrow().timestamp_ns();
+        let unrealized_pnl = cache.borrow().calculate_unrealized_pnl(position);
+
+        let snapshot = PositionStateSnapshot {
+            position: position.clone(),
+            unrealized_pnl,
+            ts_snapshot,
+        };
+
+        let topic = format!("snapshots.positions.{}", position.id);
+        msgbus::publish_any(topic.into(), &snapshot);
+
+        let has_backing = cache.borrow().has_backing();
+        if has_backing
+            && let Err(e) = cache.borrow_mut().snapshot_position_state(
+                position,
+                ts_snapshot,
+                unrealized_pnl,
+                Some(open_only),
+            )
+        {
+            log::error!("Failed to snapshot position state: {e}");
+        }
     }
 
     fn handle_event(&mut self, event: &OrderEventAny) {
@@ -3050,7 +3256,7 @@ impl ExecutionEngine {
         self.cache.borrow_mut().add_position(&position, oms_type)?;
 
         if self.config.snapshot_positions {
-            self.create_position_state_snapshot(&position);
+            self.create_position_state_snapshot(&position, true);
         }
 
         let ts_init = self.clock.borrow().timestamp_ns();
@@ -3119,7 +3325,7 @@ impl ExecutionEngine {
 
         // Create position state snapshot if enabled
         if self.config.snapshot_positions {
-            self.create_position_state_snapshot(position);
+            self.create_position_state_snapshot(position, false);
         }
 
         let ts_init = self.clock.borrow().timestamp_ns();
@@ -3181,10 +3387,12 @@ impl ExecutionEngine {
         };
 
         // Split commission between two positions
-        let fill_percent = position.quantity.as_f64() / fill.last_qty.as_f64();
+        let fill_percent = position.quantity.as_decimal() / fill.last_qty.as_decimal();
         let (commission1, commission2) = if let Some(commission) = fill.commission {
             let commission_currency = commission.currency;
-            let commission1 = Money::new(commission * fill_percent, commission_currency);
+            let commission1 =
+                Money::from_decimal(commission.as_decimal() * fill_percent, commission_currency)
+                    .expect("Invalid split commission");
             let commission2 = commission - commission1;
             (Some(commission1), Some(commission2))
         } else {

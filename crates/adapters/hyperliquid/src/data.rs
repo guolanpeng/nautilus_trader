@@ -342,7 +342,7 @@ impl HyperliquidDataClient {
                                     log::info!("WebSocket reconnected");
                                 }
                                 NautilusWsMessage::Error(e) => {
-                                    log::error!("WebSocket error: {e}");
+                                    log::warn!("WebSocket error: {e}");
                                 }
                                 NautilusWsMessage::ExecutionReports(_) => {
                                     // Handled by execution client
@@ -469,7 +469,7 @@ impl DataClient for HyperliquidDataClient {
         self.abort_pending_tasks();
 
         if let Err(e) = self.ws_client.disconnect().await {
-            log::error!("Error disconnecting WebSocket client: {e}");
+            log::warn!("Error disconnecting WebSocket client: {e}");
         }
 
         self.instruments.store(AHashMap::new());

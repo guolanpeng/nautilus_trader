@@ -35,16 +35,15 @@ use nautilus_common::{
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, QuoteTick, TradeTick},
-    enums::OmsType,
+    enums::{OmsType, OrderSide},
     events::{
         AccountState, OrderEventAny, OrderFilled, OrderInitialized, PositionAdjusted,
         PositionChanged, PositionClosed, PositionOpened,
     },
+    identifiers::PositionId,
     orders::OrderAny,
     position::Position,
 };
-#[cfg(feature = "persistence")]
-use nautilus_persistence::backend::catalog::{ParquetDataCatalog, parse_filename_timestamps};
 use serde::de::DeserializeOwned;
 
 #[cfg(test)]
@@ -86,6 +85,12 @@ use crate::{
     reader::{EventStoreReader, SnapshotReplayPlan},
     snapshot::{SnapshotAnchor, compute_snapshot_content_hash},
 };
+
+#[cfg(feature = "persistence")]
+mod catalog;
+
+#[cfg(feature = "persistence")]
+pub use catalog::ParquetReplayCatalog;
 
 /// Summary of a cache snapshot-tail replay.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -484,6 +489,9 @@ pub trait ReplayCatalog {
 
     /// Loads records for one planned catalog slice without live venue access.
     ///
+    /// Implementations return records in catalog order so marker cursor joins can take a
+    /// deterministic prefix from a cumulative stream slice.
+    ///
     /// # Errors
     ///
     /// Returns the catalog implementation's error when slice loading fails.
@@ -491,108 +499,6 @@ pub trait ReplayCatalog {
         &mut self,
         plan: &CatalogSlicePlan,
     ) -> Result<Vec<CatalogReplayRecord>, Self::Error>;
-}
-
-/// Read-only replay catalog adapter backed by [`ParquetDataCatalog`].
-#[cfg(feature = "persistence")]
-#[derive(Debug)]
-pub struct ParquetReplayCatalog<'a> {
-    catalog: &'a mut ParquetDataCatalog,
-}
-
-#[cfg(feature = "persistence")]
-impl<'a> ParquetReplayCatalog<'a> {
-    /// Creates a replay catalog adapter over an existing Parquet catalog.
-    pub const fn new(catalog: &'a mut ParquetDataCatalog) -> Self {
-        Self { catalog }
-    }
-}
-
-#[cfg(feature = "persistence")]
-impl ReplayCatalog for ParquetReplayCatalog<'_> {
-    type Error = anyhow::Error;
-
-    fn plan_slice(
-        &mut self,
-        query: &CatalogSliceQuery,
-    ) -> Result<CatalogSliceCoverage, Self::Error> {
-        let mut files = self.catalog.query_files(
-            &query.data_cls,
-            query.identifiers_option(),
-            Some(query.start),
-            Some(query.end),
-        )?;
-        files.sort();
-
-        let intervals = files
-            .iter()
-            .filter_map(|file| {
-                parse_filename_timestamps(file).map(|(start, end)| {
-                    ReplayTimeRange::new(UnixNanos::from(start), UnixNanos::from(end))
-                })
-            })
-            .collect();
-
-        Ok(CatalogSliceCoverage { files, intervals })
-    }
-
-    fn load_slice(
-        &mut self,
-        plan: &CatalogSlicePlan,
-    ) -> Result<Vec<CatalogReplayRecord>, Self::Error> {
-        let identifiers = plan.query.identifiers_option();
-        let start = Some(plan.query.start);
-        let end = Some(plan.query.end);
-        let files = Some(plan.coverage.files.clone());
-
-        match plan.query.data_cls.as_str() {
-            "quotes" => Ok(catalog_replay_records(
-                self.catalog.query_typed_data::<QuoteTick>(
-                    identifiers,
-                    start,
-                    end,
-                    None,
-                    files,
-                    false,
-                )?,
-            )),
-            "trades" => Ok(catalog_replay_records(
-                self.catalog.query_typed_data::<TradeTick>(
-                    identifiers,
-                    start,
-                    end,
-                    None,
-                    files,
-                    false,
-                )?,
-            )),
-            "bars" => Ok(catalog_replay_records(
-                self.catalog.query_typed_data::<Bar>(
-                    identifiers,
-                    start,
-                    end,
-                    None,
-                    files,
-                    false,
-                )?,
-            )),
-            data_cls => {
-                anyhow::bail!("catalog replay loading for {data_cls} is not supported")
-            }
-        }
-    }
-}
-
-#[cfg(feature = "persistence")]
-fn catalog_replay_records<T>(records: Vec<T>) -> Vec<CatalogReplayRecord>
-where
-    T: Into<CatalogReplayData>,
-{
-    records
-        .into_iter()
-        .map(Into::into)
-        .map(CatalogReplayRecord::from_data)
-        .collect()
 }
 
 /// Errors surfaced while planning or loading replay inputs.
@@ -1199,7 +1105,9 @@ pub fn restore_cache_snapshot_blob(
 /// Applies one event-store entry to cache state when a replay rule exists.
 ///
 /// Returns `Ok(true)` when the entry changed cache state and `Ok(false)` when the
-/// payload is outside the current cache bootstrap replay surface.
+/// payload is outside the current cache bootstrap replay surface, or when a position
+/// event's target position is absent from the cache (logged as a warning so the report's
+/// ignored count surfaces the divergence instead of claiming a full apply).
 ///
 /// # Errors
 ///
@@ -1267,25 +1175,34 @@ pub fn apply_cache_replay_entry(
         }
         PAYLOAD_TYPE_ORDER_FILLED => {
             let fill = decode_payload::<OrderFilled>(entry)?;
+            // The fill side panics deep inside Position/Order application; the hash
+            // proves the bytes match what was written, not that the producer wrote a
+            // semantically valid fill, so guard before the model invariants fire.
+            if matches!(fill.order_side, OrderSide::NoOrderSide) {
+                return Err(apply_error(
+                    entry,
+                    "OrderFilled.order_side must be Buy or Sell, was NoOrderSide",
+                ));
+            }
             let event = OrderEventAny::Filled(fill);
             apply_result(entry, cache.update_order(&event))?;
             apply_fill_to_position(cache, entry, &fill)?;
         }
         PAYLOAD_TYPE_POSITION_OPENED => {
             let opened = decode_payload::<PositionOpened>(entry)?;
-            apply_position_opened(cache, entry, &opened)?;
+            return apply_position_opened(cache, entry, &opened);
         }
         PAYLOAD_TYPE_POSITION_CHANGED => {
             let changed = decode_payload::<PositionChanged>(entry)?;
-            apply_position_changed(cache, entry, &changed)?;
+            return apply_position_changed(cache, entry, &changed);
         }
         PAYLOAD_TYPE_POSITION_CLOSED => {
             let closed = decode_payload::<PositionClosed>(entry)?;
-            apply_position_closed(cache, entry, &closed)?;
+            return apply_position_closed(cache, entry, &closed);
         }
         PAYLOAD_TYPE_POSITION_ADJUSTED => {
             let adjustment = decode_payload::<PositionAdjusted>(entry)?;
-            apply_position_adjustment(cache, entry, adjustment)?;
+            return apply_position_adjustment(cache, entry, adjustment);
         }
         _ => return Ok(false),
     }
@@ -1385,6 +1302,11 @@ fn apply_fill_to_position(
     }
 
     let Some(instrument) = cache.instrument(&fill.instrument_id).cloned() else {
+        log::warn!(
+            "Replay seq {} skipped opening position {position_id}: instrument {} not in cache",
+            entry.seq,
+            fill.instrument_id,
+        );
         return Ok(());
     };
 
@@ -1397,9 +1319,10 @@ fn apply_position_opened(
     cache: &mut Cache,
     entry: &EventStoreEntry,
     opened: &PositionOpened,
-) -> Result<(), CacheReplayError> {
+) -> Result<bool, CacheReplayError> {
     let Some(mut position) = cache.position_owned(&opened.position_id) else {
-        return Ok(());
+        warn_position_skip(entry, opened.position_id);
+        return Ok(false);
     };
 
     position.trader_id = opened.trader_id;
@@ -1424,16 +1347,17 @@ fn apply_position_opened(
     position.realized_return = 0.0;
 
     apply_result(entry, cache.update_position(&position))?;
-    Ok(())
+    Ok(true)
 }
 
 fn apply_position_changed(
     cache: &mut Cache,
     entry: &EventStoreEntry,
     changed: &PositionChanged,
-) -> Result<(), CacheReplayError> {
+) -> Result<bool, CacheReplayError> {
     let Some(mut position) = cache.position_owned(&changed.position_id) else {
-        return Ok(());
+        warn_position_skip(entry, changed.position_id);
+        return Ok(false);
     };
 
     position.trader_id = changed.trader_id;
@@ -1457,16 +1381,17 @@ fn apply_position_changed(
     position.realized_pnl = changed.realized_pnl;
 
     apply_result(entry, cache.update_position(&position))?;
-    Ok(())
+    Ok(true)
 }
 
 fn apply_position_closed(
     cache: &mut Cache,
     entry: &EventStoreEntry,
     closed: &PositionClosed,
-) -> Result<(), CacheReplayError> {
+) -> Result<bool, CacheReplayError> {
     let Some(mut position) = cache.position_owned(&closed.position_id) else {
-        return Ok(());
+        warn_position_skip(entry, closed.position_id);
+        return Ok(false);
     };
 
     position.trader_id = closed.trader_id;
@@ -1492,21 +1417,32 @@ fn apply_position_closed(
     position.realized_pnl = closed.realized_pnl;
 
     apply_result(entry, cache.update_position(&position))?;
-    Ok(())
+    Ok(true)
 }
 
 fn apply_position_adjustment(
     cache: &mut Cache,
     entry: &EventStoreEntry,
     adjustment: PositionAdjusted,
-) -> Result<(), CacheReplayError> {
+) -> Result<bool, CacheReplayError> {
     let Some(mut position) = cache.position_owned(&adjustment.position_id) else {
-        return Ok(());
+        warn_position_skip(entry, adjustment.position_id);
+        return Ok(false);
     };
 
     position.apply_adjustment(adjustment);
     apply_result(entry, cache.update_position(&position))?;
-    Ok(())
+    Ok(true)
+}
+
+// A position event whose position is absent cannot apply; counting it as applied would
+// let a restore report full success while an open position is missing from the cache.
+fn warn_position_skip(entry: &EventStoreEntry, position_id: PositionId) {
+    log::warn!(
+        "Replay seq {} skipped {}: position {position_id} not in cache",
+        entry.seq,
+        entry.payload_type,
+    );
 }
 
 fn decode_payload<T>(entry: &EventStoreEntry) -> Result<T, CacheReplayError>
@@ -1550,11 +1486,6 @@ fn reject_quarantined_replay_source(
 #[cfg(test)]
 mod tests {
     use std::{any::Any, cell::Cell, rc::Rc};
-    #[cfg(feature = "persistence")]
-    use std::{
-        fs::{self, File},
-        path::Path,
-    };
 
     use ahash::AHashSet;
     use bytes::Bytes;
@@ -1583,8 +1514,6 @@ mod tests {
         orders::{Order, OrderList},
         types::{Currency, Money, Price, Quantity},
     };
-    #[cfg(feature = "persistence")]
-    use nautilus_persistence::backend::catalog::{ParquetDataCatalog, timestamps_to_filename};
     use rstest::rstest;
     use serde::Serialize;
     use tempfile::TempDir;
@@ -1798,311 +1727,6 @@ mod tests {
             self.load_plans.push(plan.clone());
             Ok(self.records.clone())
         }
-    }
-
-    #[cfg(feature = "persistence")]
-    #[rstest]
-    fn parquet_replay_catalog_plans_selected_slice_files() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
-
-        create_catalog_file(temp_dir.path(), "quotes", "AUDUSD.SIM", 1_000, 2_000);
-        create_catalog_file(temp_dir.path(), "quotes", "AUDUSD.SIM", 10_000, 11_000);
-        create_catalog_file(temp_dir.path(), "quotes", "ETHUSDT.BINANCE", 5_000, 6_000);
-
-        let query = CatalogSliceQuery {
-            data_cls: "quotes".to_string(),
-            identifiers: vec!["AUD/USD.SIM".to_string()],
-            start: UnixNanos::from(1_500),
-            end: UnixNanos::from(2_500),
-            required: true,
-        };
-        let coverage = ParquetReplayCatalog::new(&mut catalog)
-            .plan_slice(&query)
-            .unwrap();
-
-        assert_eq!(coverage.files.len(), 1);
-        assert!(
-            coverage.files[0].contains("data/quotes/AUDUSD.SIM/"),
-            "planned file should come from AUD/USD.SIM partition, was {}",
-            coverage.files[0],
-        );
-        assert_eq!(
-            coverage.intervals,
-            vec![ReplayTimeRange::new(
-                UnixNanos::from(1_000),
-                UnixNanos::from(2_000)
-            )]
-        );
-
-        let full_window_query = CatalogSliceQuery {
-            start: UnixNanos::from(0),
-            end: UnixNanos::from(12_000),
-            ..query.clone()
-        };
-        let full_window_coverage = ParquetReplayCatalog::new(&mut catalog)
-            .plan_slice(&full_window_query)
-            .unwrap();
-
-        assert_eq!(full_window_coverage.files.len(), 2);
-        assert_eq!(
-            full_window_coverage.intervals,
-            vec![
-                ReplayTimeRange::new(UnixNanos::from(1_000), UnixNanos::from(2_000)),
-                ReplayTimeRange::new(UnixNanos::from(10_000), UnixNanos::from(11_000)),
-            ]
-        );
-
-        let missing_query = CatalogSliceQuery {
-            start: UnixNanos::from(20_000),
-            end: UnixNanos::from(21_000),
-            ..query
-        };
-        let missing_coverage = ParquetReplayCatalog::new(&mut catalog)
-            .plan_slice(&missing_query)
-            .unwrap();
-
-        assert!(missing_coverage.is_missing());
-        assert!(missing_coverage.intervals.is_empty());
-    }
-
-    #[cfg(feature = "persistence")]
-    #[rstest]
-    fn parquet_replay_catalog_loads_selected_quote_records() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
-        let instrument_id = InstrumentId::from("AUD/USD.SIM");
-        let quotes = vec![
-            QuoteTick::new(
-                instrument_id,
-                Price::from("1.0001"),
-                Price::from("1.0002"),
-                Quantity::from("100"),
-                Quantity::from("100"),
-                UnixNanos::from(1_000),
-                UnixNanos::from(1_000),
-            ),
-            QuoteTick::new(
-                instrument_id,
-                Price::from("1.0003"),
-                Price::from("1.0004"),
-                Quantity::from("200"),
-                Quantity::from("200"),
-                UnixNanos::from(2_000),
-                UnixNanos::from(2_000),
-            ),
-            QuoteTick::new(
-                instrument_id,
-                Price::from("1.0005"),
-                Price::from("1.0006"),
-                Quantity::from("300"),
-                Quantity::from("300"),
-                UnixNanos::from(3_000),
-                UnixNanos::from(3_000),
-            ),
-        ];
-        catalog
-            .write_to_parquet(quotes.clone(), None, None, None)
-            .expect("write quotes");
-
-        let query = CatalogSliceQuery {
-            data_cls: "quotes".to_string(),
-            identifiers: vec!["AUD/USD.SIM".to_string()],
-            start: UnixNanos::from(1_500),
-            end: UnixNanos::from(2_500),
-            required: true,
-        };
-        let mut replay_catalog = ParquetReplayCatalog::new(&mut catalog);
-        let coverage = replay_catalog.plan_slice(&query).expect("plan slice");
-        let plan = catalog_slice_plan(query, coverage);
-
-        let records = replay_catalog.load_slice(&plan).expect("load slice");
-
-        assert_eq!(
-            records,
-            vec![CatalogReplayRecord::from_data(CatalogReplayData::Quote(
-                quotes[1]
-            ))],
-        );
-    }
-
-    #[cfg(feature = "persistence")]
-    #[rstest]
-    fn parquet_replay_catalog_loads_selected_trade_records() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
-        let instrument_id = InstrumentId::from("AUD/USD.SIM");
-        let trades = vec![
-            TradeTick::new(
-                instrument_id,
-                Price::from("1.0001"),
-                Quantity::from("100"),
-                AggressorSide::Buyer,
-                TradeId::from("T-1"),
-                UnixNanos::from(1_000),
-                UnixNanos::from(1_000),
-            ),
-            TradeTick::new(
-                instrument_id,
-                Price::from("1.0002"),
-                Quantity::from("200"),
-                AggressorSide::Seller,
-                TradeId::from("T-2"),
-                UnixNanos::from(2_000),
-                UnixNanos::from(2_000),
-            ),
-            TradeTick::new(
-                instrument_id,
-                Price::from("1.0003"),
-                Quantity::from("300"),
-                AggressorSide::Buyer,
-                TradeId::from("T-3"),
-                UnixNanos::from(3_000),
-                UnixNanos::from(3_000),
-            ),
-        ];
-        catalog
-            .write_to_parquet(trades.clone(), None, None, None)
-            .expect("write trades");
-
-        let query = CatalogSliceQuery {
-            data_cls: "trades".to_string(),
-            identifiers: vec!["AUD/USD.SIM".to_string()],
-            start: UnixNanos::from(1_500),
-            end: UnixNanos::from(2_500),
-            required: true,
-        };
-        let mut replay_catalog = ParquetReplayCatalog::new(&mut catalog);
-        let coverage = replay_catalog.plan_slice(&query).expect("plan slice");
-        let plan = catalog_slice_plan(query, coverage);
-
-        let records = replay_catalog.load_slice(&plan).expect("load slice");
-
-        assert_eq!(
-            records,
-            vec![CatalogReplayRecord::from_data(CatalogReplayData::Trade(
-                trades[1]
-            ))],
-        );
-    }
-
-    #[cfg(feature = "persistence")]
-    #[rstest]
-    fn parquet_replay_catalog_loads_selected_bar_records() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
-        let instrument_id = InstrumentId::from("AUD/USD.SIM");
-        let bar_type = BarType::new(
-            instrument_id,
-            BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
-            AggregationSource::External,
-        );
-        let bars = vec![
-            Bar::new(
-                bar_type,
-                Price::from("1.0000"),
-                Price::from("1.0002"),
-                Price::from("1.0000"),
-                Price::from("1.0001"),
-                Quantity::from("100"),
-                UnixNanos::from(1_000),
-                UnixNanos::from(1_000),
-            ),
-            Bar::new(
-                bar_type,
-                Price::from("1.0001"),
-                Price::from("1.0004"),
-                Price::from("1.0001"),
-                Price::from("1.0003"),
-                Quantity::from("200"),
-                UnixNanos::from(2_000),
-                UnixNanos::from(2_000),
-            ),
-            Bar::new(
-                bar_type,
-                Price::from("1.0003"),
-                Price::from("1.0006"),
-                Price::from("1.0003"),
-                Price::from("1.0005"),
-                Quantity::from("300"),
-                UnixNanos::from(3_000),
-                UnixNanos::from(3_000),
-            ),
-        ];
-        catalog
-            .write_to_parquet(bars.clone(), None, None, None)
-            .expect("write bars");
-
-        let query = CatalogSliceQuery {
-            data_cls: "bars".to_string(),
-            identifiers: vec!["AUD/USD.SIM".to_string()],
-            start: UnixNanos::from(1_500),
-            end: UnixNanos::from(2_500),
-            required: true,
-        };
-        let mut replay_catalog = ParquetReplayCatalog::new(&mut catalog);
-        let coverage = replay_catalog.plan_slice(&query).expect("plan slice");
-        let plan = catalog_slice_plan(query, coverage);
-
-        let records = replay_catalog.load_slice(&plan).expect("load slice");
-
-        assert_eq!(
-            records,
-            vec![CatalogReplayRecord::from_data(CatalogReplayData::Bar(
-                bars[1]
-            ))],
-        );
-    }
-
-    #[cfg(feature = "persistence")]
-    #[rstest]
-    fn parquet_replay_catalog_rejects_unsupported_load_slice() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
-        let plan = CatalogSlicePlan {
-            query: CatalogSliceQuery {
-                data_cls: "order_book_deltas".to_string(),
-                identifiers: vec!["AUD/USD.SIM".to_string()],
-                start: UnixNanos::from(1_000),
-                end: UnixNanos::from(2_000),
-                required: true,
-            },
-            coverage: CatalogSliceCoverage::from_files(vec![
-                "data/order_book_deltas/AUDUSD.SIM/1000_2000.parquet".to_string(),
-            ]),
-        };
-
-        let err = ParquetReplayCatalog::new(&mut catalog)
-            .load_slice(&plan)
-            .expect_err("unsupported data class must fail");
-
-        assert_eq!(
-            err.to_string(),
-            "catalog replay loading for order_book_deltas is not supported",
-        );
-    }
-
-    #[cfg(feature = "persistence")]
-    fn catalog_slice_plan(
-        query: CatalogSliceQuery,
-        coverage: CatalogSliceCoverage,
-    ) -> CatalogSlicePlan {
-        CatalogSlicePlan { query, coverage }
-    }
-
-    #[cfg(feature = "persistence")]
-    fn create_catalog_file(
-        base_path: &Path,
-        data_cls: &str,
-        identifier: &str,
-        start: u64,
-        end: u64,
-    ) {
-        let directory = base_path.join("data").join(data_cls).join(identifier);
-        fs::create_dir_all(&directory).unwrap();
-
-        let filename = timestamps_to_filename(UnixNanos::from(start), UnixNanos::from(end));
-        File::create(directory.join(filename)).unwrap();
     }
 
     struct BusTapGuard;
@@ -3689,6 +3313,50 @@ mod tests {
         assert_eq!(position.adjustments, vec![adjustment]);
         assert_eq!(position.realized_pnl, Some(Money::from("2 USD")));
         assert_eq!(position.ts_last, adjustment.ts_event);
+    }
+
+    #[rstest]
+    fn position_event_for_unknown_position_is_counted_as_ignored() {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let position_id = PositionId::from("P-MISSING");
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .position_id(position_id)
+            .build();
+        let position = Position::new(&instrument, fill);
+        let opened = PositionOpened::create(&position, &fill, UUID4::new(), UnixNanos::from(10));
+        let entry = append_position_event(1, &PositionEvent::PositionOpened(opened)).entry;
+        let mut cache = Cache::default();
+
+        let applied = apply_cache_replay_entry(&mut cache, &entry).expect("apply");
+
+        assert!(
+            !applied,
+            "missing position must count as ignored, not applied"
+        );
+    }
+
+    #[rstest]
+    fn order_filled_with_no_order_side_is_an_apply_error_not_a_panic() {
+        // The entry hash proves the stored bytes match what was written, not that the
+        // producer wrote a valid fill; OrderSide::NoOrderSide deserializes cleanly and
+        // without the guard panics deep inside Position/Order application.
+        let mut fill = OrderFilledSpec::builder()
+            .position_id(PositionId::from("P-001"))
+            .build();
+        fill.order_side = OrderSide::NoOrderSide;
+        let entry = append_serde_payload(1, PAYLOAD_TYPE_ORDER_FILLED, &fill).entry;
+        let mut cache = Cache::default();
+
+        let err = apply_cache_replay_entry(&mut cache, &entry).expect_err("must reject");
+
+        match err {
+            CacheReplayError::Apply { seq, message, .. } => {
+                assert_eq!(seq, 1);
+                assert!(message.contains("NoOrderSide"), "message was: {message}");
+            }
+            other => panic!("expected Apply, was {other:?}"),
+        }
     }
 
     #[rstest]

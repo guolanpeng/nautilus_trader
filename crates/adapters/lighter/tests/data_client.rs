@@ -41,7 +41,7 @@ use std::{
 use axum::{
     Router,
     extract::{
-        Query, State,
+        State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
@@ -61,7 +61,7 @@ use nautilus_common::{
             SubscribeBookDeltas, SubscribeBookDepth10, SubscribeFundingRates, SubscribeIndexPrices,
             SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, UnsubscribeBars,
             UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeIndexPrices,
-            UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
+            UnsubscribeInstrument, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
     testing::wait_until_async,
@@ -69,7 +69,6 @@ use nautilus_common::{
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_lighter::{
     common::consts::LIGHTER_VENUE, config::LighterDataClientConfig, data::LighterDataClient,
-    http::query::LighterTradesQuery,
 };
 use nautilus_model::{
     data::{BarSpecification, BarType, Data},
@@ -79,9 +78,6 @@ use nautilus_model::{
 };
 use rstest::rstest;
 use serde_json::{Value, json};
-
-const PRIVATE_KEY_HEX: &str =
-    "0b8e0f63c24d8baacd9d29ad4e9a4b73c4a8d2bb8b16dc4fa9d7c2e1d3a8b1f0e8d3a4c5b6e7f001";
 const ETH_PERP_SYMBOL: &str = "ETH-PERP";
 
 fn data_path() -> PathBuf {
@@ -167,27 +163,6 @@ async fn fundings() -> Response {
     (
         StatusCode::OK,
         std::fs::read_to_string(data_path().join("http_fundings.json")).unwrap(),
-    )
-        .into_response()
-}
-
-async fn trades(Query(query): Query<LighterTradesQuery>) -> Response {
-    // The data-client trades path uses Schnorr-derived auth tokens. The mock
-    // does not verify the signature; it asserts the token is shaped as
-    // `<deadline>:<account_index>:<api_key_index>:<sig_hex>` so a regression
-    // that drops the token through silently fails here.
-    let token = query
-        .auth
-        .as_deref()
-        .expect("auth token must be present on /api/v1/trades");
-    assert_eq!(
-        token.split(':').count(),
-        4,
-        "unexpected token shape: `{token}`",
-    );
-    (
-        StatusCode::OK,
-        std::fs::read_to_string(data_path().join("http_recent_trades.json")).unwrap(),
     )
         .into_response()
 }
@@ -300,7 +275,6 @@ fn build_router(state: Arc<TestServerState>) -> Router {
         .route("/api/v1/orderBookOrders", get(order_book_orders))
         .route("/api/v1/recentTrades", get(recent_trades))
         .route("/api/v1/fundings", get(fundings))
-        .route("/api/v1/trades", get(trades))
         .route("/api/v1/candles", get(candles))
         .route("/stream", get(handle_ws_upgrade))
         .with_state(state)
@@ -329,18 +303,6 @@ fn build_config(addr: SocketAddr) -> LighterDataClientConfig {
         // via `connect()` and request_instruments(). A nonzero interval would
         // leak a background task across the entire crate's test run.
         update_instruments_interval_mins: 0,
-        ..LighterDataClientConfig::default()
-    }
-}
-
-fn build_config_with_credentials(addr: SocketAddr) -> LighterDataClientConfig {
-    LighterDataClientConfig {
-        base_url_http: Some(format!("http://{addr}")),
-        base_url_ws: Some(format!("ws://{addr}/stream")),
-        update_instruments_interval_mins: 0,
-        account_index: Some(12_345),
-        api_key_index: Some(5),
-        private_key: Some(PRIVATE_KEY_HEX.to_string()),
         ..LighterDataClientConfig::default()
     }
 }
@@ -482,6 +444,36 @@ async fn test_connect_emits_instrument_event() {
 
 #[rstest]
 #[tokio::test]
+async fn test_unsubscribe_instrument_is_cache_replay_noop() {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx) = build_client(build_config(addr));
+
+    client.connect().await.expect("connect");
+    drain_pending(&mut rx);
+
+    client
+        .unsubscribe_instrument(&UnsubscribeInstrument::new(
+            eth_perp_id(),
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("unsubscribe_instrument");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        state.unsubscribes().await.is_empty(),
+        "instrument unsubscribe is cache-local and must not hit the venue",
+    );
+
+    client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_subscribe_book_deltas_emits_deltas() {
     let (addr, state) = start_server().await;
     let (mut client, mut rx) = build_client(build_config(addr));
@@ -556,7 +548,7 @@ async fn test_subscribe_book_deltas_rejects_wrong_book_type() {
 
 #[rstest]
 #[tokio::test]
-async fn test_subscribe_book_depth10_emits_depth10_and_deltas() {
+async fn test_subscribe_book_depth10_emits_depth10_only() {
     let (addr, state) = start_server().await;
     let (mut client, mut rx) = build_client(build_config(addr));
 
@@ -583,34 +575,27 @@ async fn test_subscribe_book_depth10_emits_depth10_and_deltas() {
         ))
         .expect("subscribe_book_depth10");
 
-    let mut saw_deltas = false;
-    let mut saw_depth10 = false;
+    await_subscribe_count(&state, 1).await;
+    assert_eq!(state.subscribes().await[0]["channel"], "order_book/0");
 
-    for _ in 0..4 {
-        let Some(event) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .ok()
-            .flatten()
-        else {
-            break;
-        };
+    let event = next_event_matching(&mut rx, Duration::from_secs(2), |e| {
+        matches!(e, DataEvent::Data(Data::Depth10(_)))
+    })
+    .await
+    .expect("expected Depth10 event");
 
-        match event {
-            DataEvent::Data(Data::Deltas(_)) => saw_deltas = true,
-            DataEvent::Data(Data::Depth10(depth)) => {
-                saw_depth10 = true;
-                assert_eq!(depth.instrument_id, instrument_id);
-            }
-            _ => {}
+    match event {
+        DataEvent::Data(Data::Depth10(depth)) => {
+            assert_eq!(depth.instrument_id, instrument_id);
         }
-
-        if saw_deltas && saw_depth10 {
-            break;
-        }
+        other => panic!("expected Depth10 event, was {other:?}"),
     }
 
-    assert!(saw_deltas, "expected Deltas on snapshot frame");
-    assert!(saw_depth10, "expected Depth10 on snapshot frame");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "depth-only subscription must not emit book deltas",
+    );
 
     client.disconnect().await.expect("disconnect");
 }
@@ -981,12 +966,7 @@ async fn test_unsubscribe_quotes_and_trades_send_venue_frames() {
 
 #[rstest]
 #[tokio::test]
-async fn test_unsubscribe_book_depth10_does_not_tear_down_order_book_stream() {
-    // depth10 piggybacks on the shared `order_book` channel; the unsubscribe
-    // path only clears the depth-10 emission flag and intentionally leaves
-    // the WS subscription in place so any concurrent deltas subscriber keeps
-    // receiving updates. This pins that contract: no `unsubscribe` frame
-    // reaches the venue when depth10 is dropped on its own.
+async fn test_unsubscribe_book_depth10_without_deltas_sends_venue_unsubscribe() {
     let (addr, state) = start_server().await;
     let (mut client, mut rx) = build_client(build_config(addr));
 
@@ -1023,12 +1003,252 @@ async fn test_unsubscribe_book_depth10_does_not_tear_down_order_book_stream() {
         ))
         .expect("unsubscribe_book_depth10");
 
-    // Give the runtime a tick to confirm no venue frame is sent.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    await_unsubscribe_count(&state, 1).await;
+    assert_eq!(state.unsubscribes().await[0]["channel"], "order_book/0");
+
+    client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_book_deltas_and_depth10_share_order_book_stream() {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx) = build_client(build_config(addr));
+
+    client.connect().await.expect("connect");
+    drain_pending(&mut rx);
+
+    let instrument_id = eth_perp_id();
+    state
+        .enqueue_push(load_json("ws_order_book_subscribed.json"))
+        .await;
+
+    client
+        .subscribe_book_deltas(SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            false,
+            None,
+            None,
+        ))
+        .expect("subscribe_book_deltas");
+    await_subscribe_count(&state, 1).await;
+
+    let event = next_event_matching(&mut rx, Duration::from_secs(2), |e| {
+        matches!(e, DataEvent::Data(Data::Deltas(_)))
+    })
+    .await
+    .expect("expected initial Deltas event");
+
+    match event {
+        DataEvent::Data(Data::Deltas(deltas)) => {
+            assert_eq!(deltas.instrument_id, instrument_id);
+        }
+        other => panic!("expected Deltas event, was {other:?}"),
+    }
+
+    client
+        .subscribe_book_depth10(SubscribeBookDepth10::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            false,
+            None,
+            None,
+        ))
+        .expect("subscribe_book_depth10");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let subs = state.subscribes().await;
+    assert_eq!(
+        subs.len(),
+        1,
+        "late local subscriber must reuse the venue order_book stream"
+    );
+    assert_eq!(subs[0]["channel"], "order_book/0");
+
+    let event = next_event_matching(&mut rx, Duration::from_secs(2), |e| {
+        matches!(e, DataEvent::Data(Data::Depth10(_)))
+    })
+    .await
+    .expect("expected cached Depth10 event");
+
+    match event {
+        DataEvent::Data(Data::Depth10(depth)) => {
+            assert_eq!(depth.instrument_id, instrument_id);
+        }
+        other => panic!("expected Depth10 event, was {other:?}"),
+    }
+
+    let next = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+    assert!(
+        !matches!(next, Ok(Some(DataEvent::Data(Data::Deltas(_))))),
+        "late depth10 subscriber must not re-emit deltas",
+    );
+
+    client
+        .unsubscribe_book_depth10(&UnsubscribeBookDepth10::new(
+            instrument_id,
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("unsubscribe_book_depth10");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         state.unsubscribes().await.is_empty(),
-        "unsubscribe_book_depth10 must not tear down the shared order_book stream",
+        "dropping depth10 must leave the deltas stream active",
     );
+
+    client
+        .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("unsubscribe_book_deltas");
+
+    await_unsubscribe_count(&state, 1).await;
+    assert_eq!(state.unsubscribes().await[0]["channel"], "order_book/0");
+
+    client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_book_depth10_and_deltas_share_order_book_stream() {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx) = build_client(build_config(addr));
+
+    client.connect().await.expect("connect");
+    drain_pending(&mut rx);
+
+    let instrument_id = eth_perp_id();
+    state
+        .enqueue_push(load_json("ws_order_book_subscribed.json"))
+        .await;
+
+    client
+        .subscribe_book_depth10(SubscribeBookDepth10::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            false,
+            None,
+            None,
+        ))
+        .expect("subscribe_book_depth10");
+    await_subscribe_count(&state, 1).await;
+
+    let event = next_event_matching(&mut rx, Duration::from_secs(2), |e| {
+        matches!(e, DataEvent::Data(Data::Depth10(_)))
+    })
+    .await
+    .expect("expected initial Depth10 event");
+
+    match event {
+        DataEvent::Data(Data::Depth10(depth)) => {
+            assert_eq!(depth.instrument_id, instrument_id);
+        }
+        other => panic!("expected Depth10 event, was {other:?}"),
+    }
+
+    client
+        .subscribe_book_deltas(SubscribeBookDeltas::new(
+            instrument_id,
+            BookType::L2_MBP,
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            false,
+            None,
+            None,
+        ))
+        .expect("subscribe_book_deltas");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let subs = state.subscribes().await;
+    assert_eq!(
+        subs.len(),
+        1,
+        "late local subscriber must reuse the venue order_book stream"
+    );
+    assert_eq!(subs[0]["channel"], "order_book/0");
+
+    let event = next_event_matching(&mut rx, Duration::from_secs(2), |e| {
+        matches!(e, DataEvent::Data(Data::Deltas(_)))
+    })
+    .await
+    .expect("expected cached Deltas event");
+
+    match event {
+        DataEvent::Data(Data::Deltas(deltas)) => {
+            assert_eq!(deltas.instrument_id, instrument_id);
+        }
+        other => panic!("expected Deltas event, was {other:?}"),
+    }
+
+    let next = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+    assert!(
+        !matches!(next, Ok(Some(DataEvent::Data(Data::Depth10(_))))),
+        "late deltas subscriber must not re-emit depth10",
+    );
+
+    client
+        .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+            instrument_id,
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("unsubscribe_book_deltas");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        state.unsubscribes().await.is_empty(),
+        "dropping deltas must leave the depth10 stream active",
+    );
+
+    client
+        .unsubscribe_book_depth10(&UnsubscribeBookDepth10::new(
+            instrument_id,
+            Some(client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("unsubscribe_book_depth10");
+
+    await_unsubscribe_count(&state, 1).await;
+    assert_eq!(state.unsubscribes().await[0]["channel"], "order_book/0");
 
     client.disconnect().await.expect("disconnect");
 }
@@ -1269,9 +1489,9 @@ async fn test_request_funding_rates_emits_response() {
 
 #[rstest]
 #[tokio::test]
-async fn test_request_trades_with_credentials_emits_response() {
+async fn test_request_trades_emits_response() {
     let (addr, _state) = start_server().await;
-    let (mut client, mut rx) = build_client(build_config_with_credentials(addr));
+    let (mut client, mut rx) = build_client(build_config(addr));
 
     client.connect().await.expect("connect");
     drain_pending(&mut rx);
@@ -1302,16 +1522,6 @@ async fn test_request_trades_with_credentials_emits_response() {
 
     client.disconnect().await.expect("disconnect");
 }
-
-// The credentials-missing path for `request_trades` is covered by the
-// in-source test in `data.rs#test_request_trades_requires_credentials`, which
-// forcibly nulls `client.credential` after construction. From an external
-// integration test we cannot mutate that private field, and
-// `LighterDataClientConfig::has_credentials()` falls back to the `LIGHTER_*`
-// env vars, so the no-credentials assertion cannot be made deterministic here
-// without env mutation (which would need to be pinned to the workspace
-// `serial_tests` nextest group). The positive path is exercised by
-// `test_request_trades_with_credentials_emits_response`.
 
 #[rstest]
 #[tokio::test]

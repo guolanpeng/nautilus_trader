@@ -98,7 +98,7 @@ pub struct PendingPyRequest {
 #[cfg_attr(feature = "python", pyo3::pyclass(from_py_object))]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.bybit")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bybit")
 )]
 pub struct BybitWebSocketClient {
     url: String,
@@ -596,7 +596,11 @@ impl BybitWebSocketClient {
 
                         // Forward to out_tx so caller sees the Reconnected message
                         if out_tx.send(BybitWsMessage::Reconnected).is_err() {
-                            log::debug!("Receiver dropped, stopping");
+                            if handler.is_stopped() {
+                                log::debug!("Receiver dropped, stopping");
+                            } else {
+                                log::error!("Receiver dropped, stopping");
+                            }
                             break;
                         }
                     }
@@ -608,13 +612,21 @@ impl BybitWebSocketClient {
                         }
 
                         if out_tx.send(BybitWsMessage::Auth(auth.clone())).is_err() {
-                            log::error!("Failed to send message (receiver dropped)");
+                            if handler.is_stopped() {
+                                log::debug!("Failed to send message (receiver dropped)");
+                            } else {
+                                log::error!("Failed to send message (receiver dropped)");
+                            }
                             break;
                         }
                     }
                     Some(msg) => {
                         if out_tx.send(msg).is_err() {
-                            log::error!("Failed to send message (receiver dropped)");
+                            if handler.is_stopped() {
+                                log::debug!("Failed to send message (receiver dropped)");
+                            } else {
+                                log::error!("Failed to send message (receiver dropped)");
+                            }
                             break;
                         }
                     }

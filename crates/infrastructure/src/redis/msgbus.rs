@@ -201,7 +201,7 @@ impl MessageBusDatabaseAdapter for RedisMessageBusDatabase {
             let msg = BusMessage::new_close();
 
             if let Err(e) = self.pub_tx.send(msg) {
-                log::error!("Failed to send close message: {e:?}");
+                log::warn!("Failed to send close message: {e:?}");
             }
         }
 
@@ -380,7 +380,7 @@ async fn drain_buffer(
             ("payload", msg.payload.as_ref()),
         ];
         let stream_key = if stream_per_topic {
-            format!("{stream_key}:{}", &msg.topic)
+            format!("{stream_key}:{}", msg.topic)
         } else {
             stream_key.to_string()
         };

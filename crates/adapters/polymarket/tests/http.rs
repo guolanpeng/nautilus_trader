@@ -31,16 +31,16 @@ use axum::{
     Router,
     body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Json, Response},
     routing::{delete, get, post},
 };
 use nautilus_common::{providers::InstrumentProvider, testing::wait_until_async};
-use nautilus_model::identifiers::InstrumentId;
+use nautilus_model::{identifiers::InstrumentId, instruments::Instrument};
 use nautilus_network::{http::HttpClient, retry::RetryConfig};
 use nautilus_polymarket::{
     common::{credential::Credential, enums::PolymarketOrderType},
-    config::PolymarketInstrumentProviderConfig,
+    config::{PolymarketInstrumentProviderConfig, PolymarketUpDownEventSlugConfig},
     filters::{
         EventParamsFilter, EventSlugFilter, GammaQueryFilter, MarketSlugFilter, SearchFilter,
         TagFilter,
@@ -64,6 +64,9 @@ use serde_json::{Value, json};
 const TEST_API_SECRET_B64: &str = "dGVzdF9zZWNyZXRfa2V5XzMyYnl0ZXNfcGFkMTIzNDU=";
 const TEST_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
 
+type QueryPairs = Vec<(String, String)>;
+type QueryPairLog = Arc<tokio::sync::Mutex<Vec<QueryPairs>>>;
+
 #[derive(Clone)]
 struct TestServerState {
     request_count: Arc<tokio::sync::Mutex<usize>>,
@@ -76,6 +79,7 @@ struct TestServerState {
     gamma_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     gamma_markets_pages: Arc<tokio::sync::Mutex<VecDeque<Value>>>,
     gamma_markets_query_log: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
+    gamma_markets_query_pair_log: QueryPairLog,
     gamma_slug_responses: Arc<tokio::sync::Mutex<AHashMap<String, Value>>>,
     gamma_force_error: Arc<std::sync::atomic::AtomicBool>,
     gamma_event_slug_responses: Arc<tokio::sync::Mutex<AHashMap<String, Value>>>,
@@ -99,6 +103,7 @@ impl Default for TestServerState {
             gamma_response: Arc::new(tokio::sync::Mutex::new(None)),
             gamma_markets_pages: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             gamma_markets_query_log: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            gamma_markets_query_pair_log: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             gamma_slug_responses: Arc::new(tokio::sync::Mutex::new(AHashMap::new())),
             gamma_force_error: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             gamma_event_slug_responses: Arc::new(tokio::sync::Mutex::new(AHashMap::new())),
@@ -312,6 +317,7 @@ async fn handle_cancel_market(
 
 async fn handle_gamma_markets(
     State(state): State<TestServerState>,
+    uri: Uri,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
     if state
@@ -326,6 +332,11 @@ async fn handle_gamma_markets(
         .lock()
         .await
         .push(params.clone());
+    state
+        .gamma_markets_query_pair_log
+        .lock()
+        .await
+        .push(query_pairs(&uri));
 
     if let Some(slug) = params.get("slug") {
         let slug_map = state.gamma_slug_responses.lock().await;
@@ -349,6 +360,16 @@ async fn handle_gamma_markets(
         Some(v) => Json(v.clone()).into_response(),
         None => Json(json!([])).into_response(),
     }
+}
+
+fn query_pairs(uri: &Uri) -> Vec<(String, String)> {
+    uri.query()
+        .map(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn handle_gamma_markets_with_clob_tokens(
@@ -861,6 +882,57 @@ async fn test_get_gamma_markets_wrapped_data_response() {
 }
 
 #[rstest]
+#[case("0xcond1,0xcond2", vec!["0xcond1", "0xcond2"])]
+#[case(" 0xcond1 , 0xcond2 ", vec!["0xcond1", "0xcond2"])]
+#[case("0xcond1,,0xcond2,", vec!["0xcond1", "0xcond2"])]
+#[tokio::test]
+async fn test_get_gamma_markets_sends_repeated_list_filters(
+    #[case] csv: &str,
+    #[case] expected_values: Vec<&str>,
+) {
+    let state = TestServerState::default();
+    *state.gamma_response.lock().await = Some(json!([]));
+
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_gamma_client(&addr);
+
+    client
+        .get_gamma_markets(GetGammaMarketsParams {
+            condition_ids: Some(csv.to_string()),
+            clob_token_ids: Some(csv.to_string()),
+            question_ids: Some(csv.to_string()),
+            limit: Some(100),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let log = state.gamma_markets_query_pair_log.lock().await;
+    let pairs = log.first().expect("expected one /markets request");
+    let condition_ids: Vec<&str> = pairs
+        .iter()
+        .filter_map(|(key, value)| (key == "condition_ids").then_some(value.as_str()))
+        .collect();
+    let clob_token_ids: Vec<&str> = pairs
+        .iter()
+        .filter_map(|(key, value)| (key == "clob_token_ids").then_some(value.as_str()))
+        .collect();
+    let question_ids: Vec<&str> = pairs
+        .iter()
+        .filter_map(|(key, value)| (key == "question_ids").then_some(value.as_str()))
+        .collect();
+
+    assert_eq!(condition_ids, expected_values);
+    assert_eq!(clob_token_ids, expected_values);
+    assert_eq!(question_ids, expected_values);
+    assert!(
+        pairs
+            .iter()
+            .any(|(key, value)| key == "limit" && value == "100")
+    );
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_load_by_slugs_does_not_set_initialized() {
     let state = TestServerState::default();
@@ -1245,6 +1317,53 @@ async fn test_provider_initialize_uses_instrument_config_event_slugs() {
 
 #[rstest]
 #[tokio::test]
+async fn test_fetch_configured_instruments_uses_rust_event_slug_builder_result() {
+    let event_slug_builder = PolymarketUpDownEventSlugConfig {
+        assets: vec!["btc".to_string()],
+        interval_mins: 5,
+        periods: 2,
+        start_offset_periods: 0,
+    };
+    let event_slugs = event_slug_builder
+        .build_event_slugs()
+        .expect("event slugs should build");
+    let state = TestServerState::default();
+    let market = gamma_market_with_slug(
+        "builder-event-market",
+        "0xcondition_builder_evt",
+        ["61200000000000000001", "61200000000000000002"],
+    );
+    let mut event_responses = state.gamma_event_slug_responses.lock().await;
+
+    for event_slug in event_slugs {
+        let event = gamma_event_with_markets(&event_slug, std::slice::from_ref(&market));
+        event_responses.insert(event_slug, json!([event]));
+    }
+    drop(event_responses);
+
+    let addr = start_mock_server(state.clone()).await;
+    let http_client = create_gamma_domain_client(&addr);
+    let config = PolymarketInstrumentProviderConfig {
+        event_slug_builder: Some(event_slug_builder),
+        load_all: true,
+        ..PolymarketInstrumentProviderConfig::default()
+    };
+    let instruments =
+        nautilus_polymarket::providers::fetch_configured_instruments(&http_client, &config, &[])
+            .await
+            .expect("builder result should fetch instruments");
+
+    assert_eq!(instruments.len(), 2);
+    assert!(instruments.iter().all(|instrument| {
+        instrument
+            .id()
+            .to_string()
+            .contains("0xcondition_builder_evt")
+    }));
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_provider_initialize_merges_event_and_market_slug_scopes() {
     let state = TestServerState::default();
 
@@ -1603,17 +1722,21 @@ async fn test_load_ids_chunks_at_100_condition_ids() {
 
     provider.load_ids(&instrument_ids, None).await.unwrap();
 
-    let log = state.gamma_markets_query_log.lock().await;
+    let log = state.gamma_markets_query_pair_log.lock().await;
     assert_eq!(log.len(), 3, "expected 3 chunked /markets requests");
 
     let mut chunk_sizes = Vec::with_capacity(3);
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for entry in log.iter() {
-        let raw = entry
-            .get("condition_ids")
-            .expect("each chunk request must carry condition_ids");
-        let ids: Vec<&str> = raw.split(',').collect();
+        let ids: Vec<&str> = entry
+            .iter()
+            .filter_map(|(key, value)| (key == "condition_ids").then_some(value.as_str()))
+            .collect();
+        assert!(
+            !ids.is_empty(),
+            "each chunk request must carry condition_ids"
+        );
         chunk_sizes.push(ids.len());
 
         for id in ids {

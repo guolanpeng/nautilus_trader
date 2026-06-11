@@ -86,11 +86,11 @@ The Nautilus crates are published to
 
 ```toml
 [dependencies]
-nautilus-backtest = "0.55"
-nautilus-common = "0.55"
-nautilus-execution = "0.55"
-nautilus-model = { version = "0.55", features = ["stubs"] }
-nautilus-trading = { version = "0.55", features = ["examples"] }
+nautilus-backtest = "0.59"
+nautilus-common = "0.59"
+nautilus-execution = "0.59"
+nautilus-model = { version = "0.59", features = ["stubs"] }
+nautilus-trading = { version = "0.59", features = ["examples"] }
 
 anyhow = "1"
 log = "0.4"
@@ -100,8 +100,8 @@ For live trading, add the live crate and the adapter for your venue:
 
 ```toml
 [dependencies]
-nautilus-live = "0.55"
-nautilus-okx = "0.55"
+nautilus-live = "0.59"
+nautilus-okx = "0.59"
 ```
 
 To track the latest development branch, point all Nautilus dependencies at the
@@ -228,10 +228,10 @@ full walkthrough.
 
 #### Native config from Python
 
-Pass a config to `add_native_strategy` to register a built-in Rust
-strategy from Python. The Rust side constructs the strategy and
-registers it with the engine. Python provides the configuration;
-all execution happens in Rust.
+Pass a type name and config to `add_native_strategy` to register a
+built-in Rust strategy from Python. The Rust side constructs the strategy
+and registers it with the engine. Python provides the configuration; all
+execution happens in Rust.
 
 ```python
 from nautilus_trader.core.nautilus_pyo3.trading import GridMarketMakerConfig
@@ -244,33 +244,37 @@ config = GridMarketMakerConfig(
     grid_step_bps=15,
 )
 
-node.add_native_strategy(config)
+node.add_native_strategy("GridMarketMaker", config)
 ```
 
 Built-in strategy configs:
 
-| Config                  | Strategy              |
-|-------------------------|-----------------------|
-| `EmaCrossConfig`        | `EmaCross`            |
-| `GridMarketMakerConfig` | `GridMarketMaker`     |
-| `DeltaNeutralVolConfig` | `DeltaNeutralVol`     |
+| Config                         | Strategy                 |
+|--------------------------------|--------------------------|
+| `CompositeMarketMakerConfig`   | `CompositeMarketMaker`   |
+| `DeltaNeutralVolConfig`        | `DeltaNeutralVol`        |
+| `EmaCrossConfig`               | `EmaCross`               |
+| `ExecTesterConfig`             | `ExecTester`             |
+| `GridMarketMakerConfig`        | `GridMarketMaker`        |
+| `HurstVpinDirectionalConfig`   | `HurstVpinDirectional`   |
 
 Built-in actor configs (via `add_native_actor`):
 
 | Config                     | Actor                 |
 |----------------------------|-----------------------|
 | `BookImbalanceActorConfig` | `BookImbalanceActor`  |
+| `DataTesterConfig`         | `DataTester`          |
 
-Users who compile from source can add their own components to this
-path. Add a `#[pyclass]` config and a dispatch arm in
-`add_native_strategy` or `add_native_actor`. The component then
-works from Python without PyO3 wrappers on the type itself.
+Users who compile from source can add their own native components to this
+path. Add a `#[pyclass]` config, a `register_*` function, and a match arm
+in `native_strategy_register` or `native_actor_register`. The component
+then works from Python without PyO3 wrappers on the type itself.
 
-#### Plugin loading (planned)
+#### Plugin loading
 
-A future plugin system will load compiled shared libraries at runtime.
-Users compile strategies and actors as `cdylib` crates and the node
-loads them without recompilation. This path is not yet available.
+Use `add_plugin` or `LiveNodeConfig.plugins` for Rust components built as
+`cdylib` crates. The plug-in manifest supplies the component kind, so the
+host needs only the library path, manifest type name, and instance config.
 
 ## Backtesting
 

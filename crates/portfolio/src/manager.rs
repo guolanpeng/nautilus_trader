@@ -93,12 +93,12 @@ impl AccountsManager {
         match account.base_currency() {
             Some(base_currency) => {
                 let pnl = pnls.map_or_else(
-                    |_| Money::new(0.0, base_currency),
+                    |_| Money::zero(base_currency),
                     |pnl_list| {
                         pnl_list
                             .first()
                             .copied()
-                            .unwrap_or_else(|| Money::new(0.0, base_currency))
+                            .unwrap_or_else(|| Money::zero(base_currency))
                     },
                 );
 
@@ -106,7 +106,7 @@ impl AccountsManager {
             }
             None => {
                 if let Ok(mut pnl_list) = pnls {
-                    self.update_balance_multi_currency(&mut account, fill, &mut pnl_list);
+                    self.update_balance_multi_currency(&mut account, &fill, &mut pnl_list);
                 }
             }
         }
@@ -239,6 +239,11 @@ impl AccountsManager {
 
         if let Some(quantity) = net_qty {
             let price = Price::from_decimal_dp(net_avg_px, instrument.price_precision()).ok()?;
+            let net_entry = if net_signed_qty > Decimal::ZERO {
+                OrderSide::Buy
+            } else {
+                OrderSide::Sell
+            };
 
             let margin_maint = match instrument {
                 InstrumentAny::Betting(i) => account
@@ -300,7 +305,8 @@ impl AccountsManager {
             total_margin_maint = margin_maint.as_decimal();
 
             if let Some(base_currency) = account.base_currency {
-                if let Some(xrate) = self.calculate_xrate_to_base(account.base_currency, instrument)
+                if let Some(xrate) =
+                    self.calculate_xrate_to_base(account.base_currency, instrument, net_entry)
                 {
                     total_margin_maint *= xrate;
                 } else {
@@ -315,7 +321,11 @@ impl AccountsManager {
         }
 
         let margin_maint = Money::from_decimal(total_margin_maint, currency).ok()?;
-        account.update_maintenance_margin(instrument.id(), margin_maint);
+        if total_margin_maint.is_zero() {
+            account.clear_maintenance_margin(instrument.id());
+        } else {
+            account.update_maintenance_margin(instrument.id(), margin_maint);
+        }
 
         log::info!("{} margin_maint={margin_maint}", instrument.id());
 
@@ -375,7 +385,11 @@ impl AccountsManager {
             if let Some(base_curr) = account.base_currency() {
                 if base_xrate.is_none() {
                     currency = base_curr;
-                    base_xrate = self.calculate_xrate_to_base(account.base_currency(), instrument);
+                    base_xrate = self.calculate_xrate_to_base(
+                        account.base_currency(),
+                        instrument,
+                        order.order_side(),
+                    );
                 }
 
                 if let Some(xrate) = base_xrate {
@@ -513,7 +527,11 @@ impl AccountsManager {
             if let Some(base_currency) = account.base_currency {
                 if base_xrate.is_none() {
                     currency = base_currency;
-                    base_xrate = self.calculate_xrate_to_base(account.base_currency, instrument);
+                    base_xrate = self.calculate_xrate_to_base(
+                        account.base_currency,
+                        instrument,
+                        order.order_side(),
+                    );
                 }
 
                 if let Some(xrate) = base_xrate {
@@ -524,7 +542,7 @@ impl AccountsManager {
                         instrument.settlement_currency(),
                         base_currency
                     );
-                    continue;
+                    return None;
                 }
             }
 
@@ -538,7 +556,10 @@ impl AccountsManager {
                 return None;
             }
         };
-        let margin_init = {
+        let margin_init = if total_margin_init.is_zero() {
+            account.clear_initial_margin(instrument.id());
+            money
+        } else {
             account.update_initial_margin(instrument.id(), money);
             money
         };
@@ -600,7 +621,12 @@ impl AccountsManager {
             if let Some(base_curr) = account.base_currency() {
                 if base_xrate.is_none() {
                     currency = base_curr;
-                    base_xrate = self.calculate_xrate_to_base(account.base_currency(), instrument);
+                    base_xrate = self.cache.borrow().get_xrate(
+                        instrument.id().venue,
+                        instrument.settlement_currency(),
+                        base_curr,
+                        PriceType::Mid,
+                    );
                 }
 
                 if let Some(xrate) = base_xrate {
@@ -789,7 +815,7 @@ impl AccountsManager {
     fn update_balance_multi_currency(
         &self,
         account: &mut AccountAny,
-        fill: OrderFilled,
+        fill: &OrderFilled,
         pnls: &mut [Money],
     ) {
         let mut new_balances = Vec::new();
@@ -845,7 +871,7 @@ impl AccountsManager {
                     );
                     return;
                 }
-                AccountBalance::new(*pnl, Money::new(0.0, currency), *pnl)
+                AccountBalance::new(*pnl, Money::zero(currency), *pnl)
             };
 
             new_balances.push(new_balance);
@@ -877,11 +903,14 @@ impl AccountsManager {
                     );
                     return;
                 }
-                AccountBalance::new(
-                    Money::new(0.0, currency),
-                    Money::new(0.0, currency),
-                    Money::new(0.0, currency),
-                )
+                let rebate = -commission.as_decimal();
+                match AccountBalance::from_total_and_locked(rebate, Decimal::ZERO, currency) {
+                    Ok(commission_balance) => commission_balance,
+                    Err(e) => {
+                        log::error!("Cannot credit {currency} commission rebate: {e}");
+                        return;
+                    }
+                }
             };
             new_balances.push(commission_balance);
         }
@@ -1005,6 +1034,7 @@ impl AccountsManager {
         &self,
         base_currency: Option<Currency>,
         instrument: &InstrumentAny,
+        side: OrderSide,
     ) -> Option<Decimal> {
         match base_currency {
             None => Some(Decimal::ONE),
@@ -1012,7 +1042,11 @@ impl AccountsManager {
                 instrument.id().venue,
                 instrument.settlement_currency(),
                 base_curr,
-                PriceType::Mid,
+                if side == OrderSide::Buy {
+                    PriceType::Bid
+                } else {
+                    PriceType::Ask
+                },
             ),
         }
     }
@@ -1025,15 +1059,19 @@ mod tests {
     use nautilus_common::{cache::Cache, clock::TestClock};
     use nautilus_model::{
         accounts::{BettingAccount, CashAccount, MarginAccount},
+        data::QuoteTick,
         enums::{AccountType, OmsType, OrderSide, OrderType},
         events::{
             AccountState, OrderAccepted, OrderEventAny, OrderFilled, OrderSubmitted,
             order::spec::{OrderAcceptedSpec, OrderFilledSpec, OrderSubmittedSpec},
         },
-        identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, TradeId, VenueOrderId},
+        identifiers::{
+            AccountId, ClientOrderId, InstrumentId, PositionId, Symbol, TradeId, Venue,
+            VenueOrderId,
+        },
         instruments::{
             Instrument, InstrumentAny,
-            stubs::{audusd_sim, betting, currency_pair_btcusdt},
+            stubs::{audusd_sim, betting, currency_pair_btcusdt, default_fx_ccy},
         },
         orders::{OrderAny, OrderTestBuilder},
         position::Position,
@@ -1051,7 +1089,7 @@ mod tests {
             AccountType::Cash,
             vec![AccountBalance::new(
                 Money::new(1_000_000.0, usd),
-                Money::new(0.0, usd),
+                Money::zero(usd),
                 Money::new(1_000_000.0, usd),
             )],
             Vec::new(),
@@ -1152,7 +1190,7 @@ mod tests {
             AccountType::Betting,
             vec![AccountBalance::new(
                 Money::new(1_000.0, gbp),
-                Money::new(0.0, gbp),
+                Money::zero(gbp),
                 Money::new(1_000.0, gbp),
             )],
             Vec::new(),
@@ -1250,7 +1288,7 @@ mod tests {
             AccountType::Betting,
             vec![AccountBalance::new(
                 Money::new(1_000.0, gbp),
-                Money::new(0.0, gbp),
+                Money::zero(gbp),
                 Money::new(1_000.0, gbp),
             )],
             Vec::new(),
@@ -1326,7 +1364,7 @@ mod tests {
         if let AccountAny::Betting(betting_account) = final_account {
             assert_eq!(
                 betting_account.balance_locked(Some(gbp)),
-                Some(Money::new(0.0, gbp))
+                Some(Money::zero(gbp))
             );
             assert_eq!(
                 betting_account.balance_free(Some(gbp)),
@@ -1351,12 +1389,12 @@ mod tests {
             vec![
                 AccountBalance::new(
                     Money::new(1_000_000.0, usd),
-                    Money::new(0.0, usd),
+                    Money::zero(usd),
                     Money::new(1_000_000.0, usd),
                 ),
                 AccountBalance::new(
                     Money::new(1_000_000.0, aud),
-                    Money::new(0.0, aud),
+                    Money::zero(aud),
                     Money::new(1_000_000.0, aud),
                 ),
             ],
@@ -1452,7 +1490,7 @@ mod tests {
         if let AccountAny::Cash(cash_account) = final_account {
             assert_eq!(
                 cash_account.balance_locked(Some(usd)),
-                Some(Money::new(0.0, usd))
+                Some(Money::zero(usd))
             );
             assert_eq!(
                 cash_account.balance_locked(Some(aud)),
@@ -1464,6 +1502,232 @@ mod tests {
     }
 
     #[rstest]
+    fn test_update_orders_margin_init_xrate_unavailable_returns_none() {
+        let eur = Currency::EUR();
+        let account_state = AccountState::new(
+            AccountId::new("SIM-001"),
+            AccountType::Margin,
+            vec![AccountBalance::new(
+                Money::new(1_000_000.0, eur),
+                Money::zero(eur),
+                Money::new(1_000_000.0, eur),
+            )],
+            Vec::new(),
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            Some(eur),
+        );
+        let mut account = MarginAccount::new(account_state, true);
+        let instrument = audusd_sim();
+        let prior_margin = Money::new(10.0, eur);
+        account.update_initial_margin(instrument.id(), prior_margin);
+
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        let manager = AccountsManager::new(clock, cache);
+
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("100000"))
+            .price(Price::from("0.80000"))
+            .build();
+
+        let submitted = order_submitted_for(&order);
+        let accepted = order_accepted_for(&order, VenueOrderId::new("1"));
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+
+        let mut account = AccountAny::Margin(account);
+        let result = manager.update_orders_in_place(
+            &mut account,
+            &InstrumentAny::CurrencyPair(instrument.clone()),
+            &[&order],
+            UnixNanos::default(),
+        );
+
+        assert!(result.is_none(), "xrate-unavailable must return None");
+
+        match account {
+            AccountAny::Margin(margin_account) => {
+                assert_eq!(margin_account.initial_margin(instrument.id()), prior_margin);
+                assert_eq!(margin_account.balance_locked(Some(eur)), Some(prior_margin));
+            }
+            _ => panic!("Expected MarginAccount"),
+        }
+    }
+
+    #[rstest]
+    fn test_update_balance_locked_base_xrate_uses_bid_for_buy_order() {
+        let eur = Currency::EUR();
+        let account_state = AccountState::new(
+            AccountId::new("SIM-001"),
+            AccountType::Cash,
+            vec![AccountBalance::new(
+                Money::new(1_000.0, eur),
+                Money::zero(eur),
+                Money::new(1_000.0, eur),
+            )],
+            Vec::new(),
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            Some(eur),
+        );
+        let account = CashAccount::new(account_state, true, false);
+
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        add_usdeur_quote(&cache, "0.90000", "1.10000");
+        let manager = AccountsManager::new(clock, cache);
+
+        let instrument = audusd_sim();
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("100"))
+            .price(Price::from("2.00000"))
+            .build();
+
+        let submitted = order_submitted_for(&order);
+        let accepted = order_accepted_for(&order, VenueOrderId::new("1"));
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+
+        let result = manager.update_orders(
+            &AccountAny::Cash(account),
+            &InstrumentAny::CurrencyPair(instrument),
+            &[&order],
+            UnixNanos::default(),
+        );
+
+        assert!(result.is_some());
+        let (updated_account, _) = result.unwrap();
+
+        match updated_account {
+            AccountAny::Cash(cash) => {
+                assert_eq!(cash.balance_locked(Some(eur)), Some(Money::new(180.0, eur)));
+            }
+            _ => panic!("Expected CashAccount"),
+        }
+    }
+
+    #[rstest]
+    fn test_update_margin_init_base_xrate_uses_ask_for_sell_order() {
+        let eur = Currency::EUR();
+        let account_state = AccountState::new(
+            AccountId::new("SIM-001"),
+            AccountType::Margin,
+            vec![AccountBalance::new(
+                Money::new(1_000.0, eur),
+                Money::zero(eur),
+                Money::new(1_000.0, eur),
+            )],
+            Vec::new(),
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            Some(eur),
+        );
+        let account = MarginAccount::new(account_state, true);
+
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        add_usdeur_quote(&cache, "0.90000", "1.10000");
+        let manager = AccountsManager::new(clock, cache);
+
+        let instrument = audusd_sim();
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("100"))
+            .price(Price::from("2.00000"))
+            .build();
+
+        let submitted = order_submitted_for(&order);
+        let accepted = order_accepted_for(&order, VenueOrderId::new("1"));
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+
+        let result = manager.update_orders(
+            &AccountAny::Margin(account),
+            &InstrumentAny::CurrencyPair(instrument.clone()),
+            &[&order],
+            UnixNanos::default(),
+        );
+
+        assert!(result.is_some());
+        let (updated_account, _) = result.unwrap();
+
+        match updated_account {
+            AccountAny::Margin(margin) => {
+                assert_eq!(
+                    margin.initial_margin(instrument.id()),
+                    Money::new(6.60, eur)
+                );
+            }
+            _ => panic!("Expected MarginAccount"),
+        }
+    }
+
+    #[rstest]
+    fn test_update_margin_init_empty_orders_clears_prior_initial_margin() {
+        let usd = Currency::USD();
+        let mut account = build_margin_account_usd(1_000_000.0);
+        let instrument = audusd_sim();
+        let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
+        account.update_margin(MarginBalance::new(
+            Money::new(25.0, usd),
+            Money::zero(usd),
+            Some(instrument.id()),
+        ));
+
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        let manager = AccountsManager::new(clock, cache);
+
+        let state = manager
+            .update_margin_init(&mut account, &instrument_any, &[], UnixNanos::default())
+            .expect("initial margin clear should generate account state");
+
+        assert!(account.margin(&instrument.id()).is_none());
+        assert!(state.margins.is_empty());
+    }
+
+    #[rstest]
+    fn test_update_margin_init_empty_orders_preserves_prior_maintenance_margin() {
+        let usd = Currency::USD();
+        let mut account = build_margin_account_usd(1_000_000.0);
+        let instrument = audusd_sim();
+        let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
+        let maintenance = Money::new(12.0, usd);
+        account.update_margin(MarginBalance::new(
+            Money::new(25.0, usd),
+            maintenance,
+            Some(instrument.id()),
+        ));
+
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        let manager = AccountsManager::new(clock, cache);
+
+        let state = manager
+            .update_margin_init(&mut account, &instrument_any, &[], UnixNanos::default())
+            .expect("initial margin clear should generate account state");
+
+        let margin = account
+            .margin(&instrument.id())
+            .expect("maintenance margin should remain");
+        assert_eq!(margin.initial, Money::zero(usd));
+        assert_eq!(margin.maintenance, maintenance);
+        assert_eq!(state.margins, vec![margin]);
+    }
+
+    #[rstest]
     fn test_cash_account_rejects_negative_balance_when_borrowing_disabled() {
         let usd = Currency::USD();
         let account_state = AccountState::new(
@@ -1471,7 +1735,7 @@ mod tests {
             AccountType::Cash,
             vec![AccountBalance::new(
                 Money::new(1_000.0, usd),
-                Money::new(0.0, usd),
+                Money::zero(usd),
                 Money::new(1_000.0, usd),
             )],
             Vec::new(),
@@ -1486,7 +1750,7 @@ mod tests {
 
         let negative_balances = vec![AccountBalance::new(
             Money::new(-500.0, usd),
-            Money::new(0.0, usd),
+            Money::zero(usd),
             Money::new(-500.0, usd),
         )];
 
@@ -1506,7 +1770,7 @@ mod tests {
             AccountType::Cash,
             vec![AccountBalance::new(
                 Money::new(100.0, usd),
-                Money::new(0.0, usd),
+                Money::zero(usd),
                 Money::new(100.0, usd),
             )],
             Vec::new(),
@@ -1605,7 +1869,7 @@ mod tests {
             AccountType::Cash,
             vec![AccountBalance::new(
                 Money::new(100_000.0, usd),
-                Money::new(0.0, usd),
+                Money::zero(usd),
                 Money::new(100_000.0, usd),
             )],
             Vec::new(),
@@ -1676,7 +1940,7 @@ mod tests {
         let (final_account, _) = result.unwrap();
 
         if let AccountAny::Cash(cash) = final_account {
-            assert_eq!(cash.balance_locked(Some(usd)), Some(Money::new(0.0, usd)));
+            assert_eq!(cash.balance_locked(Some(usd)), Some(Money::zero(usd)));
             assert_eq!(
                 cash.balance_free(Some(usd)),
                 Some(Money::new(100_000.0, usd))
@@ -1699,7 +1963,7 @@ mod tests {
             AccountType::Margin,
             vec![AccountBalance::new(
                 Money::new(1_000_000.0, usd),
-                Money::new(0.0, usd),
+                Money::zero(usd),
                 Money::new(1_000_000.0, usd),
             )],
             Vec::new(),
@@ -1763,7 +2027,7 @@ mod tests {
             AccountType::Cash,
             vec![AccountBalance::new(
                 Money::new(1_000_000.0, usd),
-                Money::new(0.0, usd),
+                Money::zero(usd),
                 Money::new(1_000_000.0, usd),
             )],
             Vec::new(),
@@ -1848,12 +2112,12 @@ mod tests {
             vec![
                 AccountBalance::new(
                     Money::new(10_000.0, aud),
-                    Money::new(0.0, aud),
+                    Money::zero(aud),
                     Money::new(10_000.0, aud),
                 ),
                 AccountBalance::new(
                     Money::new(100.0, usd),
-                    Money::new(0.0, usd),
+                    Money::zero(usd),
                     Money::new(100.0, usd),
                 ),
             ],
@@ -1994,7 +2258,7 @@ mod tests {
         let mut account = AccountAny::Cash(account);
         let mut pnls = vec![Money::new(-100.0, usd)];
 
-        manager.update_balance_multi_currency(&mut account, fill, &mut pnls);
+        manager.update_balance_multi_currency(&mut account, &fill, &mut pnls);
 
         match account {
             AccountAny::Cash(cash) => {
@@ -2028,7 +2292,7 @@ mod tests {
         let mut account = AccountAny::Cash(account);
         let mut pnls = vec![Money::new(-100.0, usd)];
 
-        manager.update_balance_multi_currency(&mut account, fill, &mut pnls);
+        manager.update_balance_multi_currency(&mut account, &fill, &mut pnls);
 
         match account {
             AccountAny::Cash(cash) => {
@@ -2062,12 +2326,12 @@ mod tests {
         let mut account = AccountAny::Cash(account);
         let mut pnls = vec![Money::new(-100.0, usd)];
 
-        manager.update_balance_multi_currency(&mut account, fill, &mut pnls);
+        manager.update_balance_multi_currency(&mut account, &fill, &mut pnls);
 
         match account {
             AccountAny::Cash(cash) => {
                 assert_eq!(cash.balance_total(Some(usd)), Some(Money::new(880.0, usd)));
-                assert_eq!(cash.balance_locked(Some(usd)), Some(Money::new(0.0, usd)));
+                assert_eq!(cash.balance_locked(Some(usd)), Some(Money::zero(usd)));
                 assert_eq!(cash.balance_free(Some(usd)), Some(Money::new(880.0, usd)));
                 assert_eq!(cash.commission(&usd), Some(Money::new(20.0, usd)));
             }
@@ -2096,12 +2360,12 @@ mod tests {
         let mut account = AccountAny::Cash(account);
         let mut pnls = vec![Money::new(-200.0, usd)];
 
-        manager.update_balance_multi_currency(&mut account, fill, &mut pnls);
+        manager.update_balance_multi_currency(&mut account, &fill, &mut pnls);
 
         match account {
             AccountAny::Cash(cash) => {
                 assert_eq!(cash.balance_total(Some(usd)), Some(Money::new(-120.0, usd)));
-                assert_eq!(cash.balance_locked(Some(usd)), Some(Money::new(0.0, usd)));
+                assert_eq!(cash.balance_locked(Some(usd)), Some(Money::zero(usd)));
                 assert_eq!(cash.balance_free(Some(usd)), Some(Money::new(-120.0, usd)));
                 assert_eq!(cash.commission(&usd), Some(Money::new(20.0, usd)));
             }
@@ -2130,7 +2394,7 @@ mod tests {
         let mut account = AccountAny::Betting(account);
         let mut pnls = vec![Money::new(-100.0, gbp)];
 
-        manager.update_balance_multi_currency(&mut account, fill, &mut pnls);
+        manager.update_balance_multi_currency(&mut account, &fill, &mut pnls);
 
         match account {
             AccountAny::Betting(betting_account) => {
@@ -2243,7 +2507,7 @@ mod tests {
             AccountType::Cash,
             vec![AccountBalance::new(
                 Money::new(10_000.0, aud),
-                Money::new(0.0, aud),
+                Money::zero(aud),
                 Money::new(10_000.0, aud),
             )],
             Vec::new(),
@@ -2335,7 +2599,7 @@ mod tests {
         let pnl =
             Money::from_decimal(Decimal::from_str_exact("0.00000064").unwrap(), usdt).unwrap();
         let mut pnls = [pnl];
-        manager.update_balance_multi_currency(&mut account, fill, &mut pnls);
+        manager.update_balance_multi_currency(&mut account, &fill, &mut pnls);
 
         let balances = account.balances();
         let balance = balances.get(&usdt).expect("USDT balance");
@@ -2365,7 +2629,7 @@ mod tests {
 
         // No PnL entries: only the commission branch runs.
         let mut pnls: [Money; 0] = [];
-        manager.update_balance_multi_currency(&mut account, fill, &mut pnls);
+        manager.update_balance_multi_currency(&mut account, &fill, &mut pnls);
 
         let balances = account.balances();
         let balance = balances.get(&usdt).expect("USDT balance");
@@ -2382,6 +2646,41 @@ mod tests {
         );
     }
 
+    #[rstest]
+    fn test_update_balance_multi_currency_negative_commission_creates_rebate_balance() {
+        let usd = Currency::USD();
+        let account_state = AccountState::new(
+            AccountId::new("SIM-001"),
+            AccountType::Cash,
+            Vec::new(),
+            Vec::new(),
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            None,
+        );
+        let mut account = AccountAny::Cash(CashAccount::new(account_state, true, false));
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        let manager = AccountsManager::new(clock, cache);
+
+        let fill = OrderFilledSpec::builder()
+            .commission(Money::new(-1.0, usd))
+            .build();
+        let mut pnls: [Money; 0] = [];
+        manager.update_balance_multi_currency(&mut account, &fill, &mut pnls);
+
+        let AccountAny::Cash(cash) = account else {
+            panic!("Expected CashAccount");
+        };
+        let balance = cash.balance(Some(usd)).expect("USD rebate balance");
+        assert_eq!(balance.total, Money::new(1.0, usd));
+        assert_eq!(balance.locked, Money::zero(usd));
+        assert_eq!(balance.free, Money::new(1.0, usd));
+        assert_eq!(cash.commission(&usd), Some(Money::new(-1.0, usd)));
+    }
+
     fn build_margin_account_usd(balance: f64) -> MarginAccount {
         let usd = Currency::USD();
         let account_state = AccountState::new(
@@ -2389,7 +2688,7 @@ mod tests {
             AccountType::Margin,
             vec![AccountBalance::new(
                 Money::new(balance, usd),
-                Money::new(0.0, usd),
+                Money::zero(usd),
                 Money::new(balance, usd),
             )],
             Vec::new(),
@@ -2409,7 +2708,7 @@ mod tests {
             AccountType::Margin,
             vec![AccountBalance::new(
                 Money::new(balance, usdt),
-                Money::new(0.0, usdt),
+                Money::zero(usdt),
                 Money::new(balance, usdt),
             )],
             Vec::new(),
@@ -2523,16 +2822,18 @@ mod tests {
         let long = build_hedging_position(&instrument_any, OrderSide::Buy, "100", "1.00000", "L");
         let short = build_hedging_position(&instrument_any, OrderSide::Sell, "100", "1.00000", "S");
 
-        let result = manager.update_positions_in_place(
-            &mut account,
-            &instrument_any,
-            vec![&long, &short],
-            UnixNanos::default(),
-        );
-        assert!(result.is_some(), "update_positions_in_place returned None");
+        let state = manager
+            .update_positions_in_place(
+                &mut account,
+                &instrument_any,
+                vec![&long, &short],
+                UnixNanos::default(),
+            )
+            .expect("update_positions_in_place returned None");
 
-        let margin_maint = account.maintenance_margin(instrument.id());
-        assert_eq!(margin_maint, Money::new(0.0, usd));
+        assert!(account.margin(&instrument.id()).is_none());
+        assert!(state.margins.is_empty());
+        assert_eq!(account.balance_locked(Some(usd)), Some(Money::zero(usd)));
     }
 
     #[rstest]
@@ -2597,16 +2898,18 @@ mod tests {
             "S2",
         );
 
-        let result = manager.update_positions_in_place(
-            &mut account,
-            &instrument_any,
-            vec![&long, &short_a, &short_b],
-            UnixNanos::default(),
-        );
-        assert!(result.is_some(), "update_positions_in_place returned None");
+        let state = manager
+            .update_positions_in_place(
+                &mut account,
+                &instrument_any,
+                vec![&long, &short_a, &short_b],
+                UnixNanos::default(),
+            )
+            .expect("update_positions_in_place returned None");
 
-        let margin_maint = account.maintenance_margin(instrument.id());
-        assert_eq!(margin_maint, Money::new(0.0, usdt));
+        assert!(account.margin(&instrument.id()).is_none());
+        assert!(state.margins.is_empty());
+        assert_eq!(account.balance_locked(Some(usdt)), Some(Money::zero(usdt)));
     }
 
     #[rstest]
@@ -2619,7 +2922,7 @@ mod tests {
             AccountType::Margin,
             vec![AccountBalance::new(
                 Money::new(1_000_000.0, usdt),
-                Money::new(0.0, usdt),
+                Money::zero(usdt),
                 Money::new(1_000_000.0, usdt),
             )],
             Vec::new(),
@@ -2649,10 +2952,10 @@ mod tests {
         );
         assert!(first.is_some());
         let prior_margin = account.maintenance_margin(instrument.id());
-        assert!(prior_margin.as_f64() > 0.0);
+        assert!(prior_margin.as_decimal() > Decimal::ZERO);
         assert_eq!(prior_margin.currency, usdt);
         let prior_locked = account.balance_locked(Some(usdt)).unwrap();
-        assert!(prior_locked.as_f64() > 0.0);
+        assert!(prior_locked.as_decimal() > Decimal::ZERO);
 
         // Second snapshot: offsetting short closes the net exposure.
         let short = build_hedging_position(
@@ -2668,17 +2971,52 @@ mod tests {
             vec![&long, &short],
             UnixNanos::default(),
         );
-        assert!(second.is_some());
+        let second_state = second.expect("net-flat maintenance update should generate state");
 
-        // Net-flat: maintenance margin and the resulting base-currency locked balance must clear.
-        assert_eq!(
-            account.maintenance_margin(instrument.id()),
-            Money::new(0.0, usdt)
-        );
+        // Net-flat: the per-instrument margin entry and resulting base-currency lock must clear.
+        assert!(account.margin(&instrument.id()).is_none());
+        assert!(second_state.margins.is_empty());
         assert_eq!(
             account.balance_locked(Some(usdt)).unwrap(),
-            Money::new(0.0, usdt)
+            Money::zero(usdt)
         );
+    }
+
+    #[rstest]
+    fn test_update_positions_in_place_net_flat_preserves_prior_initial_margin() {
+        let usd = Currency::USD();
+        let mut account = build_margin_account_usd(1_000_000.0);
+        let instrument = audusd_sim();
+        account.set_leverage(instrument.id(), Decimal::ONE);
+        let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
+        let initial = Money::new(25.0, usd);
+        account.update_margin(MarginBalance::new(
+            initial,
+            Money::new(5.0, usd),
+            Some(instrument.id()),
+        ));
+
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        let manager = AccountsManager::new(clock, cache);
+
+        let long = build_hedging_position(&instrument_any, OrderSide::Buy, "100", "1.00000", "L");
+        let short = build_hedging_position(&instrument_any, OrderSide::Sell, "100", "1.00000", "S");
+        let state = manager
+            .update_positions_in_place(
+                &mut account,
+                &instrument_any,
+                vec![&long, &short],
+                UnixNanos::default(),
+            )
+            .expect("net-flat maintenance update should generate state");
+
+        let margin = account
+            .margin(&instrument.id())
+            .expect("initial margin should remain");
+        assert_eq!(margin.initial, initial);
+        assert_eq!(margin.maintenance, Money::zero(usd));
+        assert_eq!(state.margins, vec![margin]);
     }
 
     #[rstest]
@@ -2818,7 +3156,7 @@ mod tests {
             AccountType::Margin,
             vec![AccountBalance::new(
                 Money::new(1_000_000.0, eur),
-                Money::new(0.0, eur),
+                Money::zero(eur),
                 Money::new(1_000_000.0, eur),
             )],
             Vec::new(),
@@ -2845,6 +3183,49 @@ mod tests {
             UnixNanos::default(),
         );
         assert!(result.is_none(), "xrate-unavailable must return None");
+    }
+
+    #[rstest]
+    fn test_update_positions_in_place_base_xrate_uses_ask_for_short_net_position() {
+        let eur = Currency::EUR();
+        let account_state = AccountState::new(
+            AccountId::new("SIM-001"),
+            AccountType::Margin,
+            vec![AccountBalance::new(
+                Money::new(1_000.0, eur),
+                Money::zero(eur),
+                Money::new(1_000.0, eur),
+            )],
+            Vec::new(),
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            Some(eur),
+        );
+        let mut account = MarginAccount::new(account_state, false);
+        let instrument = audusd_sim();
+        let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
+
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        add_usdeur_quote(&cache, "0.90000", "1.10000");
+        let manager = AccountsManager::new(clock, cache);
+
+        let position =
+            build_hedging_position(&instrument_any, OrderSide::Sell, "100", "2.00000", "S");
+        let result = manager.update_positions_in_place(
+            &mut account,
+            &instrument_any,
+            vec![&position],
+            UnixNanos::default(),
+        );
+
+        assert!(result.is_some());
+        assert_eq!(
+            account.maintenance_margin(instrument.id()),
+            Money::new(6.60, eur)
+        );
     }
 
     #[rstest]
@@ -2909,5 +3290,23 @@ mod tests {
             account.maintenance_margin(instrument.id()),
             Money::new(1.50, usd)
         );
+    }
+
+    fn add_usdeur_quote(cache: &Rc<RefCell<Cache>>, bid: &str, ask: &str) {
+        let instrument = default_fx_ccy(Symbol::from("USD/EUR"), Some(Venue::from("SIM")));
+        let quote = QuoteTick::new(
+            instrument.id(),
+            Price::from(bid),
+            Price::from(ask),
+            Quantity::from("1"),
+            Quantity::from("1"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+        let mut cache = cache.borrow_mut();
+        cache
+            .add_instrument(InstrumentAny::CurrencyPair(instrument))
+            .unwrap();
+        cache.add_quote(quote).unwrap();
     }
 }

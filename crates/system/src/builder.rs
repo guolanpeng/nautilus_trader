@@ -45,6 +45,7 @@ pub struct NautilusKernelBuilder {
     instance_id: Option<UUID4>,
     load_state: bool,
     save_state: bool,
+    shutdown_on_error: bool,
     logging: Option<LoggerConfig>,
     timeout_connection: Duration,
     timeout_reconciliation: Duration,
@@ -70,6 +71,7 @@ impl Debug for NautilusKernelBuilder {
             .field("instance_id", &self.instance_id)
             .field("load_state", &self.load_state)
             .field("save_state", &self.save_state)
+            .field("shutdown_on_error", &self.shutdown_on_error)
             .field("logging", &self.logging)
             .field("timeout_connection", &self.timeout_connection)
             .field("timeout_reconciliation", &self.timeout_reconciliation)
@@ -99,8 +101,9 @@ impl NautilusKernelBuilder {
             instance_id: None,
             load_state: true,
             save_state: true,
+            shutdown_on_error: false,
             logging: None,
-            timeout_connection: Duration::from_secs(60),
+            timeout_connection: Duration::from_mins(1),
             timeout_reconciliation: Duration::from_secs(30),
             timeout_portfolio: Duration::from_secs(10),
             timeout_disconnection: Duration::from_secs(10),
@@ -134,6 +137,15 @@ impl NautilusKernelBuilder {
     #[must_use]
     pub const fn with_save_state(mut self, save_state: bool) -> Self {
         self.save_state = save_state;
+        self
+    }
+
+    /// Configure whether an error log shuts down the system.
+    ///
+    /// Filtered or bypassed error logs still request shutdown.
+    #[must_use]
+    pub const fn with_shutdown_on_error(mut self, shutdown_on_error: bool) -> Self {
+        self.shutdown_on_error = shutdown_on_error;
         self
     }
 
@@ -262,6 +274,7 @@ impl NautilusKernelBuilder {
             trader_id: self.trader_id,
             load_state: self.load_state,
             save_state: self.save_state,
+            shutdown_on_error: self.shutdown_on_error,
             logging: self.logging.unwrap_or_default(),
             instance_id: self.instance_id,
             timeout_connection: self.timeout_connection,
@@ -328,7 +341,7 @@ mod tests {
         orderbook::OrderBook,
         orders::OrderAny,
         position::Position,
-        types::Currency,
+        types::{Currency, Money},
     };
     use rstest::*;
     use ustr::Ustr;
@@ -479,14 +492,14 @@ mod tests {
         assert_eq!(builder.timeout_portfolio, Duration::from_secs(30));
         assert_eq!(builder.timeout_disconnection, Duration::from_secs(40));
         assert_eq!(builder.delay_post_stop, Duration::from_secs(50));
-        assert_eq!(builder.timeout_shutdown, Duration::from_secs(60));
+        assert_eq!(builder.timeout_shutdown, Duration::from_mins(1));
     }
 
     #[rstest]
     fn test_builder_default_timeouts() {
         let builder = NautilusKernelBuilder::default();
 
-        assert_eq!(builder.timeout_connection, Duration::from_secs(60));
+        assert_eq!(builder.timeout_connection, Duration::from_mins(1));
         assert_eq!(builder.timeout_reconciliation, Duration::from_secs(30));
         assert_eq!(builder.timeout_portfolio, Duration::from_secs(10));
         assert_eq!(builder.timeout_disconnection, Duration::from_secs(10));
@@ -540,7 +553,7 @@ mod tests {
             Ok(AHashMap::new())
         }
 
-        fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, Position>> {
+        fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, PositionId>> {
             Ok(AHashMap::new())
         }
 
@@ -778,7 +791,12 @@ mod tests {
             Ok(())
         }
 
-        fn snapshot_position_state(&self, _position: &Position) -> anyhow::Result<()> {
+        fn snapshot_position_state(
+            &self,
+            _position: &Position,
+            _ts_snapshot: UnixNanos,
+            _unrealized_pnl: Option<Money>,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 

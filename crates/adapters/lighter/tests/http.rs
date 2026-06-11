@@ -15,9 +15,12 @@
 
 //! Integration tests for the Lighter HTTP client using a mock Axum server.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use axum::{
@@ -45,7 +48,8 @@ use nautilus_lighter::{
         query::{
             LighterAccountActiveOrdersQuery, LighterAccountActiveOrdersQueryBuilder,
             LighterAccountInactiveOrdersQuery, LighterAccountInactiveOrdersQueryBuilder,
-            LighterCandlesQuery, LighterCandlesQueryBuilder, LighterFundingsQuery,
+            LighterAccountLookup, LighterAccountQuery, LighterCandlesQuery,
+            LighterCandlesQueryBuilder, LighterFundingsQuery, LighterMakerOnlyApiKeysQueryBuilder,
             LighterNextNonceQuery, LighterOrderBookDetailsQuery,
             LighterOrderBookDetailsQueryBuilder, LighterOrderBookOrdersQuery,
             LighterOrderBooksQuery, LighterOrderBooksQueryBuilder, LighterRecentTradesQuery,
@@ -75,6 +79,7 @@ const HTTP_ORDERS: &str = include_str!("../test_data/http_orders.json");
 const HTTP_RECENT_TRADES: &str = include_str!("../test_data/http_recent_trades.json");
 const HTTP_CANDLES: &str = include_str!("../test_data/http_candles.json");
 const HTTP_FUNDINGS: &str = include_str!("../test_data/http_fundings.json");
+const HTTP_ACCOUNT: &str = include_str!("../test_data/http_account.json");
 const MINUTE_MS: i64 = 60_000;
 
 #[derive(Clone)]
@@ -304,6 +309,45 @@ async fn raw_client_get_next_nonce_sends_query_and_parses_response() {
 
     assert_eq!(response.code, 200);
     assert_eq!(response.nonce, 1_234_567_890);
+}
+
+#[tokio::test]
+async fn domain_client_get_maker_only_api_keys_sends_authorization_header() {
+    let base_url = spawn_server(Router::new().route(
+        "/api/v1/getMakerOnlyApiKeys",
+        get(handle_maker_only_api_keys),
+    ))
+    .await;
+    let client =
+        LighterHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+
+    let response = client
+        .get_maker_only_api_keys(712_440, "auth-token")
+        .await
+        .unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(response.api_key_indexes, vec![5]);
+}
+
+#[tokio::test]
+async fn raw_client_get_maker_only_api_keys_maps_auth_query_field_to_authorization_header() {
+    let base_url = spawn_server(Router::new().route(
+        "/api/v1/getMakerOnlyApiKeys",
+        get(handle_maker_only_api_keys),
+    ))
+    .await;
+    let client = raw_client(base_url);
+    let query = LighterMakerOnlyApiKeysQueryBuilder::default()
+        .auth("auth-token")
+        .account_index(712_440)
+        .build()
+        .unwrap();
+
+    let response = client.get_maker_only_api_keys(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(response.api_key_indexes, vec![5]);
 }
 
 #[tokio::test]
@@ -1038,10 +1082,62 @@ async fn domain_client_request_instrument_errors_when_not_found() {
     ));
 }
 
+#[tokio::test]
+async fn domain_client_get_account_detail_queries_by_index_and_parses_first_account() {
+    let base_url = spawn_server(Router::new().route("/api/v1/account", get(handle_account))).await;
+    let client =
+        LighterHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+
+    let detail = client.get_account_detail(123_456).await.unwrap();
+
+    assert_eq!(detail.account_index, 123_456);
+    assert_eq!(detail.account_type, 0);
+    assert_eq!(detail.status, 1);
+}
+
+#[tokio::test]
+async fn domain_client_get_account_detail_errors_on_empty_accounts() {
+    let base_url =
+        spawn_server(Router::new().route("/api/v1/account", get(handle_account_empty))).await;
+    let client =
+        LighterHttpClient::new(LighterEnvironment::Mainnet, Some(base_url), 10, None).unwrap();
+
+    let error = client.get_account_detail(123_456).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        LighterHttpError::Parse(message)
+            if message == "no account returned for index 123456"
+    ));
+}
+
 async fn handle_next_nonce(Query(query): Query<LighterNextNonceQuery>) -> Response {
     assert_eq!(query.account_index, 12_345);
     assert_eq!(query.api_key_index, 5);
     (StatusCode::OK, HTTP_NEXT_NONCE).into_response()
+}
+
+async fn handle_maker_only_api_keys(
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+
+    if authorization != Some("auth-token")
+        || query.get("account_index").map(String::as_str) != Some("712440")
+        || query.contains_key("auth")
+        || query.contains_key("authorization")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            r#"{"code":400,"message":"unexpected maker-only request"}"#,
+        )
+            .into_response();
+    }
+
+    (StatusCode::OK, r#"{"code":200,"api_key_indexes":[5]}"#).into_response()
 }
 
 async fn handle_send_tx(headers: HeaderMap, body: Bytes) -> Response {
@@ -1295,6 +1391,16 @@ async fn handle_account_inactive_orders(
     assert_eq!(query.cursor.as_deref(), Some("cursor-1"));
     assert_eq!(query.limit, 50);
     (StatusCode::OK, HTTP_ORDERS).into_response()
+}
+
+async fn handle_account(Query(query): Query<LighterAccountQuery>) -> Response {
+    assert_eq!(query.by, LighterAccountLookup::Index);
+    assert_eq!(query.value, "123456");
+    (StatusCode::OK, HTTP_ACCOUNT).into_response()
+}
+
+async fn handle_account_empty() -> Response {
+    (StatusCode::OK, r#"{"code":200,"total":0,"accounts":[]}"#).into_response()
 }
 
 async fn handle_rate_limit() -> Response {

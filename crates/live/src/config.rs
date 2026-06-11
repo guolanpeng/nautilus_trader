@@ -84,6 +84,10 @@ impl Default for PluginConfig {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "config fields mirror the existing Python live data engine surface"
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 pub struct LiveDataEngineConfig {
@@ -127,9 +131,6 @@ pub struct LiveDataEngineConfig {
     /// If debug mode is active (will provide extra debug logging).
     #[builder(default)]
     pub debug: bool,
-    /// If the engine should gracefully shut down when queue processing encounters unexpected errors.
-    #[builder(default)]
-    pub graceful_shutdown_on_error: bool,
     /// The queue size for the engine's internal queue buffers.
     ///
     /// Not implemented on the current live runtime; `validate_runtime_support` rejects
@@ -203,9 +204,6 @@ pub struct LiveRiskEngineConfig {
     /// If debug mode is active (will provide extra debug logging).
     #[builder(default)]
     pub debug: bool,
-    /// If the engine should gracefully shut down when queue processing encounters unexpected errors.
-    #[builder(default)]
-    pub graceful_shutdown_on_error: bool,
     /// The queue size for the engine's internal queue buffers.
     ///
     /// Not implemented on the current live runtime; `validate_runtime_support` rejects
@@ -299,6 +297,10 @@ fn parse_rate_limit(input: &str) -> anyhow::Result<RateLimit> {
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "config fields mirror the existing Python live execution engine surface"
 )]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
@@ -409,9 +411,6 @@ pub struct LiveExecEngineConfig {
     pub purge_from_database: bool,
     /// The interval (seconds) between auditing own books against public order books.
     pub own_books_audit_interval_secs: Option<f64>,
-    /// If the engine should gracefully shutdown when queue processing encounters unexpected errors.
-    #[builder(default)]
-    pub graceful_shutdown_on_error: bool,
     /// The queue size for the engine's internal queue buffers.
     #[builder(default = 100_000)]
     pub qsize: u32,
@@ -442,6 +441,7 @@ impl From<LiveExecEngineConfig> for ExecutionEngineConfig {
             snapshot_positions: config.snapshot_positions,
             snapshot_positions_interval_secs: config.snapshot_positions_interval_secs,
             allow_overfills: config.allow_overfills,
+            filter_unclaimed_external_orders: config.filter_unclaimed_external_orders,
             external_clients: config.external_clients,
             purge_closed_orders_interval_mins: config.purge_closed_orders_interval_mins,
             purge_closed_orders_buffer_mins: config.purge_closed_orders_buffer_mins,
@@ -559,6 +559,10 @@ pub struct LiveExecClientConfig {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "config fields mirror the existing Python live node surface"
+)]
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 pub struct LiveNodeConfig {
@@ -574,13 +578,18 @@ pub struct LiveNodeConfig {
     /// If trading strategy state should be saved to the database on stop.
     #[builder(default)]
     pub save_state: bool,
+    /// If the system should request shutdown when an error log is emitted.
+    ///
+    /// Filtered or bypassed error logs still request shutdown.
+    #[builder(default)]
+    pub shutdown_on_error: bool,
     /// The logging configuration for the kernel.
     #[builder(default)]
     pub logging: LoggerConfig,
     /// The unique instance identifier for the kernel
     pub instance_id: Option<UUID4>,
     /// The timeout for all clients to connect and initialize.
-    #[builder(default = Duration::from_secs(60))]
+    #[builder(default = Duration::from_mins(1))]
     pub timeout_connection: Duration,
     /// The timeout for execution state to reconcile.
     #[builder(default = Duration::from_secs(30))]
@@ -686,7 +695,7 @@ impl LiveNodeConfig {
 }
 
 impl PluginConfig {
-    fn validate_runtime_support(&self, index: usize) -> anyhow::Result<()> {
+    pub(crate) fn validate_runtime_support(&self, index: usize) -> anyhow::Result<()> {
         if self.path.trim().is_empty() {
             anyhow::bail!("LiveNodeConfig.plugins[{index}].path must not be empty");
         }
@@ -719,12 +728,6 @@ impl LiveDataEngineConfig {
         }
 
         let default = Self::default();
-
-        if self.graceful_shutdown_on_error != default.graceful_shutdown_on_error {
-            anyhow::bail!(
-                "LiveDataEngineConfig.graceful_shutdown_on_error is not supported by the Rust live runtime yet"
-            );
-        }
 
         if self.qsize != default.qsize {
             anyhow::bail!(
@@ -759,12 +762,6 @@ impl LiveRiskEngineConfig {
         }
 
         let default = Self::default();
-
-        if self.graceful_shutdown_on_error != default.graceful_shutdown_on_error {
-            anyhow::bail!(
-                "LiveRiskEngineConfig.graceful_shutdown_on_error is not supported by the Rust live runtime yet"
-            );
-        }
 
         if self.qsize != default.qsize {
             anyhow::bail!(
@@ -830,12 +827,6 @@ impl LiveExecEngineConfig {
             );
         }
 
-        if self.graceful_shutdown_on_error != default.graceful_shutdown_on_error {
-            anyhow::bail!(
-                "LiveExecEngineConfig.graceful_shutdown_on_error is not supported by the Rust live runtime yet"
-            );
-        }
-
         if self.qsize != default.qsize {
             anyhow::bail!(
                 "LiveExecEngineConfig.qsize is not supported by the Rust live runtime yet"
@@ -861,6 +852,10 @@ impl NautilusKernelConfig for LiveNodeConfig {
 
     fn save_state(&self) -> bool {
         self.save_state
+    }
+
+    fn shutdown_on_error(&self) -> bool {
+        self.shutdown_on_error
     }
 
     fn logging(&self) -> LoggerConfig {
@@ -940,7 +935,7 @@ mod tests {
         assert_eq!(config.data_engine.qsize, 100_000);
         assert_eq!(config.risk_engine.qsize, 100_000);
         assert_eq!(config.exec_engine.qsize, 100_000);
-        assert_eq!(config.timeout_connection, Duration::from_secs(60));
+        assert_eq!(config.timeout_connection, Duration::from_mins(1));
         assert!(config.exec_engine.reconciliation);
         assert!(!config.exec_engine.filter_unclaimed_external_orders);
         assert!(config.data_clients.is_empty());
@@ -1087,7 +1082,7 @@ mod tests {
         assert_eq!(converted.time_bars_origin_offset.len(), 1);
         assert_eq!(
             converted.time_bars_origin_offset[&BarAggregation::Minute],
-            Duration::from_nanos(5_000_000_000),
+            Duration::from_secs(5),
         );
         assert!(converted.emit_quotes_from_book);
         assert!(converted.emit_quotes_from_book_depths);
@@ -1098,6 +1093,7 @@ mod tests {
         let config = LiveExecEngineConfig {
             load_cache: false,
             snapshot_positions_interval_secs: Some(30.0),
+            filter_unclaimed_external_orders: true,
             ..Default::default()
         };
 
@@ -1105,6 +1101,7 @@ mod tests {
 
         assert!(!converted.load_cache);
         assert_eq!(converted.snapshot_positions_interval_secs, Some(30.0));
+        assert!(converted.filter_unclaimed_external_orders);
     }
 
     #[rstest]
@@ -1241,34 +1238,6 @@ mod tests {
     }
 
     #[rstest]
-    fn test_validate_runtime_support_rejects_data_engine_graceful_shutdown() {
-        let config = LiveNodeConfig {
-            data_engine: LiveDataEngineConfig {
-                graceful_shutdown_on_error: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let error = config.validate_runtime_support().unwrap_err().to_string();
-        assert!(error.contains("graceful_shutdown_on_error"));
-    }
-
-    #[rstest]
-    fn test_validate_runtime_support_rejects_risk_engine_graceful_shutdown() {
-        let config = LiveNodeConfig {
-            risk_engine: LiveRiskEngineConfig {
-                graceful_shutdown_on_error: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let error = config.validate_runtime_support().unwrap_err().to_string();
-        assert!(error.contains("graceful_shutdown_on_error"));
-    }
-
-    #[rstest]
     fn test_validate_runtime_support_rejects_emulator() {
         let config = LiveNodeConfig {
             emulator: Some(OrderEmulatorConfig::default()),
@@ -1377,6 +1346,10 @@ mod tests {
     }
 
     #[rstest]
+    #[expect(
+        clippy::float_cmp,
+        reason = "asserts the exact configured default with no arithmetic involved"
+    )]
     fn test_live_exec_engine_config_defaults() {
         let config = LiveExecEngineConfig::default();
 
@@ -1407,7 +1380,6 @@ mod tests {
         assert_eq!(config.position_check_threshold_ms, 5_000);
         assert_eq!(config.position_check_retries, 3);
         assert!(!config.purge_from_database);
-        assert!(!config.graceful_shutdown_on_error);
         assert_eq!(config.qsize, 100_000);
     }
 
@@ -1427,7 +1399,6 @@ mod tests {
         assert!(!config.emit_quotes_from_book_depths);
         assert_eq!(config.external_clients, None);
         assert!(!config.debug);
-        assert!(!config.graceful_shutdown_on_error);
         assert_eq!(config.qsize, 100_000);
     }
 
@@ -1440,7 +1411,6 @@ mod tests {
         assert_eq!(config.max_order_modify_rate, DEFAULT_ORDER_RATE_LIMIT);
         assert!(config.max_notional_per_order.is_empty());
         assert!(!config.debug);
-        assert!(!config.graceful_shutdown_on_error);
         assert_eq!(config.qsize, 100_000);
     }
 

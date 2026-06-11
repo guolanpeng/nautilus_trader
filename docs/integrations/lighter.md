@@ -276,7 +276,7 @@ the strategy has subscribed to quotes is denied with a clear error. Override per
 | Option           | Perpetuals | Spot | Notes                                                                      |
 |------------------|------------|------|----------------------------------------------------------------------------|
 | `post_only`      | ✓          | ✓    | Maps to Lighter's post‑only time‑in‑force.                                 |
-| `reduce_only`    | ✓          | -    | Passed through to `CreateOrder`; use on derivatives only.                  |
+| `reduce_only`    | ✓          | -    | Passed through to `CreateOrder`; use only to reduce an existing position.  |
 | `quote_quantity` | -          | -    | *Not supported*; submit base quantity instead.                             |
 | `display_qty`    | -          | -    | *Not supported*; Lighter exposes no iceberg display quantity field.        |
 
@@ -318,12 +318,15 @@ also shown that very short GTD expiries can be rejected by the sequencer with
 
 ### Execution instructions
 
-| Instruction   | Perpetuals | Spot | Notes                                           |
-|---------------|------------|------|-------------------------------------------------|
-| `post_only`   | ✓          | ✓    | Overrides the TIF and sends Lighter `PostOnly`. |
-| `reduce_only` | ✓          | -    | Position‑reducing flag for derivatives.         |
+| Instruction   | Perpetuals | Spot | Notes                                                        |
+|---------------|------------|------|--------------------------------------------------------------|
+| `post_only`   | ✓          | ✓    | Overrides the TIF and sends Lighter `PostOnly`.              |
+| `reduce_only` | ✓          | -    | Position‑reducing flag for existing derivative positions.    |
 
 Use `post_only` on limit-style orders. The adapter does not synthesize maker-only market orders.
+Live mainnet testing confirms `reduce_only=true` for closing perpetual positions. Invalid
+reduce-only opens can be dropped by Lighter without a venue order report; the adapter reconciles
+them as `INFLIGHT_TIMEOUT` rather than a venue-supplied rejection reason.
 
 ### Advanced order features
 
@@ -415,7 +418,7 @@ previously cached market, the adapter emits a flat position report for that inst
 | Cross margin            | ✓          | -    | Passed through `LighterPositionMarginMode::Cross`.           |
 | Isolated margin         | ✓          | -    | Passed through `LighterPositionMarginMode::Isolated`.        |
 | Leverage updates        | ✓          | -    | Signed `UpdateLeverage` transaction.                         |
-| Spot margin / borrowing | -          | -    | *Not supported*.                                            |
+| Spot margin / borrowing | -          | -    | *Not supported*.                                             |
 | Deposits / withdrawals  | -          | -    | Use venue tools or Lighter APIs outside the trading adapter. |
 
 ## Liquidation and ADL handling
@@ -435,41 +438,76 @@ Perpetual `market_stats` frames emit `MarkPriceUpdate`, `IndexPriceUpdate`, and
 Historical funding-rate requests use the public `/api/v1/fundings` endpoint and emit
 `FundingRateUpdate` responses for settled hourly rows.
 
+## Account tiers
+
+Lighter assigns each account a tier that governs latency, rate limits, and fees. Standard is the
+zero-fee default; the higher tiers are opt-in on the venue and trade fees for lower latency and
+higher throughput. The execution client detects the tier on connect (via `GET /api/v1/account`)
+and logs it in blue, including the raw `account_type` code for any tier this adapter does not yet
+recognize. Detection is informational only: the adapter never raises rate limits on its own,
+because the higher venue limits require registering the caller IP with Lighter, so a higher tier
+does not by itself guarantee the higher limit is active for your connection.
+
+| Tier     | Latency (maker / taker) | REST weighted limit | `sendTx` limit       | Fees (maker / taker)      | Notes                                   |
+|----------|-------------------------|---------------------|----------------------|---------------------------|-----------------------------------------|
+| Standard | 200 ms / 300 ms         | 60 req/min          | 60 req/min           | 0 / 0                     | Zero‑fee default tier.                  |
+| Premium  | 0 ms / 140-200 ms       | 24,000 req/min      | 4,000-40,000 req/min | 0.28-0.40 / 1.96-2.80 bps | Lowest latency; scales with staked LIT. |
+| Plus     | 200 ms / 300 ms         | 120,000 req/min     | 8,000 req/min        | 0.5 / 0.5 bps             | Raised limits, standard latency.        |
+| Builder  | -                       | 240,000 req/min     | -                    | -                         | Highest REST throughput.                |
+
+Premium latency, fees, and `sendTx` throughput scale with staked LIT, and the schedule can change;
+see the Lighter docs for the current figures. To actually use a higher tier's limits, register the
+caller IP with Lighter and set the quota explicitly (see [Rate limiting](#rate-limiting)).
+
 ## Rate limiting
 
-Lighter applies rate limits to both IP address and L1 address. The adapter uses the conservative
-standard-account REST quota by default, even when credentials belong to an account tier with higher
-venue limits.
+Lighter applies rate limits to both IP address and L1 address. The execution client detects the
+account tier on connect and logs it (see [Account tiers](#account-tiers)), but it does not raise
+limits automatically. By default both clients use the conservative standard-account quotas. To use
+a higher tier's throughput, register the caller IP with Lighter and set the quota explicitly in the
+client config:
 
-| Scope                                | Venue limit                 | Adapter behavior                                      |
-|--------------------------------------|-----------------------------|-------------------------------------------------------|
-| REST, standard account               | 60 req/min                  | HTTP client quota is fixed at this default.           |
-| REST, premium account                | 24,000 weighted req/min     | Not auto‑detected; adapter still uses 60 req/min.     |
-| REST, plus account                   | 120,000 weighted req/min    | Not auto‑detected; adapter still uses 60 req/min.     |
-| REST, builder account                | 240,000 weighted req/min    | Not auto‑detected; adapter still uses 60 req/min.     |
-| `sendTx` / `sendTxBatch`, standard   | 60 req/min                  | Singles use `sendTx`; batches use `sendTxBatch`.       |
-| `sendTx` / `sendTxBatch`, plus       | 8,000 req/min               | Higher tiers still need external config planning.     |
-| `sendTx` / `sendTxBatch`, premium    | 4,000-40,000 req/min        | Higher tiers still need external config planning.     |
-| Default transaction type limit       | 40 req/min                  | Applies to tx types not covered by volume quota.      |
-| `L2UpdateLeverage` transaction limit | 40 req/min                  | Relevant to `update_leverage`.                        |
-| Pending orders                       | 500/account, 16/market      | Venue limit; adapter does not pre‑count it.           |
-| Active orders                        | 1,500/account, 1,000/market | Venue limit; adapter does not pre‑count it.           |
+- `rest_quota_per_min`: REST read-bucket quota in requests per minute. Unset keeps 60 req/min.
+  Available on both the data and execution clients.
+- `sendtx_quota_per_min`: transaction quota in requests per minute, metered in a bucket separate
+  from reads. Unset keeps it at the standard 60 req/min, independent of `rest_quota_per_min`.
+  Execution client only.
 
-| Endpoint or transport                  | Limit      | Notes                                                    |
-|----------------------------------------|------------|----------------------------------------------------------|
-| `/api/v1/trades`                       | 100 rows   | Adapter paginates reconciliation at this cap.            |
-| `/api/v1/accountInactiveOrders`        | 100 rows   | Adapter follows `next_cursor` at this cap.               |
-| `/api/v1/orderBookOrders`              | 250 levels | Snapshot depth is clamped to the venue cap.              |
-| `/api/v1/candles`                      | 500 rows   | Adapter caps REST bar pages at this venue maximum.       |
-| WebSocket connections                  | 200 / IP   | Venue limit.                                             |
-| WebSocket subscriptions / connection   | 500        | Venue limit.                                             |
-| WebSocket unique accounts / connection | 500        | Venue limit.                                             |
-| WebSocket connections / minute         | 80         | Venue limit.                                             |
-| WebSocket client messages / minute     | 200        | Excludes `sendTx` and `sendTxBatch`.                     |
-| WebSocket inflight messages            | 50         | Excludes `sendTx` and `sendTxBatch`.                     |
-| `sendTxBatch` batch size               | 15 txs     | Applies to native HTTP submit and cancel batches.        |
-| WebSocket keepalive                    | 2 minutes  | Adapter sends heartbeats every 30 seconds.               |
-| WebSocket outbound command queue       | 1000       | Adapter backpressure starts at this queue depth.         |
+The venue meters transactions per account across both transports in one bucket. The execution
+client enforces `sendtx_quota_per_min` with a single shared limiter across both paths it submits
+on: the WebSocket `sendTx` path (single order submit, cancel, modify, leverage) and the HTTP
+`sendTx` / `sendTxBatch` endpoints (native batch submit/cancel and the startup integrator
+approval). Their combined rate therefore stays under the one venue limit.
+
+| Scope                                  | Venue limit                 | Adapter behavior                                     |
+|----------------------------------------|-----------------------------|------------------------------------------------------|
+| REST, standard account                 | 60 req/min                  | Default; set `rest_quota_per_min` to override.       |
+| REST, premium account                  | 24,000 weighted req/min     | Logged; set `rest_quota_per_min` to use it.          |
+| REST, plus account                     | 120,000 weighted req/min    | Logged; set `rest_quota_per_min` to use it.          |
+| REST, builder account                  | 240,000 weighted req/min    | Logged; set `rest_quota_per_min` to use it.          |
+| `sendTx` / `sendTxBatch`, standard     | 60 req/min                  | Singles use `sendTx`; batches use `sendTxBatch`.     |
+| `sendTx` / `sendTxBatch`, plus         | 8,000 req/min               | Set `sendtx_quota_per_min` to use it.                |
+| `sendTx` / `sendTxBatch`, premium      | 4,000-40,000 req/min        | Set `sendtx_quota_per_min` (scales with staked LIT). |
+| Default transaction type limit         | 40 req/min                  | Applies to tx types not covered by volume quota.     |
+| `L2UpdateLeverage` transaction limit   | 40 req/min                  | Relevant to `update_leverage`.                       |
+| Pending orders                         | 500/account, 16/market      | Venue limit; adapter does not pre‑count it.          |
+| Active orders                          | 1,500/account, 1,000/market | Venue limit; adapter does not pre‑count it.          |
+
+| Endpoint or transport                  | Limit      | Notes                                              |
+|----------------------------------------|------------|----------------------------------------------------|
+| `/api/v1/trades`                       | 100 rows   | Adapter paginates reconciliation at this cap.      |
+| `/api/v1/accountInactiveOrders`        | 100 rows   | Adapter follows `next_cursor` at this cap.         |
+| `/api/v1/orderBookOrders`              | 250 levels | Snapshot depth is clamped to the venue cap.        |
+| `/api/v1/candles`                      | 500 rows   | Adapter caps REST bar pages at this venue maximum. |
+| WebSocket connections                  | 200 / IP   | Venue limit.                                       |
+| WebSocket subscriptions / connection   | 500        | Venue limit.                                       |
+| WebSocket unique accounts / connection | 500        | Venue limit.                                       |
+| WebSocket connections / minute         | 80         | Venue limit.                                       |
+| WebSocket client messages / minute     | 200        | Excludes `sendTx` and `sendTxBatch`.               |
+| WebSocket inflight messages            | 50         | Excludes `sendTx` and `sendTxBatch`.               |
+| `sendTxBatch` batch size               | 15 txs     | Applies to native HTTP submit and cancel batches.  |
+| WebSocket keepalive                    | 2 minutes  | Adapter sends heartbeats every 30 seconds.         |
+| WebSocket outbound command queue       | 1000       | Adapter backpressure starts at this queue depth.   |
 
 Premium volume quota is a separate venue constraint for `L2CreateOrder`, `L2CancelAllOrders`,
 `L2ModifyOrder`, and `L2CreateGroupedOrders`. The adapter does not inspect remaining quota; use
@@ -484,6 +522,10 @@ channels.
 
 On execution reconnect, the adapter refreshes the nonce baseline through `GET /api/v1/nextNonce`
 before it resumes signed transaction dispatch.
+
+Within a session, the adapter manages transaction nonces locally: venue confirmations advance the
+allocation window, and rejected or failed transactions roll back or trigger a resync from
+`GET /api/v1/nextNonce`, so order flow recovers from nonce desyncs without a reconnect.
 
 `LighterExecutionClient::connect()` waits up to 30 seconds for every account stream
 (`account_all_orders`, `account_all_trades`, `account_all_positions`, `account_all_assets`) to

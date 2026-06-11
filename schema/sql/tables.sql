@@ -169,6 +169,13 @@ CREATE TABLE IF NOT EXISTS "order_event" (
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS "order_position_index" (
+    client_order_id TEXT PRIMARY KEY NOT NULL,
+    position_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS "position"(
     id TEXT PRIMARY KEY NOT NULL,
     trader_id TEXT REFERENCES trader(id) ON DELETE CASCADE,
@@ -305,6 +312,13 @@ CREATE TABLE IF NOT EXISTS "block" (
     PRIMARY KEY (chain_id, number)
 ) PARTITION BY LIST (chain_id);
 CREATE TABLE IF NOT EXISTS "block_default" PARTITION OF "block" DEFAULT;
+
+CREATE TABLE IF NOT EXISTS "pool_event_block" (
+    chain_id INTEGER NOT NULL REFERENCES chain(chain_id) ON DELETE CASCADE,
+    number BIGINT NOT NULL,
+    timestamp TEXT NOT NULL,
+    PRIMARY KEY (chain_id, number)
+);
 
 CREATE TABLE IF NOT EXISTS "token"(
     chain_id INTEGER NOT NULL REFERENCES chain(chain_id) ON DELETE CASCADE,

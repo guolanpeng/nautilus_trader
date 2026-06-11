@@ -37,7 +37,7 @@ use nautilus_model::{
     data::{BarSpecification, BarType},
     enums::{AccountType, BookType, OmsType, OtoTriggerMode},
     identifiers::{ClientId, InstrumentId, TraderId, Venue},
-    types::{Currency, Money},
+    types::{Currency, Money, Price},
 };
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
@@ -91,7 +91,6 @@ impl FromStr for NautilusDataType {
 }
 
 /// Configuration for ``BacktestEngine`` instances.
-#[derive(Debug, Clone, bon::Builder)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
@@ -104,6 +103,11 @@ impl FromStr for NautilusDataType {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.backtest")
 )]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "config fields mirror the existing Rust and Python backtest engine surfaces"
+)]
+#[derive(Debug, Clone, bon::Builder)]
 pub struct BacktestEngineConfig {
     /// The kernel environment context.
     #[builder(default = Environment::Backtest)]
@@ -117,13 +121,18 @@ pub struct BacktestEngineConfig {
     /// If trading strategy state should be saved to the database on stop.
     #[builder(default)]
     pub save_state: bool,
+    /// If the system should request shutdown when an error log is emitted.
+    ///
+    /// Filtered or bypassed error logs still request shutdown.
+    #[builder(default)]
+    pub shutdown_on_error: bool,
     /// The logging configuration for the kernel.
     #[builder(default)]
     pub logging: LoggerConfig,
     /// The unique instance identifier for the kernel.
     pub instance_id: Option<UUID4>,
     /// The timeout for all clients to connect and initialize.
-    #[builder(default = Duration::from_secs(60))]
+    #[builder(default = Duration::from_mins(1))]
     pub timeout_connection: Duration,
     /// The timeout for execution state to reconcile.
     #[builder(default = Duration::from_secs(30))]
@@ -181,6 +190,10 @@ impl NautilusKernelConfig for BacktestEngineConfig {
 
     fn save_state(&self) -> bool {
         self.save_state
+    }
+
+    fn shutdown_on_error(&self) -> bool {
+        self.shutdown_on_error
     }
 
     fn logging(&self) -> LoggerConfig {
@@ -258,8 +271,12 @@ impl Default for BacktestEngineConfig {
 /// `SimulatedExchange` shapes (trait objects for modules/latency, typed
 /// `Money` balances), which is why this is distinct from the YAML-friendly
 /// [`BacktestVenueConfig`] used by `BacktestNode`.
-#[derive(bon::Builder)]
 #[allow(missing_debug_implementations)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "venue config fields mirror the existing imperative backtest API"
+)]
+#[derive(bon::Builder)]
 pub struct SimulatedVenueConfig {
     pub venue: Venue,
     pub oms_type: OmsType,
@@ -316,11 +333,14 @@ pub struct SimulatedVenueConfig {
     pub oto_full_trigger: bool,
     #[builder(default = 0)]
     pub price_protection_points: u32,
+    /// Settlement prices for expiring instruments keyed by instrument ID.
+    #[builder(default)]
+    pub settlement_prices: AHashMap<InstrumentId, Price>,
     /// If liquidation of positions should be triggered when maintenance margin is breached.
     #[builder(default = false)]
     pub liquidation_enabled: bool,
     /// The ratio of equity to maintenance margin at which liquidation is triggered.
-    /// A value of 1.0 means liquidation triggers when equity <= maintenance_margin.
+    /// A value of 1.0 means liquidation triggers when equity <= `maintenance_margin`.
     #[builder(default = 1.0)]
     pub liquidation_trigger_ratio: f64,
     /// If open orders should be canceled before closing positions during liquidation.
@@ -329,7 +349,6 @@ pub struct SimulatedVenueConfig {
 }
 
 /// Represents a venue configuration for one specific backtest engine.
-#[derive(Debug, Clone, bon::Builder)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
@@ -342,6 +361,11 @@ pub struct SimulatedVenueConfig {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.backtest")
 )]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "venue config fields mirror the existing Rust and Python backtest surfaces"
+)]
+#[derive(Debug, Clone, bon::Builder)]
 pub struct BacktestVenueConfig {
     /// The name of the venue.
     name: Ustr,
@@ -437,7 +461,7 @@ pub struct BacktestVenueConfig {
     #[builder(default)]
     liquidation_enabled: bool,
     /// The ratio of equity to maintenance margin at which liquidation is triggered.
-    /// A value of 1.0 means liquidation triggers when equity <= maintenance_margin.
+    /// A value of 1.0 means liquidation triggers when equity <= `maintenance_margin`.
     #[builder(default = 1.0)]
     liquidation_trigger_ratio: f64,
     /// If open orders should be canceled before closing positions during liquidation.
@@ -740,7 +764,7 @@ impl BacktestDataConfig {
     /// Constructs identifier strings for catalog queries.
     ///
     /// Follows the same logic as Python's `BacktestDataConfig.query`:
-    /// - For bars: prefer `bar_types`, else construct from instrument(s) + bar_spec + "-EXTERNAL"
+    /// - For bars: prefer `bar_types`, else construct from instrument(s) + `bar_spec` + "-EXTERNAL"
     /// - For other types: use `instrument_id` or `instrument_ids`
     #[must_use]
     pub fn query_identifiers(&self) -> Option<Vec<String>> {
@@ -787,7 +811,7 @@ impl BacktestDataConfig {
 
     /// Returns all instrument IDs referenced by this config.
     ///
-    /// For bar_types, extracts the instrument ID from each bar type string.
+    /// For `bar_types`, extracts the instrument ID from each bar type string.
     ///
     /// # Errors
     ///

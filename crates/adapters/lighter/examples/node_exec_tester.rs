@@ -27,7 +27,7 @@ use nautilus_lighter::{
     config::{LighterDataClientConfig, LighterExecClientConfig},
     factories::{LighterDataClientFactory, LighterExecutionClientFactory},
 };
-use nautilus_live::node::LiveNode;
+use nautilus_live::{config::LiveExecEngineConfig, node::LiveNode};
 use nautilus_model::{
     identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId},
     types::Quantity,
@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let account_id = AccountId::from("LIGHTER-001");
     let node_name = "LIGHTER-EXEC-TESTER-001".to_string();
     let client_id = ClientId::new("LIGHTER");
-    let instrument_id = InstrumentId::from("DOGE-PERP.LIGHTER");
+    let instrument_id = InstrumentId::from("ETH-PERP.LIGHTER");
 
     let data_config = LighterDataClientConfig {
         environment: lighter_environment,
@@ -64,17 +64,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stdout_level: LevelFilter::Info,
         ..Default::default()
     };
+    let exec_engine_config = LiveExecEngineConfig {
+        open_check_interval_secs: Some(10.0),
+        position_check_interval_secs: Some(30.0),
+        // Example client order ID filtering for historical rows
+        filtered_client_order_ids: Some(vec![
+            "1793664468".to_string(),
+            "1062637805503".to_string(),
+        ]),
+        ..Default::default()
+    };
 
     let mut node = LiveNode::builder(trader_id, environment)?
         .with_name(node_name)
         .with_logging(log_config)
+        .with_exec_engine_config(exec_engine_config)
         .add_data_client(None, Box::new(data_factory), Box::new(data_config))?
         .add_exec_client(None, Box::new(exec_factory), Box::new(exec_config))?
         .with_reconciliation(true)
         .with_delay_post_stop_secs(5)
         .build()?;
 
-    let order_qty = Quantity::from("200");
+    let order_qty = Quantity::from("0.01");
     let tester_config = ExecTesterConfig::builder()
         .base(StrategyConfig {
             strategy_id: Some(StrategyId::from("EXEC_TESTER-001")),
@@ -88,13 +99,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .subscribe_trades(false)
         .subscribe_book(false)
         .enable_limit_buys(true)
-        .enable_limit_sells(false)
+        .enable_limit_sells(true)
         .enable_stop_buys(false)
         .enable_stop_sells(false)
-        .tob_offset_ticks(10_000)
+        .tob_offset_ticks(1_000)
         .use_post_only(true)
         .cancel_orders_on_stop(true)
-        .close_positions_on_stop(false)
+        .close_positions_on_stop(true)
         .log_data(false)
         .build();
 

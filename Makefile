@@ -32,6 +32,8 @@ VERBOSE ?= true
 # Set UV_SYNC_FLAGS= to make uv prune packages not in uv.lock
 UV_SYNC_FLAGS ?= --inexact
 
+PIP_AUDIT_IGNORE_FLAGS :=
+
 # TARGET_DIR controls where cargo places build artifacts.
 # Can be overridden to use a separate directory: make build-debug TARGET_DIR=target-python
 TARGET_DIR ?= target
@@ -231,7 +233,7 @@ ib-stop:  #-- Stop local TWS/IBC processes and Docker IB Gateway containers
 
 .PHONY: clean-builds
 clean-builds:  #-- Clean distribution and target directories
-	$Q rm -rf dist target target-v2 2>/dev/null || true
+	$Q rm -rf dist target target-v2 crates/pyo3/target-v2 2>/dev/null || true
 
 .PHONY: clean-build-artifacts
 clean-build-artifacts:  #-- Clean compiled artifacts (.so, .dll, .pyc, .c files)
@@ -368,7 +370,7 @@ outdated: check-edit-installed  #-- Check for outdated dependencies
 
 .PHONY: update
 update: cargo-update update-uv  #-- Update all dependencies (cargo and uv)
-	uv lock --upgrade
+	$Q uv lock --upgrade
 
 .PHONY: update-uv
 update-uv:  #-- Install or upgrade uv to the version pinned in pyproject.toml
@@ -411,10 +413,16 @@ endef
 security-audit: check-audit-installed check-deny-installed check-vet-installed check-osv-scanner-installed  #-- Run comprehensive security audit (cargo-audit, cargo-deny, cargo-vet, pip-audit, osv-scanner)
 	$(info $(M) Running security audit...)
 	@$(call audit_step,cargo audit,cargo audit --color never)
+	@$(call audit_step,cargo audit lighter fuzz,cargo audit --color never --file crates/adapters/lighter/fuzz/Cargo.lock)
+	@$(call audit_step,cargo audit derive fuzz,cargo audit --color never --file crates/adapters/derive/fuzz/Cargo.lock)
 	@$(call audit_step,cargo deny,cargo deny --all-features check advisories licenses sources bans)
+	@$(call audit_step,cargo deny lighter fuzz,cargo deny --manifest-path crates/adapters/lighter/fuzz/Cargo.toml --locked --all-features check --config .cargo/deny-fuzz.toml advisories licenses sources bans)
+	@$(call audit_step,cargo deny derive fuzz,cargo deny --manifest-path crates/adapters/derive/fuzz/Cargo.toml --locked --all-features check --config .cargo/deny-fuzz.toml advisories licenses sources bans)
 	@$(call audit_step,cargo vet,cargo vet --locked)
-	@$(call audit_step,pip-audit,uv export --no-hashes --frozen | uv run --no-project --with pip-audit -- pip-audit --disable-pip --no-deps -r /dev/stdin)
-	@$(call audit_step,osv-scanner,osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock --lockfile=uv.lock --lockfile=python/uv.lock)
+	@$(call audit_step,cargo vet lighter fuzz,cargo vet --locked --manifest-path crates/adapters/lighter/fuzz/Cargo.toml --store-path .supply-chain)
+	@$(call audit_step,cargo vet derive fuzz,cargo vet --locked --manifest-path crates/adapters/derive/fuzz/Cargo.toml --store-path .supply-chain)
+	@$(call audit_step,pip-audit,uv export --no-hashes --frozen | uv run --no-project --with pip-audit -- pip-audit --disable-pip --no-deps -r /dev/stdin $(PIP_AUDIT_IGNORE_FLAGS))
+	@$(call audit_step,osv-scanner,osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock --lockfile=crates/adapters/lighter/fuzz/Cargo.lock --lockfile=crates/adapters/derive/fuzz/Cargo.lock --lockfile=uv.lock --lockfile=python/uv.lock)
 
 .PHONY: cargo-deny
 cargo-deny: check-deny-installed  #-- Run cargo-deny checks (advisories, sources, bans, licenses)
@@ -963,7 +971,7 @@ docker-push:  #-- Push Docker image to registry
 
 .PHONY: docker-build-jupyter
 docker-build-jupyter:  #-- Build JupyterLab Docker image
-	docker build --build-arg GIT_TAG=$(GIT_TAG) -f .docker/jupyterlab.dockerfile --platform linux/x86_64 -t $(IMAGE):jupyter .
+	docker build -f .docker/jupyterlab.dockerfile --platform linux/x86_64 -t $(IMAGE):jupyter .
 
 .PHONY: docker-push-jupyter
 docker-push-jupyter:  #-- Push JupyterLab Docker image to registry

@@ -64,7 +64,7 @@ async fn await_handle(handle: Option<tokio::task::JoinHandle<()>>, task_name: &s
                 }
             }
             Err(_) => {
-                log::error!("Timeout {timeout:?} awaiting task '{task_name}'");
+                log::warn!("Timeout {timeout:?} awaiting task '{task_name}'");
             }
         }
     }
@@ -356,7 +356,7 @@ mod tests {
         };
 
         let key = get_stream_key(trader_id, instance_id, &config);
-        assert_eq!(key, format!("stream"));
+        assert_eq!(key, "stream".to_string());
     }
 
     #[rstest]

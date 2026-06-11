@@ -30,7 +30,10 @@ use nautilus_model::{
     reports::PositionStatusReport,
 };
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
+};
 use serde_json::value::RawValue;
 use ustr::Ustr;
 
@@ -384,6 +387,7 @@ pub enum LighterWsFrame {
     #[serde(rename = "subscribed/order_book")]
     OrderBookSnapshot {
         channel: Ustr,
+        #[serde(default)]
         last_updated_at: u64,
         offset: i64,
         order_book: LighterWsOrderBook,
@@ -400,6 +404,7 @@ pub enum LighterWsFrame {
     #[serde(rename = "subscribed/ticker")]
     TickerSnapshot {
         channel: Ustr,
+        #[serde(default)]
         last_updated_at: u64,
         nonce: i64,
         ticker: LighterTicker,
@@ -413,13 +418,16 @@ pub enum LighterWsFrame {
         ticker: LighterTicker,
         timestamp: u64,
     },
-    #[serde(rename = "update/market_stats")]
+    #[serde(rename = "update/market_stats", alias = "subscribed/market_stats")]
     MarketStats {
         channel: Ustr,
         market_stats: LighterMarketStatsPayload,
         timestamp: u64,
     },
-    #[serde(rename = "update/spot_market_stats")]
+    #[serde(
+        rename = "update/spot_market_stats",
+        alias = "subscribed/spot_market_stats"
+    )]
     SpotMarketStats {
         channel: Ustr,
         spot_market_stats: LighterSpotMarketStatsPayload,
@@ -685,25 +693,43 @@ fn deserialize_trade_vec<'de, D>(deserializer: D) -> Result<Vec<LighterTrade>, D
 where
     D: serde::Deserializer<'de>,
 {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match value {
-        serde_json::Value::Null => Ok(Vec::new()),
-        serde_json::Value::Array(_) => {
-            serde_json::from_value(value).map_err(serde::de::Error::custom)
+    struct TradeVecVisitor;
+
+    impl<'de> Visitor<'de> for TradeVecVisitor {
+        type Value = Vec<LighterTrade>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("trade array, object keyed by market, or null")
         }
-        serde_json::Value::Object(map) => {
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut trades = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(trade) = seq.next_element::<LighterTrade>()? {
+                trades.push(trade);
+            }
+            Ok(trades)
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
             let mut trades = Vec::new();
-            for value in map.into_values() {
-                let mut market_trades: Vec<LighterTrade> =
-                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            while let Some((_, mut market_trades)) =
+                map.next_entry::<IgnoredAny, Vec<LighterTrade>>()?
+            {
                 trades.append(&mut market_trades);
             }
             Ok(trades)
         }
-        other => Err(serde::de::Error::custom(format!(
-            "expected trade array, object, or null, was {other}"
-        ))),
     }
+
+    deserializer.deserialize_any(TradeVecVisitor)
 }
 
 #[cfg(test)]
@@ -718,16 +744,24 @@ mod tests {
     const WS_ORDER_BOOK_UPDATE: &str = include_str!("../../test_data/ws_order_book_update.json");
     const WS_ORDER_BOOK_SUBSCRIBED: &str =
         include_str!("../../test_data/ws_order_book_subscribed.json");
+    const WS_ORDER_BOOK_SUBSCRIBED_EMPTY: &str =
+        include_str!("../../test_data/ws_order_book_subscribed_empty.json");
     const WS_TRADE_UPDATE: &str = include_str!("../../test_data/ws_trade_update.json");
     const WS_TRADE_SUBSCRIBED: &str = include_str!("../../test_data/ws_trade_subscribed.json");
     const WS_TICKER_UPDATE: &str = include_str!("../../test_data/ws_ticker_update.json");
     const WS_TICKER_SUBSCRIBED: &str = include_str!("../../test_data/ws_ticker_subscribed.json");
+    const WS_TICKER_SUBSCRIBED_EMPTY: &str =
+        include_str!("../../test_data/ws_ticker_subscribed_empty.json");
     const WS_MARKET_STATS_UPDATE_SINGLE: &str =
         include_str!("../../test_data/ws_market_stats_update_single.json");
+    const WS_MARKET_STATS_SUBSCRIBED_SINGLE: &str =
+        include_str!("../../test_data/ws_market_stats_subscribed_single.json");
     const WS_MARKET_STATS_UPDATE_ALL: &str =
         include_str!("../../test_data/ws_market_stats_update_all.json");
     const WS_SPOT_MARKET_STATS_UPDATE_SINGLE: &str =
         include_str!("../../test_data/ws_spot_market_stats_update_single.json");
+    const WS_SPOT_MARKET_STATS_SUBSCRIBED_SINGLE: &str =
+        include_str!("../../test_data/ws_spot_market_stats_subscribed_single.json");
     const WS_SPOT_MARKET_STATS_UPDATE_ALL: &str =
         include_str!("../../test_data/ws_spot_market_stats_update_all.json");
     const WS_ACCOUNT_ALL_ASSETS_UPDATE: &str =
@@ -886,6 +920,23 @@ mod tests {
     }
 
     #[rstest]
+    fn test_trade_frame_deserializes_object_trades() {
+        let mut payload: Value = serde_json::from_str(WS_TRADE_UPDATE).unwrap();
+        let trades = payload.get_mut("trades").unwrap().take();
+        payload["trades"] = serde_json::json!({ "0": trades });
+
+        let frame: LighterWsFrame = serde_json::from_value(payload).unwrap();
+
+        match frame {
+            LighterWsFrame::Trade { trades, .. } => {
+                assert_eq!(trades.len(), 1);
+                assert_eq!(trades[0].trade_id_str.as_deref(), Some("16164557907"));
+            }
+            _ => panic!("expected trade frame"),
+        }
+    }
+
+    #[rstest]
     fn test_ticker_frame_deserializes() {
         let frame: LighterWsFrame = serde_json::from_str(WS_TICKER_UPDATE).unwrap();
 
@@ -942,6 +993,30 @@ mod tests {
     }
 
     #[rstest]
+    fn test_empty_order_book_snapshot_frame_deserializes() {
+        let frame: LighterWsFrame = serde_json::from_str(WS_ORDER_BOOK_SUBSCRIBED_EMPTY).unwrap();
+
+        match frame {
+            LighterWsFrame::OrderBookSnapshot {
+                channel,
+                last_updated_at,
+                order_book,
+                timestamp,
+                ..
+            } => {
+                assert_eq!(channel, Ustr::from("order_book:39"));
+                assert_eq!(last_updated_at, 0);
+                assert!(order_book.asks.is_empty());
+                assert!(order_book.bids.is_empty());
+                assert_eq!(order_book.offset, 1);
+                assert_eq!(order_book.nonce, 0);
+                assert_eq!(timestamp, 1_778_138_582_602);
+            }
+            _ => panic!("expected empty order book snapshot frame, was {frame:?}"),
+        }
+    }
+
+    #[rstest]
     fn test_ticker_snapshot_frame_deserializes() {
         let frame: LighterWsFrame = serde_json::from_str(WS_TICKER_SUBSCRIBED).unwrap();
 
@@ -961,6 +1036,33 @@ mod tests {
                 assert_eq!(timestamp, 1_778_138_582_640);
             }
             _ => panic!("expected ticker snapshot frame, was {frame:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_empty_ticker_snapshot_frame_deserializes() {
+        let frame: LighterWsFrame = serde_json::from_str(WS_TICKER_SUBSCRIBED_EMPTY).unwrap();
+
+        match frame {
+            LighterWsFrame::TickerSnapshot {
+                channel,
+                last_updated_at,
+                nonce,
+                ticker,
+                timestamp,
+                ..
+            } => {
+                assert_eq!(channel, Ustr::from("ticker:39"));
+                assert_eq!(last_updated_at, 0);
+                assert_eq!(nonce, 2_475_051);
+                assert_eq!(ticker.s, Ustr::from("ADA"));
+                assert_eq!(ticker.a.price, Decimal::ZERO);
+                assert_eq!(ticker.a.size, Decimal::ZERO);
+                assert_eq!(ticker.b.price, Decimal::ZERO);
+                assert_eq!(ticker.b.size, Decimal::ZERO);
+                assert_eq!(timestamp, 1_778_138_582_640);
+            }
+            _ => panic!("expected empty ticker snapshot frame, was {frame:?}"),
         }
     }
 
@@ -1009,6 +1111,27 @@ mod tests {
     }
 
     #[rstest]
+    fn test_market_stats_subscribed_frame_deserializes_single_payload() {
+        let frame: LighterWsFrame =
+            serde_json::from_str(WS_MARKET_STATS_SUBSCRIBED_SINGLE).unwrap();
+
+        match frame {
+            LighterWsFrame::MarketStats {
+                channel,
+                market_stats: LighterMarketStatsPayload::One(stats),
+                timestamp,
+            } => {
+                assert_eq!(channel, Ustr::from("market_stats:1"));
+                assert_eq!(stats.symbol, Ustr::from("BTC"));
+                assert_eq!(stats.market_id, 1);
+                assert_eq!(stats.mark_price, Decimal::from_str("64356.3").unwrap());
+                assert_eq!(timestamp, 1_780_546_209_291);
+            }
+            _ => panic!("expected subscribed market stats frame"),
+        }
+    }
+
+    #[rstest]
     fn test_market_stats_frame_deserializes_all_payload() {
         let frame: LighterWsFrame = serde_json::from_str(WS_MARKET_STATS_UPDATE_ALL).unwrap();
 
@@ -1048,6 +1171,27 @@ mod tests {
                 assert_eq!(timestamp, 1_774_883_844_933);
             }
             _ => panic!("expected single spot market stats frame"),
+        }
+    }
+
+    #[rstest]
+    fn test_spot_market_stats_subscribed_frame_deserializes_single_payload() {
+        let frame: LighterWsFrame =
+            serde_json::from_str(WS_SPOT_MARKET_STATS_SUBSCRIBED_SINGLE).unwrap();
+
+        match frame {
+            LighterWsFrame::SpotMarketStats {
+                channel,
+                spot_market_stats: LighterSpotMarketStatsPayload::One(stats),
+                timestamp,
+            } => {
+                assert_eq!(channel, Ustr::from("spot_market_stats:2048"));
+                assert_eq!(stats.symbol, Ustr::from("USDC"));
+                assert_eq!(stats.market_id, 2048);
+                assert_eq!(stats.mid_price, Decimal::from_str("1.000001").unwrap());
+                assert_eq!(timestamp, 1_774_883_844_933);
+            }
+            _ => panic!("expected subscribed spot market stats frame"),
         }
     }
 

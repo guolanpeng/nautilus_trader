@@ -234,7 +234,7 @@ impl SocketClient {
                     match timeout {
                         Ok(Ok(())) => log::debug!("Reconnected successfully"),
                         Ok(Err(e)) => log::warn!("Reconnect aborted: {e}"),
-                        Err(_) => log::error!("Reconnect timed out after 30s"),
+                        Err(_) => log::warn!("Reconnect timed out after 30s"),
                     }
                 }
             }
@@ -275,7 +275,7 @@ impl SocketClient {
                     .await;
 
                     if timeout.is_err() {
-                        log::error!("Timeout waiting for socket to close, forcing closed state");
+                        log::warn!("Timeout waiting for socket to close, forcing closed state");
                         connection_mode.store(ConnectionMode::Closed.as_u8(), Ordering::SeqCst);
                     }
                 }

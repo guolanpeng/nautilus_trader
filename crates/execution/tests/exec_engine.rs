@@ -43,12 +43,17 @@ use nautilus_common::{
     },
     timer::{TimeEvent, TimeEventCallback},
 };
-use nautilus_core::{UUID4, UnixNanos, datetime::NANOSECONDS_IN_MINUTE};
+use nautilus_core::{
+    UUID4, UnixNanos,
+    datetime::{NANOSECONDS_IN_MINUTE, NANOSECONDS_IN_SECOND},
+};
 use nautilus_execution::engine::{
-    ExecutionEngine, config::ExecutionEngineConfig, stubs::StubExecutionClient,
+    ExecutionEngine, PositionStateSnapshot, config::ExecutionEngineConfig,
+    stubs::StubExecutionClient,
 };
 use nautilus_model::{
     accounts::{AccountAny, CashAccount},
+    data::QuoteTick,
     enums::{
         AccountType, AssetClass, ContingencyType, LiquiditySide, OmsType, OrderSide, OrderStatus,
         OrderType, PositionSide, PositionSideSpecified, TimeInForce, TriggerType,
@@ -5440,7 +5445,7 @@ fn test_flip_position_on_opposite_filled_same_position_sell(mut execution_engine
         None,
         None,
         None,
-        None,
+        Some(Money::from("3 USD")),
         None,
         Some(AccountId::test_default()),
     );
@@ -5479,14 +5484,18 @@ fn test_flip_position_on_opposite_filled_same_position_sell(mut execution_engine
             original_position.is_closed(),
             "Original position should be closed after flip"
         );
+        let close_split = original_position
+            .events
+            .last()
+            .expect("closed position should include the closing split fill");
         assert_eq!(
-            original_position
-                .events
-                .last()
-                .expect("closed position should include the closing split fill")
-                .event_id,
-            flip_fill_event_id,
+            close_split.event_id, flip_fill_event_id,
             "close-side split fill should retain the original fill event ID",
+        );
+        assert_eq!(
+            close_split.commission,
+            Some(Money::from("2 USD")),
+            "close-side split fill should receive two thirds of the commission",
         );
     }
 
@@ -5525,6 +5534,15 @@ fn test_flip_position_on_opposite_filled_same_position_sell(mut execution_engine
             flipped_position.quantity,
             Quantity::from(50_000), // 150,000 - 100,000 = 50,000
             "Flipped position quantity should be 50,000 (150,000 - 100,000)"
+        );
+        assert_eq!(
+            flipped_position
+                .events
+                .first()
+                .expect("flipped position should include the opening split fill")
+                .commission,
+            Some(Money::from("1 USD")),
+            "open-side split fill should receive the residual commission",
         );
 
         assert_eq!(
@@ -12617,6 +12635,205 @@ fn test_purge_closed_orders_timer_fires_callback() {
 }
 
 #[rstest]
+fn test_start_snapshot_timer_registers_when_configured() {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = ExecutionEngineConfig {
+        snapshot_positions_interval_secs: Some(1.0),
+        ..Default::default()
+    };
+
+    let mut engine = ExecutionEngine::new(clock.clone(), cache, Some(config));
+    engine.start();
+
+    assert!(
+        clock
+            .borrow()
+            .timer_names()
+            .contains(&"ExecEngine_SNAPSHOT_POSITIONS")
+    );
+    assert_eq!(clock.borrow().timer_count(), 1);
+}
+
+#[rstest]
+fn test_start_snapshot_timer_zero_interval_skipped() {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = ExecutionEngineConfig {
+        snapshot_positions_interval_secs: Some(0.0),
+        ..Default::default()
+    };
+
+    let mut engine = ExecutionEngine::new(clock.clone(), cache, Some(config));
+    engine.start();
+
+    assert_eq!(clock.borrow().timer_count(), 0);
+}
+
+#[rstest]
+#[case::stop("stop")]
+#[case::reset("reset")]
+#[case::dispose("dispose")]
+fn test_snapshot_timer_canceled_on_lifecycle_transition(#[case] action: &str) {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = ExecutionEngineConfig {
+        snapshot_positions_interval_secs: Some(1.0),
+        ..Default::default()
+    };
+
+    let mut engine = ExecutionEngine::new(clock.clone(), cache, Some(config));
+    engine.start();
+    assert_eq!(clock.borrow().timer_count(), 1);
+
+    match action {
+        "stop" => engine.stop(),
+        "reset" => engine.reset(),
+        "dispose" => engine.dispose(),
+        _ => unreachable!(),
+    }
+
+    assert_eq!(clock.borrow().timer_count(), 0);
+}
+
+#[rstest]
+fn test_snapshot_open_position_states_publishes_position_state_snapshot() {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+
+    let position = stub_position_long(audusd_sim());
+    cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+
+    // Wide spread so a long marking to ask instead of bid changes the rounded PnL
+    let quote = QuoteTick {
+        instrument_id: position.instrument_id,
+        bid_price: Price::from("2.00020"),
+        ask_price: Price::from("3.00020"),
+        bid_size: Quantity::from(1_000_000),
+        ask_size: Quantity::from(1_000_000),
+        ts_event: UnixNanos::default(),
+        ts_init: UnixNanos::default(),
+    };
+    cache.borrow_mut().add_quote(quote).unwrap();
+
+    let ts_snapshot = UnixNanos::from(123_456_789);
+    clock.borrow_mut().advance_time(ts_snapshot, true);
+
+    let engine = ExecutionEngine::new(clock, cache, None);
+
+    let topic = format!("snapshots.positions.{}", position.id);
+    let pattern: msgbus::MStr<msgbus::Pattern> = topic.as_str().into();
+    let (handler, saver) = get_any_saving_handler::<PositionStateSnapshot>(None);
+    msgbus::subscribe_any(pattern, handler.clone(), None);
+
+    engine.snapshot_open_position_states();
+
+    msgbus::unsubscribe_any(pattern, &handler);
+
+    let snapshots = saver.get_messages();
+    assert_eq!(snapshots.len(), 1);
+    let snapshot = &snapshots[0];
+    let unrealized_pnl = snapshot
+        .unrealized_pnl
+        .expect("unrealized PnL should be present when a quote is cached");
+
+    assert_eq!(snapshot.position.id, position.id);
+    assert_eq!(snapshot.ts_snapshot, ts_snapshot);
+    assert_eq!(unrealized_pnl.currency, Currency::USD());
+    assert_eq!(unrealized_pnl.as_decimal(), dec!(1.00));
+}
+
+#[rstest]
+fn test_snapshot_open_position_states_publishes_snapshot_without_quote() {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+
+    let position = stub_position_long(audusd_sim());
+    cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+
+    let ts_snapshot = UnixNanos::from(987_654_321);
+    clock.borrow_mut().advance_time(ts_snapshot, true);
+
+    let engine = ExecutionEngine::new(clock, cache, None);
+
+    let topic = format!("snapshots.positions.{}", position.id);
+    let pattern: msgbus::MStr<msgbus::Pattern> = topic.as_str().into();
+    let (handler, saver) = get_any_saving_handler::<PositionStateSnapshot>(None);
+    msgbus::subscribe_any(pattern, handler.clone(), None);
+
+    engine.snapshot_open_position_states();
+
+    msgbus::unsubscribe_any(pattern, &handler);
+
+    let snapshots = saver.get_messages();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].position.id, position.id);
+    assert_eq!(snapshots[0].ts_snapshot, ts_snapshot);
+    assert!(snapshots[0].unrealized_pnl.is_none());
+}
+
+#[rstest]
+fn test_snapshot_timer_fires_callback_publishes_position_state_snapshot() {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+
+    let position = stub_position_long(audusd_sim());
+    cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+
+    let quote = QuoteTick {
+        instrument_id: position.instrument_id,
+        bid_price: Price::from("2.00020"),
+        ask_price: Price::from("2.00030"),
+        bid_size: Quantity::from(1_000_000),
+        ask_size: Quantity::from(1_000_000),
+        ts_event: UnixNanos::default(),
+        ts_init: UnixNanos::default(),
+    };
+    cache.borrow_mut().add_quote(quote).unwrap();
+
+    let config = ExecutionEngineConfig {
+        snapshot_positions_interval_secs: Some(1.0),
+        ..Default::default()
+    };
+    let mut engine = ExecutionEngine::new(clock.clone(), cache, Some(config));
+    engine.start();
+
+    let topic = format!("snapshots.positions.{}", position.id);
+    let pattern: msgbus::MStr<msgbus::Pattern> = topic.as_str().into();
+    let (handler, saver) = get_any_saving_handler::<PositionStateSnapshot>(None);
+    msgbus::subscribe_any(pattern, handler.clone(), None);
+
+    let events = clock
+        .borrow_mut()
+        .advance_time(UnixNanos::from(NANOSECONDS_IN_SECOND + 1), true);
+    let handlers = clock.borrow().match_handlers(events);
+    for handler in handlers {
+        handler.callback.call(handler.event);
+    }
+
+    msgbus::unsubscribe_any(pattern, &handler);
+
+    let snapshots = saver.get_messages();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].position.id, position.id);
+}
+
+#[rstest]
 fn test_reconcile_order_status_report_creates_external_order_when_filled(
     mut execution_engine: ExecutionEngine,
 ) {
@@ -12644,6 +12861,333 @@ fn test_reconcile_order_status_report_creates_external_order_when_filled(
         .expect("external order should be in cache");
     assert_eq!(order.status(), OrderStatus::Filled);
     assert_eq!(order.strategy_id(), StrategyId::from("EXTERNAL"));
+}
+
+#[rstest]
+#[case::filter_enabled(true, false, 1)]
+#[case::filter_disabled(false, true, 0)]
+fn test_reconcile_execution_report_filters_unclaimed_external_order(
+    #[case] filter_unclaimed_external_orders: bool,
+    #[case] expected_order_exists: bool,
+    #[case] expected_filtered_count: u64,
+) {
+    let mut execution_engine =
+        execution_engine_with_unclaimed_external_order_filter(filter_unclaimed_external_orders);
+    let instrument = audusd_sim();
+    let client_order_id = ClientOrderId::from("O-UNCLAIMED-001");
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone().into())
+        .unwrap();
+
+    let report = create_order_status_report(
+        Some(client_order_id),
+        VenueOrderId::from("V-UNCLAIMED-001"),
+        instrument.id(),
+        OrderStatus::Accepted,
+        Quantity::from(50_000),
+        Quantity::from(0),
+    );
+
+    execution_engine.reconcile_execution_report(&ExecutionReport::Order(Box::new(report)));
+
+    let order_exists = execution_engine
+        .cache()
+        .borrow()
+        .order_exists(&client_order_id);
+    assert_eq!(order_exists, expected_order_exists);
+    assert_eq!(
+        execution_engine.filtered_unclaimed_external_order_count(),
+        expected_filtered_count,
+    );
+
+    if filter_unclaimed_external_orders {
+        assert_eq!(execution_engine.event_count(), 0);
+    } else {
+        assert_eq!(execution_engine.event_count(), 1);
+    }
+}
+
+#[rstest]
+fn test_reconcile_execution_mass_status_filters_unclaimed_external_order() {
+    let mut execution_engine = execution_engine_with_unclaimed_external_order_filter(true);
+    let instrument = audusd_sim();
+    let client_order_id = ClientOrderId::from("O-UNCLAIMED-MASS");
+    let venue_order_id = VenueOrderId::from("V-UNCLAIMED-MASS");
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone().into())
+        .unwrap();
+
+    let order_report = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument.id(),
+        OrderStatus::Accepted,
+        Quantity::from(50_000),
+        Quantity::from(0),
+    );
+    let fill_report = create_fill_report(
+        instrument.id(),
+        Some(client_order_id),
+        venue_order_id,
+        TradeId::from("T-UNCLAIMED-MASS"),
+        Quantity::from(50_000),
+        Price::from("1.00000"),
+    );
+
+    let mut mass_status = ExecutionMassStatus::new(
+        ClientId::from("SIM"),
+        AccountId::test_default(),
+        Venue::from("SIM"),
+        UnixNanos::from(1_000_000),
+        None,
+    );
+    mass_status.add_order_reports(vec![order_report.clone()]);
+    mass_status.add_fill_reports(vec![fill_report.clone()]);
+
+    let raw_order_topic = MessagingSwitchboard::reconciliation_raw_order_status_report_topic();
+    let raw_order_pattern: msgbus::MStr<msgbus::Pattern> = raw_order_topic.into();
+    let (raw_order_handler, raw_order_saver) = get_any_saving_handler::<OrderStatusReport>(None);
+    msgbus::subscribe_any(raw_order_pattern, raw_order_handler.clone(), None);
+
+    let raw_fill_topic = MessagingSwitchboard::reconciliation_raw_fill_report_topic();
+    let raw_fill_pattern: msgbus::MStr<msgbus::Pattern> = raw_fill_topic.into();
+    let (raw_fill_handler, raw_fill_saver) = get_any_saving_handler::<FillReport>(None);
+    msgbus::subscribe_any(raw_fill_pattern, raw_fill_handler.clone(), None);
+
+    execution_engine.reconcile_execution_mass_status(&mass_status);
+
+    msgbus::unsubscribe_any(raw_order_pattern, &raw_order_handler);
+    msgbus::unsubscribe_any(raw_fill_pattern, &raw_fill_handler);
+
+    let captured_orders = raw_order_saver.get_messages();
+    let captured_fills = raw_fill_saver.get_messages();
+    let order_exists = execution_engine
+        .cache()
+        .borrow()
+        .order_exists(&client_order_id);
+    assert!(!order_exists);
+    assert_eq!(execution_engine.event_count(), 0);
+    assert_eq!(execution_engine.report_count(), 1);
+    assert_eq!(
+        execution_engine.filtered_unclaimed_external_order_count(),
+        1,
+    );
+    assert_eq!(captured_orders.len(), 1);
+    assert_eq!(captured_orders[0], order_report);
+    assert_eq!(captured_fills.len(), 1);
+    assert_eq!(captured_fills[0], fill_report);
+}
+
+#[rstest]
+fn test_reconcile_order_status_report_filter_keeps_claimed_external_order() {
+    let mut execution_engine = execution_engine_with_unclaimed_external_order_filter(true);
+    let instrument = audusd_sim();
+    let strategy_id = StrategyId::from("MyStrategy-001");
+    let client_order_id = ClientOrderId::from("O-CLAIMED-FILTER");
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone().into())
+        .unwrap();
+
+    let mut instruments = HashSet::new();
+    instruments.insert(instrument.id());
+    execution_engine
+        .register_external_order_claims(strategy_id, &instruments)
+        .unwrap();
+
+    let report = create_order_status_report(
+        Some(client_order_id),
+        VenueOrderId::from("V-CLAIMED-FILTER"),
+        instrument.id(),
+        OrderStatus::Accepted,
+        Quantity::from(50_000),
+        Quantity::from(0),
+    );
+
+    execution_engine.reconcile_order_status_report(&report);
+
+    let cache = execution_engine.cache().borrow();
+    let order = cache
+        .order(&client_order_id)
+        .expect("claimed external order should be in cache");
+    assert_eq!(order.strategy_id(), strategy_id);
+    assert_eq!(order.status(), OrderStatus::Accepted);
+    assert_eq!(
+        execution_engine.filtered_unclaimed_external_order_count(),
+        0,
+    );
+}
+
+#[rstest]
+fn test_reconcile_fill_report_filters_unclaimed_external_order() {
+    let mut execution_engine = execution_engine_with_unclaimed_external_order_filter(true);
+    let instrument = audusd_sim();
+    let client_order_id = ClientOrderId::from("O-FILL-FILTER");
+    let venue_order_id = VenueOrderId::from("V-FILL-FILTER");
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(instrument.clone()))
+        .unwrap();
+
+    let report = create_fill_report(
+        instrument.id(),
+        Some(client_order_id),
+        venue_order_id,
+        TradeId::from("T-FILL-FILTER"),
+        Quantity::from(50_000),
+        Price::from("1.00000"),
+    );
+
+    execution_engine.reconcile_fill_report(&report);
+
+    let cache = execution_engine.cache().borrow();
+    assert!(!cache.order_exists(&client_order_id));
+    assert_eq!(cache.positions_total_count(None, None, None, None, None), 0,);
+    assert_eq!(
+        execution_engine.filtered_unclaimed_external_order_count(),
+        1
+    );
+}
+
+#[rstest]
+fn test_reconcile_fill_report_filter_keeps_claimed_external_order() {
+    let mut execution_engine = execution_engine_with_unclaimed_external_order_filter(true);
+    let instrument = audusd_sim();
+    let client_order_id = ClientOrderId::from("O-CLAIMED-FILL-FILTER");
+    let venue_order_id = VenueOrderId::from("V-CLAIMED-FILL-FILTER");
+    let strategy_id = StrategyId::from("MyStrategy-001");
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(instrument.clone()))
+        .unwrap();
+
+    let mut instruments = HashSet::new();
+    instruments.insert(instrument.id());
+    execution_engine
+        .register_external_order_claims(strategy_id, &instruments)
+        .unwrap();
+
+    let report = create_fill_report(
+        instrument.id(),
+        Some(client_order_id),
+        venue_order_id,
+        TradeId::from("T-CLAIMED-FILL-FILTER"),
+        Quantity::from(50_000),
+        Price::from("1.00000"),
+    );
+
+    execution_engine.reconcile_fill_report(&report);
+
+    let cache = execution_engine.cache().borrow();
+    let order = cache
+        .order(&client_order_id)
+        .expect("claimed external order should be in cache");
+    assert_eq!(order.strategy_id(), strategy_id);
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert_eq!(
+        execution_engine.filtered_unclaimed_external_order_count(),
+        0
+    );
+}
+
+#[rstest]
+fn test_reconcile_order_with_fills_filters_unclaimed_external_order() {
+    let mut execution_engine = execution_engine_with_unclaimed_external_order_filter(true);
+    let instrument = audusd_sim();
+    let client_order_id = ClientOrderId::from("O-BUNDLED-FILTER");
+    let venue_order_id = VenueOrderId::from("V-BUNDLED-FILTER");
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(instrument.clone()))
+        .unwrap();
+
+    let order_report = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument.id(),
+        OrderStatus::Filled,
+        Quantity::from(50_000),
+        Quantity::from(50_000),
+    );
+    let fill_report = create_fill_report(
+        instrument.id(),
+        Some(client_order_id),
+        venue_order_id,
+        TradeId::from("T-BUNDLED-FILTER"),
+        Quantity::from(50_000),
+        Price::from("1.00000"),
+    );
+
+    execution_engine.reconcile_order_with_fills(&order_report, &[fill_report]);
+
+    let cache = execution_engine.cache().borrow();
+    assert!(!cache.order_exists(&client_order_id));
+    assert_eq!(cache.positions_total_count(None, None, None, None, None), 0,);
+    assert_eq!(execution_engine.event_count(), 0);
+    assert_eq!(
+        execution_engine.filtered_unclaimed_external_order_count(),
+        1,
+    );
+}
+
+#[rstest]
+fn test_reset_clears_filtered_unclaimed_external_order_count() {
+    let mut execution_engine = execution_engine_with_unclaimed_external_order_filter(true);
+    let instrument = audusd_sim();
+
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(instrument.clone()))
+        .unwrap();
+
+    let report = create_order_status_report(
+        Some(ClientOrderId::from("O-RESET-FILTER")),
+        VenueOrderId::from("V-RESET-FILTER"),
+        instrument.id(),
+        OrderStatus::Accepted,
+        Quantity::from(50_000),
+        Quantity::from(0),
+    );
+
+    execution_engine.reconcile_order_status_report(&report);
+    assert_eq!(
+        execution_engine.filtered_unclaimed_external_order_count(),
+        1,
+    );
+
+    execution_engine.reset();
+
+    assert_eq!(
+        execution_engine.filtered_unclaimed_external_order_count(),
+        0,
+    );
+}
+
+fn execution_engine_with_unclaimed_external_order_filter(
+    filter_unclaimed_external_orders: bool,
+) -> ExecutionEngine {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = ExecutionEngineConfig {
+        filter_unclaimed_external_orders,
+        ..Default::default()
+    };
+    ExecutionEngine::new(clock, cache, Some(config))
 }
 
 #[rstest]

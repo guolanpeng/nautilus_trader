@@ -42,18 +42,19 @@ use nautilus_indicators::{
 use nautilus_model::{
     accounts::{Account, AccountAny},
     data::{
-        Bar, BarSpecification, BarType, BookOrder, Data, FundingRateUpdate, MarkPriceUpdate,
-        OrderBookDelta, QuoteTick, TradeTick,
+        Bar, BarSpecification, BarType, BookOrder, Data, FundingRateUpdate, InstrumentClose,
+        MarkPriceUpdate, OrderBookDelta, QuoteTick, TradeTick,
     },
     enums::{
         AccountType, AggregationSource, AggressorSide, AssetClass, BarAggregation, BookAction,
-        BookType, OmsType, OptionKind, OrderSide, PositionAdjustmentType, PriceType,
+        BookType, InstrumentCloseType, OmsType, OptionKind, OrderSide, PositionAdjustmentType,
+        PriceType,
     },
-    events::OrderFilled,
+    events::{OrderEventAny, OrderFilled},
     identifiers::{ActorId, ExecAlgorithmId, InstrumentId, StrategyId, Symbol, TradeId, Venue},
     instruments::{
         CryptoPerpetual, Equity, Instrument, InstrumentAny, OptionContract,
-        stubs::crypto_perpetual_ethusdt,
+        stubs::{crypto_perpetual_ethusdt, default_fx_ccy},
     },
     orders::{Order, OrderAny},
     position::Position,
@@ -65,6 +66,7 @@ use nautilus_trading::{
     ExecutionAlgorithmCore, Strategy, StrategyConfig, StrategyCore, nautilus_strategy,
 };
 use rstest::*;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use ustr::Ustr;
 struct EmptyStrategy {
     core: StrategyCore,
@@ -344,6 +346,11 @@ impl Debug for OpenOptionOnQuote {
 impl DataActor for OpenOptionOnQuote {
     fn on_start(&mut self) -> anyhow::Result<()> {
         self.subscribe_quotes(self.instrument_id, None, None);
+        Ok(())
+    }
+
+    fn on_reset(&mut self) -> anyhow::Result<()> {
+        self.opened = false;
         Ok(())
     }
 
@@ -855,6 +862,24 @@ fn create_engine() -> BacktestEngine {
         .account_type(AccountType::Margin)
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .build();
+    engine.add_venue(venue_config).unwrap();
+    engine
+}
+
+fn create_eur_base_margin_engine() -> BacktestEngine {
+    let config = BacktestEngineConfig {
+        bypass_logging: true,
+        ..Default::default()
+    };
+    let mut engine = BacktestEngine::new(config).unwrap();
+    let venue_config = SimulatedVenueConfig::builder()
+        .venue(Venue::from("BINANCE"))
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Margin)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::from("1_000_000 EUR")])
+        .base_currency(Currency::EUR())
         .build();
     engine.add_venue(venue_config).unwrap();
     engine
@@ -1415,6 +1440,81 @@ fn test_run_processes_scheduled_funding_settlement(crypto_perpetual_ethusdt: Cry
 }
 
 #[rstest]
+fn test_simulated_venue_config_settlement_prices_used_on_instrument_close(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+) {
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    let settlement_price = Price::from("1010.00");
+    let venue = Venue::from("BINANCE");
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    let venue_config = SimulatedVenueConfig::builder()
+        .venue(venue)
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Margin)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .settlement_prices([(instrument_id, settlement_price)].into_iter().collect())
+        .build();
+    engine.add_venue(venue_config).unwrap();
+    engine.add_instrument(&instrument).unwrap();
+    engine
+        .add_strategy(OpenOptionOnQuote::new(
+            instrument_id,
+            Quantity::from("1.000"),
+        ))
+        .unwrap();
+
+    let data = vec![
+        quote(instrument_id, "1000.00", "1001.00", 1_000_000_000),
+        Data::InstrumentClose(InstrumentClose::new(
+            instrument_id,
+            Price::from("1005.00"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(2_000_000_000),
+            UnixNanos::from(2_000_000_000),
+        )),
+    ];
+    engine.add_data(data, None, true, true).unwrap();
+    engine.run(None, None, None, false).unwrap();
+
+    assert_eq!(
+        expiration_fill_price(&engine, venue, instrument_id),
+        settlement_price
+    );
+
+    engine.reset();
+    engine.run(None, None, None, false).unwrap();
+
+    assert_eq!(
+        expiration_fill_price(&engine, venue, instrument_id),
+        settlement_price
+    );
+}
+
+fn expiration_fill_price(
+    engine: &BacktestEngine,
+    venue: Venue,
+    instrument_id: InstrumentId,
+) -> Price {
+    let cache = engine.kernel().cache.borrow();
+    let closed_orders = cache.orders_closed(Some(&venue), Some(&instrument_id), None, None, None);
+    let expiration_fill = closed_orders
+        .iter()
+        .find_map(|order| match order.last_event() {
+            OrderEventAny::Filled(fill)
+                if fill.client_order_id.as_str().starts_with("EXPIRATION-") =>
+            {
+                Some(*fill)
+            }
+            _ => None,
+        })
+        .expect("expected expiration fill");
+
+    expiration_fill.last_px
+}
+
+#[rstest]
 fn test_get_result_includes_snapshot_position_history(crypto_perpetual_ethusdt: CryptoPerpetual) {
     let mut engine = create_engine();
     let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
@@ -1521,6 +1621,73 @@ fn test_get_result_includes_snapshot_position_history(crypto_perpetual_ethusdt: 
     assert!(
         (expectancy - expected_expectancy).abs() < 1e-9,
         "expected Expectancy={expected_expectancy} to include snapshot history {snapshots_realized}, found {expectancy}"
+    );
+}
+
+#[rstest]
+fn test_get_result_uses_recorded_account_currency_pnls(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    let mut engine = create_eur_base_margin_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    let xrate_instrument = InstrumentAny::CurrencyPair(default_fx_ccy(
+        Symbol::from("USDT/EUR"),
+        Some(Venue::from("BINANCE")),
+    ));
+    let xrate_instrument_id = xrate_instrument.id();
+
+    engine.add_instrument(&instrument).unwrap();
+    engine.add_instrument(&xrate_instrument).unwrap();
+    engine
+        .add_strategy(SnapshotNettingFlip::new(
+            instrument_id,
+            Quantity::from("1.000"),
+        ))
+        .unwrap();
+
+    let quotes = vec![
+        quote_with_size(xrate_instrument_id, "0.90000", "0.90000", "1", 500_000_000),
+        quote(instrument_id, "1000.00", "1001.00", 1_000_000_000),
+        quote(instrument_id, "1000.00", "1001.00", 2_000_000_000),
+        quote(instrument_id, "1010.00", "1011.00", 3_000_000_000),
+        quote(instrument_id, "1010.00", "1011.00", 4_000_000_000),
+    ];
+    engine.add_data(quotes, None, true, true).unwrap();
+    engine.run(None, None, None, false).unwrap();
+
+    let expected_eur_pnl = {
+        let cache = engine.kernel().cache.borrow();
+        let positions = cache.positions(None, Some(&instrument_id), None, None, None);
+        let [position] = positions.as_slice() else {
+            panic!("expected one cached position");
+        };
+        let realized_pnl = position
+            .realized_pnl
+            .as_ref()
+            .expect("closed position should have realized PnL");
+
+        assert!(position.is_closed());
+        assert_eq!(realized_pnl.currency, Currency::USDT());
+
+        (realized_pnl.as_decimal() * Decimal::new(9, 1))
+            .round_dp(u32::from(Currency::EUR().precision))
+    };
+
+    let bt_result = engine.get_result();
+    let eur_stats = bt_result
+        .stats_pnls
+        .get("EUR")
+        .expect("EUR PnL stats must exist");
+    let expectancy = eur_stats
+        .get("Expectancy")
+        .copied()
+        .expect("Expectancy must use recorded EUR realized PnL");
+    let expected = expected_eur_pnl
+        .to_f64()
+        .expect("expected EUR PnL should fit f64");
+
+    assert!(
+        (expectancy - expected).abs() < 1e-9,
+        "expected EUR Expectancy={expected} from recorded account-currency PnL, found {expectancy}"
     );
 }
 

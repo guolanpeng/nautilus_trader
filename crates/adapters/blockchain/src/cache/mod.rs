@@ -398,6 +398,29 @@ impl BlockchainCache {
         Ok(())
     }
 
+    /// Adds block timestamps observed while streaming pool events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if adding the block timestamps to the database fails.
+    pub async fn add_pool_event_blocks_batch(&mut self, blocks: Vec<Block>) -> anyhow::Result<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(database) = &self.database {
+            database
+                .add_pool_event_blocks_batch(self.chain.chain_id, &blocks)
+                .await?;
+        }
+
+        for block in blocks {
+            self.block_timestamps.insert(block.number, block.timestamp);
+        }
+
+        Ok(())
+    }
+
     /// Adds a DEX to the cache with the specified identifier.
     ///
     /// # Errors
@@ -863,7 +886,7 @@ impl BlockchainCache {
         pool_identifier: &PoolIdentifier,
     ) -> anyhow::Result<Option<u64>> {
         if let Some(database) = &self.database {
-            let (swaps_last_block, liquidity_last_block, collect_last_block) = tokio::try_join!(
+            let (swaps_last_block, liquidity_last_block, collect_last_block, flash_last_block) = tokio::try_join!(
                 database.get_table_last_block(
                     self.chain.chain_id,
                     "pool_swap_event",
@@ -879,12 +902,22 @@ impl BlockchainCache {
                     "pool_collect_event",
                     pool_identifier
                 ),
+                database.get_table_last_block(
+                    self.chain.chain_id,
+                    "pool_flash_event",
+                    pool_identifier
+                ),
             )?;
 
-            let max_block = [swaps_last_block, liquidity_last_block, collect_last_block]
-                .into_iter()
-                .flatten()
-                .max();
+            let max_block = [
+                swaps_last_block,
+                liquidity_last_block,
+                collect_last_block,
+                flash_last_block,
+            ]
+            .into_iter()
+            .flatten()
+            .max();
             Ok(max_block)
         } else {
             Ok(None)

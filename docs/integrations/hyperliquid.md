@@ -29,19 +29,82 @@ and won't need to work directly with these lower-level components.
 
 You can find live example scripts [here](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/hyperliquid/).
 
-## Builder address
+## Builder code attribution
 
-Mainnet orders submitted through the adapter include a NautilusTrader builder address with a
-**zero fee rate**, so it adds no trading cost to your orders. This helps us gauge real usage of
-the integration and prioritize ongoing maintenance and improvements.
+Submitted mainnet orders carry the NautilusTrader builder code at a **zero fee rate**, so
+attribution adds no trading cost. This helps us gauge real usage of the integration and
+prioritize ongoing maintenance. Users who attribute order flow may also qualify for direct
+support through the [Institutional](https://nautilustrader.io/institutional/) tier when trading
+at scale.
 
-The builder address is omitted from orders in two cases:
+You may opt out of attribution with `include_builder_attribution: false` in serialized config,
+or `include_builder_attribution=False` in Python.
 
-- **Testnet.** Hyperliquid testnet rejects orders that include a builder address the wallet has
+The builder address is omitted from orders in three cases:
+
+- **Testnet**: Hyperliquid testnet rejects orders that include a builder address the wallet has
   not explicitly approved (faucet-funded testnet wallets typically have no approval), so testnet
   orders never include the builder.
-- **Vault trading** (`vault_address` configured). Hyperliquid does not allow vaults to approve
+- **Vault trading** (`vault_address` configured): Hyperliquid does not allow vaults to approve
   builder fees, so including the builder address would cause the exchange to reject the order.
+- **Attribution disabled** (`include_builder_attribution=False`): Users who choose not to
+  attribute their order flow can disable builder attribution explicitly.
+
+```python
+from nautilus_trader.adapters.hyperliquid import HyperliquidExecClientConfig
+
+config = HyperliquidExecClientConfig(
+    include_builder_attribution=False,
+)
+```
+
+### Builder fee approval
+
+Hyperliquid requires a one-time `ApproveBuilderFee` approval before orders can carry the builder
+address: orders from a wallet that has never approved a builder fee are rejected with the reason
+`Builder fee has not been approved` (any prior approval, including at a 0% rate, satisfies the
+check). The approval must be signed by the master wallet's private key, which the adapter does
+not hold in agent (API) wallet setups, so it runs as a one-time script rather than at execution
+client startup. The 0% max fee rate permits attribution only: no builder fee is ever charged,
+and raising the rate would require a new approval signed by you.
+
+Run the approval script once per wallet (reads `HYPERLIQUID_PK`, or `HYPERLIQUID_TESTNET_PK`
+with `HYPERLIQUID_TESTNET=true`):
+
+```bash
+cargo run -p nautilus-hyperliquid --bin hyperliquid-builder-fee-approve
+```
+
+Or from Python:
+
+```python
+from nautilus_trader.adapters.hyperliquid import builder_fee_approve
+
+builder_fee_approve()
+```
+
+### Revoking the approval
+
+Use revocation to cap a previously approved builder fee at 0% (for example, an approval from a
+version that charged builder fees). Revocation caps the fee; it does not remove the approval
+record, so attribution continues unless `include_builder_attribution` is disabled.
+
+```bash
+cargo run -p nautilus-hyperliquid --bin hyperliquid-builder-fee-revoke
+```
+
+Or from Python:
+
+```python
+from nautilus_trader.adapters.hyperliquid import builder_fee_revoke
+
+builder_fee_revoke()
+```
+
+The Rust scripts print a summary of the action and pause for an Enter keypress before signing;
+abort with `Ctrl+C` if anything in the summary looks wrong, or pass `--yes` to skip the prompt.
+The Python bindings do not prompt: review the active environment variables yourself before
+calling.
 
 ## Testnet setup
 
@@ -1125,6 +1188,7 @@ match the venue limit.
 | `retry_delay_max_ms`           | `None`    | Maximum delay (milliseconds) between retries. Rust‑only. |
 | `http_timeout_secs`            | `10`      | Timeout (seconds) applied to REST calls. |
 | `normalize_prices`             | `True`    | Normalize order prices to 5 significant figures before submission. |
+| `include_builder_attribution`  | `True`    | Include zero‑fee Nautilus builder attribution on eligible mainnet orders. |
 | `market_order_slippage_bps`    | `50`      | Slippage buffer (bps) applied to MARKET and stop trigger derivations. Rust‑only. |
 | `outcome_settlement_poll_secs` | `0`       | HIP‑4 `outcomeMeta` settlement poll interval (seconds). Rust‑only; venue `Settlement` fills cover settlement, so polling is disabled by default. |
 | `proxy_url`                    | `None`    | Optional proxy URL for HTTP and WebSocket transports. |

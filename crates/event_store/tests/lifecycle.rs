@@ -68,7 +68,7 @@ use nautilus_model::{
     orders::{Order, OrderAny, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
     position::Position,
     stubs::TestDefault,
-    types::{Currency, Quantity},
+    types::{Currency, Money, Quantity},
 };
 use nautilus_system::{KernelEventStore, NautilusKernelBuilder};
 use rstest::rstest;
@@ -108,6 +108,7 @@ fn config_with(base_dir: PathBuf) -> EventStoreConfig {
         },
         retention: RetentionMode::Full,
         replay_from_run_id: None,
+        data_markers: None,
         channel_capacity: 64,
         max_batch_entries: 1,
         max_batch_latency: Duration::from_millis(2),
@@ -1272,7 +1273,7 @@ impl CacheDatabaseAdapter for StubCacheDatabase {
         Ok(AHashMap::new())
     }
 
-    fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, Position>> {
+    fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, PositionId>> {
         Ok(AHashMap::new())
     }
 
@@ -1494,7 +1495,12 @@ impl CacheDatabaseAdapter for StubCacheDatabase {
         Ok(())
     }
 
-    fn snapshot_position_state(&self, _position: &Position) -> anyhow::Result<()> {
+    fn snapshot_position_state(
+        &self,
+        _position: &Position,
+        _ts_snapshot: UnixNanos,
+        _unrealized_pnl: Option<Money>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
