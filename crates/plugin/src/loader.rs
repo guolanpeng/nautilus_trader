@@ -38,7 +38,7 @@ use crate::{
     host::{HostContext, HostLogLevel, HostVTable},
     manifest::{
         PluginBuildId, PluginInitFn, PluginManifest, PluginManifestValidationErrors,
-        ValidatedPluginManifest,
+        ValidatedCustomDataRegistration, ValidatedPluginManifest,
     },
     surfaces::commands::{
         CancelAllOrdersHandle, CancelOrderHandle, CancelOrdersHandle, CloseAllPositionsHandle,
@@ -265,7 +265,7 @@ impl Debug for LoadedPlugin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(LoadedPlugin))
             .field("path", &self.path)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -355,6 +355,11 @@ impl PluginLoader {
     }
 
     /// Loads every plug-in path in order. Stops on the first error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`LoadError`] raised while loading the provided
+    /// paths.
     pub fn load_all<P>(&mut self, paths: impl IntoIterator<Item = P>) -> Result<(), LoadError>
     where
         P: AsRef<OsStr>,
@@ -366,6 +371,12 @@ impl PluginLoader {
     }
 
     /// Loads a single plug-in cdylib.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LoadError`] if the library cannot be opened, the init
+    /// symbol is missing, the manifest is invalid, or the manifest conflicts
+    /// with an already loaded plug-in.
     pub fn load(&mut self, path: impl AsRef<OsStr>) -> Result<&LoadedPlugin, LoadError> {
         let path_buf = PathBuf::from(path.as_ref());
 
@@ -402,7 +413,10 @@ impl PluginLoader {
         validate_build_pinning(manifest, &path_buf, self.allow_build_mismatch)?;
 
         let collision = {
-            let new_types: Vec<&str> = manifest.custom_data().map(|e| e.type_name()).collect();
+            let new_types: Vec<&str> = manifest
+                .custom_data()
+                .map(ValidatedCustomDataRegistration::type_name)
+                .collect();
             let existing: Vec<(&str, &Path)> = self
                 .loaded
                 .iter()
@@ -441,12 +455,13 @@ impl PluginLoader {
             path_buf.display(),
         );
 
+        let loaded_index = self.loaded.len();
         self.loaded.push(LoadedPlugin {
             path: path_buf,
             _library: library,
             manifest,
         });
-        Ok(self.loaded.last().expect("just pushed"))
+        Ok(&self.loaded[loaded_index])
     }
 
     /// Returns every loaded plug-in in load order.
@@ -643,6 +658,11 @@ fn host_vtable() -> *const HostVTable {
         close_all_positions: host_close_all_positions_unbound,
         query_account: host_query_account_unbound,
         query_order: host_query_order_unbound,
+        trader_id: host_trader_id_unbound,
+        strategy_id: host_strategy_id_unbound,
+        component_state: host_component_state_unbound,
+        generate_client_order_id: host_generate_client_order_id_unbound,
+        generate_order_list_id: host_generate_order_list_id_unbound,
     }))
 }
 
@@ -666,6 +686,15 @@ macro_rules! unbound_bytes_fn {
 macro_rules! unbound_unit_fn {
     ($name:ident, $message:literal, ($($arg:ident : $ty:ty),* $(,)?)) => {
         unsafe extern "C" fn $name($($arg: $ty),*) -> PluginResult<()> {
+            $(let _ = $arg;)*
+            PluginResult::Err(PluginError::new(PluginErrorCode::NotImplemented, $message))
+        }
+    };
+}
+
+macro_rules! unbound_u8_fn {
+    ($name:ident, $message:literal, ($($arg:ident : $ty:ty),* $(,)?)) => {
+        unsafe extern "C" fn $name($($arg: $ty),*) -> PluginResult<u8> {
             $(let _ = $arg;)*
             PluginResult::Err(PluginError::new(PluginErrorCode::NotImplemented, $message))
         }
@@ -701,6 +730,31 @@ unbound_bytes_fn!(
     host_cache_positions_for_strategy_unbound,
     "cache_positions_for_strategy is not wired into this host vtable",
     (ctx: *const HostContext, strategy_id: BorrowedStr<'_>)
+);
+unbound_bytes_fn!(
+    host_trader_id_unbound,
+    "trader_id is not wired into this host vtable",
+    (ctx: *const HostContext)
+);
+unbound_bytes_fn!(
+    host_strategy_id_unbound,
+    "strategy_id is not wired into this host vtable",
+    (ctx: *const HostContext)
+);
+unbound_u8_fn!(
+    host_component_state_unbound,
+    "component_state is not wired into this host vtable",
+    (ctx: *const HostContext)
+);
+unbound_bytes_fn!(
+    host_generate_client_order_id_unbound,
+    "generate_client_order_id is not wired into this host vtable",
+    (ctx: *const HostContext)
+);
+unbound_bytes_fn!(
+    host_generate_order_list_id_unbound,
+    "generate_order_list_id is not wired into this host vtable",
+    (ctx: *const HostContext)
 );
 
 unbound_unit_fn!(
@@ -1635,14 +1689,65 @@ mod tests {
             _ => unreachable!(),
         };
 
-        let err = match r.into_result() {
-            Ok(_) => panic!("{method} unexpectedly succeeded"),
-            Err(e) => e,
+        let Err(e) = r.into_result() else {
+            panic!("{method} unexpectedly succeeded");
         };
-        assert_eq!(err.code, PluginErrorCode::NotImplemented);
+        assert_eq!(e.code, PluginErrorCode::NotImplemented);
         assert_eq!(
-            err.message_string(),
+            e.message_string(),
             format!("{method} is not wired into this host vtable")
+        );
+    }
+
+    #[rstest]
+    #[case::trader_id("trader_id")]
+    #[case::strategy_id("strategy_id")]
+    #[case::generate_client_order_id("generate_client_order_id")]
+    #[case::generate_order_list_id("generate_order_list_id")]
+    fn host_context_bytes_stubs_return_not_implemented(#[case] method: &str) {
+        let p = host_vtable();
+        // SAFETY: pointer is to a static `OnceLock`-backed HostVTable.
+        let v = unsafe { &*p };
+        let ctx = std::ptr::null::<HostContext>();
+
+        let r = match method {
+            // SAFETY: stubs do not dereference ctx.
+            "trader_id" => unsafe { (v.trader_id)(ctx) },
+            // SAFETY: see above.
+            "strategy_id" => unsafe { (v.strategy_id)(ctx) },
+            // SAFETY: see above.
+            "generate_client_order_id" => unsafe { (v.generate_client_order_id)(ctx) },
+            // SAFETY: see above.
+            "generate_order_list_id" => unsafe { (v.generate_order_list_id)(ctx) },
+            _ => unreachable!(),
+        };
+
+        let Err(e) = r.into_result() else {
+            panic!("{method} unexpectedly succeeded");
+        };
+        assert_eq!(e.code, PluginErrorCode::NotImplemented);
+        assert_eq!(
+            e.message_string(),
+            format!("{method} is not wired into this host vtable")
+        );
+    }
+
+    #[rstest]
+    fn host_component_state_stub_returns_not_implemented() {
+        let p = host_vtable();
+        // SAFETY: pointer is to a static `OnceLock`-backed HostVTable.
+        let v = unsafe { &*p };
+        let ctx = std::ptr::null::<HostContext>();
+
+        // SAFETY: stub does not dereference ctx.
+        let r = unsafe { (v.component_state)(ctx) };
+        let Err(e) = r.into_result() else {
+            panic!("component_state unexpectedly succeeded");
+        };
+        assert_eq!(e.code, PluginErrorCode::NotImplemented);
+        assert_eq!(
+            e.message_string(),
+            "component_state is not wired into this host vtable"
         );
     }
 

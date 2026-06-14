@@ -50,8 +50,8 @@ use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     data::{
         Bar, FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus,
-        MarkPriceUpdate, OptionChainSlice, OptionGreeks, OrderBookDelta, OrderBookDeltas,
-        OrderBookDepth10, QuoteTick, TradeTick,
+        MarkPriceUpdate, OptionChainSlice, OptionGreekValues, OptionGreeks, OrderBookDelta,
+        OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
         stubs::{
             stub_bar, stub_deltas, stub_depth10, stub_instrument_close, stub_instrument_status,
             stub_trade_ethusdt_buyer,
@@ -568,12 +568,11 @@ fn custom_data_from_json_thunk_propagates_failure(#[case] mode: Mode) {
     let r = unsafe { generated_slot!(vt, from_json)(payload) };
     // from_json returns *mut CustomDataHandle, not OwnedBytes, so it has
     // Debug; use the plain helper anyway for symmetry.
-    let err = match r.into_result() {
-        Ok(_) => panic!("expected an error from from_json"),
-        Err(e) => e,
+    let Err(e) = r.into_result() else {
+        panic!("expected an error from from_json");
     };
     assert_failure_code(
-        &err,
+        &e,
         mode,
         PluginErrorCode::Panic,
         PluginErrorCode::SerializationFailed,
@@ -650,7 +649,10 @@ fn custom_data_to_json_thunk_propagates_failure(#[case] mode: Mode) {
 
 // `On` prefix mirrors the trait method names; clippy's
 // `enum_variant_names` would otherwise object to the shared prefix.
-#[allow(clippy::enum_variant_names)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variants mirror actor hook method names"
+)]
 #[derive(Clone, Copy, Debug)]
 enum ActorThunkUnderTest {
     OnStart,
@@ -688,6 +690,10 @@ enum ActorThunkUnderTest {
     OnHistoricalFundingRates,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "test dispatch table covers every actor thunk in one auditable match"
+)]
 fn drive_actor_thunk(thunk: ActorThunkUnderTest) -> PluginResult<()> {
     // SAFETY: vtable lives for the process lifetime.
     let vt = unsafe { &*actor_vtable::<MisbehavingActor>() };
@@ -938,7 +944,10 @@ fn actor_thunk_propagates_failure(#[case] thunk: ActorThunkUnderTest, #[case] mo
 }
 
 // See note above on ActorThunkUnderTest regarding the `On` prefix lint.
-#[allow(clippy::enum_variant_names)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variants mirror strategy hook method names"
+)]
 #[derive(Clone, Copy, Debug)]
 enum StrategyThunkUnderTest {
     OnStart,
@@ -994,6 +1003,10 @@ enum StrategyThunkUnderTest {
     OnHistoricalFundingRates,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "test dispatch table covers every strategy thunk in one auditable match"
+)]
 fn drive_strategy_thunk(thunk: StrategyThunkUnderTest) -> PluginResult<()> {
     // SAFETY: vtable lives for the process lifetime.
     let vt = unsafe { &*strategy_vtable::<MisbehavingStrategy>() };
@@ -1380,8 +1393,6 @@ fn strategy_thunk_propagates_failure(#[case] thunk: StrategyThunkUnderTest, #[ca
     assert_failure_code(&err, mode, PluginErrorCode::Panic, PluginErrorCode::Generic);
 }
 
-// See note above on ActorThunkUnderTest regarding the `On` prefix lint.
-#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug)]
 enum ControllerThunkUnderTest {
     Prepare,
@@ -1558,7 +1569,7 @@ fn option_greeks_value() -> OptionGreeks {
     OptionGreeks {
         instrument_id: instrument_id(),
         convention: GreeksConvention::BlackScholes,
-        greeks: Default::default(),
+        greeks: OptionGreekValues::default(),
         mark_iv: Some(0.25),
         bid_iv: Some(0.24),
         ask_iv: Some(0.26),

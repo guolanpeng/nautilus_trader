@@ -8749,6 +8749,12 @@ class OKXHttpClient:
         new_callback_ratio: str | None = None,
         new_callback_spread: str | None = None,
         new_activation_price: Price | None = None,
+        new_sl_trigger_price: Price | None = None,
+        new_tp_trigger_price: Price | None = None,
+        new_tp_order_price: str | None = None,
+        new_tp_trigger_px_type: str | None = None,
+        new_sl_order_price: str | None = None,
+        new_sl_trigger_px_type: str | None = None,
     ) -> Any: ...
     async def cancel_advance_algo_order(
         self,
@@ -10562,6 +10568,10 @@ class PortfolioAnalyzer:
     def get_performance_stats_returns(self) -> dict[str, float]: ...
     def get_performance_stats_position_returns(self) -> dict[str, float]: ...
     def get_performance_stats_portfolio_returns(self) -> dict[str, float]: ...
+    def get_performance_stats_returns_vs_benchmark(
+        self,
+        benchmark: dict[int, float],
+    ) -> dict[str, float]: ...
     def get_performance_stats_pnls(
         self,
         currency: Currency | None = None,
@@ -10644,6 +10654,64 @@ class MaxDrawdown:
     @property
     def name(self) -> str: ...
     def calculate_from_returns(self, returns: dict[int, float]) -> float | None: ...
+
+class Alpha:
+    def __init__(
+        self,
+        period: int | None = None,
+        risk_free_rate: float | None = None,
+    ) -> None: ...
+    @property
+    def name(self) -> str: ...
+    def calculate_from_returns_with_benchmark(
+        self,
+        returns: dict[int, float],
+        benchmark: dict[int, float],
+    ) -> float | None: ...
+
+class BetaRatio:
+    def __init__(self) -> None: ...
+    @property
+    def name(self) -> str: ...
+    def calculate_from_returns_with_benchmark(
+        self,
+        returns: dict[int, float],
+        benchmark: dict[int, float],
+    ) -> float | None: ...
+
+class InformationRatio:
+    def __init__(self, period: int | None = None) -> None: ...
+    @property
+    def name(self) -> str: ...
+    def calculate_from_returns_with_benchmark(
+        self,
+        returns: dict[int, float],
+        benchmark: dict[int, float],
+    ) -> float | None: ...
+
+class TrackingError:
+    def __init__(self, period: int | None = None) -> None: ...
+    @property
+    def name(self) -> str: ...
+    def calculate_from_returns_with_benchmark(
+        self,
+        returns: dict[int, float],
+        benchmark: dict[int, float],
+    ) -> float | None: ...
+
+class TreynorRatio:
+    def __init__(
+        self,
+        period: int | None = None,
+        risk_free_rate: float | None = None,
+    ) -> None: ...
+    @property
+    def name(self) -> str: ...
+    def calculate_from_returns_with_benchmark(
+        self,
+        returns: dict[int, float],
+        benchmark: dict[int, float],
+    ) -> float | None: ...
 
 class WinRate:
     def __init__(self) -> None: ...

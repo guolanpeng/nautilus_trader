@@ -49,7 +49,7 @@ use nautilus_trading::{
 };
 use pyo3::{
     prelude::*,
-    types::{PyDict, PyTuple},
+    types::{PyCFunction, PyDict, PyTuple},
 };
 use serde_json;
 
@@ -144,10 +144,8 @@ impl LiveNode {
 
         // Set up a custom signal handler that uses our handle
         let handle_for_signal = handle;
-        let signal_callback = pyo3::types::PyCFunction::new_closure(
+        let signal_callback = new_sync_py_callback(
             py,
-            None,
-            None,
             move |_args: &pyo3::Bound<'_, PyTuple>,
                   _kwargs: Option<&pyo3::Bound<'_, PyDict>>|
                   -> PyResult<()> {
@@ -736,6 +734,13 @@ impl LiveNode {
     }
 }
 
+fn new_sync_py_callback<F>(py: Python<'_>, closure: F) -> PyResult<Bound<'_, PyCFunction>>
+where
+    F: Fn(&Bound<'_, PyTuple>, Option<&Bound<'_, PyDict>>) -> PyResult<()> + Send + Sync + 'static,
+{
+    PyCFunction::new_closure(py, None, None, closure)
+}
+
 #[allow(unsafe_code)]
 fn run_live_node_detached(py: Python<'_>, node: &mut LiveNode) -> PyResult<()> {
     let node_ptr = SendPtr(std::ptr::from_mut::<LiveNode>(node));
@@ -1246,9 +1251,7 @@ fn create_config_instance<'py>(
     let py_dict = PyDict::new(py);
 
     for (key, value) in config {
-        let json_str = serde_json::to_string(value)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize config value: {e}"))?;
-        let py_value = PyModule::import(py, "json")?.call_method("loads", (json_str,), None)?;
+        let py_value = config_value_to_py(py, key, value)?;
         py_dict.set_item(key, py_value)?;
     }
 
@@ -1267,14 +1270,7 @@ fn create_config_instance<'py>(
                 Ok(instance) => {
                     log::debug!("Created default config instance, setting attributes");
                     for (key, value) in config {
-                        let json_str = serde_json::to_string(value).map_err(|e| {
-                            anyhow::anyhow!("Failed to serialize config value: {e}")
-                        })?;
-                        let py_value = PyModule::import(py, "json")?.call_method(
-                            "loads",
-                            (json_str,),
-                            None,
-                        )?;
+                        let py_value = config_value_to_py(py, key, value)?;
 
                         if let Err(setattr_err) = instance.setattr(key, py_value) {
                             log::warn!("Failed to set attribute {key}: {setattr_err}");
@@ -1302,6 +1298,26 @@ fn create_config_instance<'py>(
     log::debug!("Created config instance: {config_instance:?}");
 
     Ok(Some(config_instance))
+}
+
+fn config_value_to_py<'py>(
+    py: Python<'py>,
+    key: &str,
+    value: &serde_json::Value,
+) -> anyhow::Result<Bound<'py, PyAny>> {
+    if key == "actor_id"
+        && let Some(actor_id) = value.as_str()
+    {
+        return Ok(ActorId::new_checked(actor_id)?
+            .into_pyobject(py)?
+            .into_any());
+    }
+
+    let json_str = serde_json::to_string(value)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize config value: {e}"))?;
+    Ok(PyModule::import(py, "json")?
+        .call_method("loads", (json_str,), None)?
+        .into_any())
 }
 
 /// Extracts an optional boolean attribute from a Python config object.

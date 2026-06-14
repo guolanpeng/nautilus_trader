@@ -168,7 +168,7 @@ binding does not prompt: review the active env vars yourself before calling.
 | Trade ticks          | ✓            | -        | ✓     | `TradeTick`         | WebSocket trades; historical REST trades require auth. |
 | Quote ticks          | ✓            | -        | -     | `QuoteTick`         | Best bid and ask ticker stream.                        |
 | Order book deltas    | ✓            | ✓        | -     | `OrderBookDeltas`   | `L2_MBP` only.                                         |
-| Order book depth10   | ✓            | ✓        | -     | `OrderBookDepth10`  | Full WebSocket book snapshots.                         |
+| Order book depth10   | ✓            | ✓        | -     | `OrderBookDepth10`  | Live top-10 view from maintained book state.           |
 | Order book snapshots | -            | ✓        | -     | `OrderBook`         | REST snapshot, max depth 250.                          |
 | Mark prices          | ✓            | -        | -     | `MarkPriceUpdate`   | Perp market stats stream.                              |
 | Index prices         | ✓            | -        | -     | `IndexPriceUpdate`  | Market and spot stats streams.                         |
@@ -182,6 +182,9 @@ return an error before subscribing.
 The WebSocket order book initializes only from `subscribed/order_book`. If an `update/order_book`
 arrives before that snapshot, the adapter drops it and waits for the real snapshot because
 incremental updates do not contain the full visible book.
+
+Depth10 subscriptions use the same WebSocket `order_book` stream as deltas. The adapter emits a
+refreshed top-10 view after each accepted snapshot or incremental update.
 
 Bar subscriptions use the venue's `candle/{market_id}/{resolution}` WebSocket channel. Lighter
 batches in-progress updates for the open bar every ~500 ms; the adapter emits a Nautilus `Bar`
@@ -213,8 +216,8 @@ WebSocket `ticker` stream, but the REST endpoints available to the adapter do no
 timestamped quote snapshot or quote history that can map safely to `QuoteTick`.
 
 `request_book_depth` is not implemented. The documented REST book endpoints do not provide a
-venue event timestamp for `OrderBookDepth10.ts_event`; use `subscribe_book_depth10` for live
-depth10 snapshots or `request_book_snapshot` for a REST `OrderBook` snapshot.
+venue event timestamp for `OrderBookDepth10.ts_event`; use `subscribe_book_depth10` for a live
+depth10 stream or `request_book_snapshot` for a REST `OrderBook` snapshot.
 
 ## Orders capability
 
@@ -388,7 +391,7 @@ submitting a signed tx to Lighter mainnet that the sequencer accepted.
 | Trade history        | ✓          | ✓    | REST `trades`; credentials are required for account history. |
 | Fill reports         | ✓          | ✓    | REST and private WebSocket trade payloads.                   |
 | Position reports     | ✓          | -    | Perp only; replays cached position stream.                   |
-| Account state        | ✓          | ✓    | Replays the cached `account_all_assets` stream.              |
+| Account state        | ✓          | ✓    | Replays the cached merged account state snapshot.            |
 | Mass status          | ✓          | ✓    | Combines orders, fills, and cached positions.                |
 
 ## Account and position management
@@ -398,7 +401,11 @@ Authenticated execution clients subscribe to these private streams:
 - `account_all_orders`: order status reports.
 - `account_all_trades`: fill reports.
 - `account_all_positions`: position snapshots.
-- `account_all_assets`: account balance and margin snapshots.
+- `account_all_assets`: per-asset balance snapshots (spot balance plus perp collateral).
+- `user_stats`: perp-account margin rollup (collateral and available balance).
+
+The adapter merges `account_all_assets` and `user_stats` into a single account state and emits it
+only after both streams have delivered their first frame.
 
 The execution client requires credentials before connecting because private account streams and
 nonce refresh are mandatory. A client can be constructed without credentials, but live execution
@@ -412,7 +419,7 @@ previously cached market, the adapter emits a flat position report for that inst
 
 | Feature                 | Perpetuals | Spot | Notes                                                        |
 |-------------------------|------------|------|--------------------------------------------------------------|
-| Account balances        | ✓          | ✓    | `account_all_assets` stream, replayed from cache on query.   |
+| Account balances        | ✓          | ✓    | Merged assets + `user_stats`, replayed from cache on query.  |
 | Position snapshots      | ✓          | -    | Perp only; `account_all_positions` stream.                   |
 | Netting positions       | ✓          | -    | One Nautilus position per perpetual market.                  |
 | Cross margin            | ✓          | -    | Passed through `LighterPositionMarginMode::Cross`.           |
@@ -528,8 +535,8 @@ allocation window, and rejected or failed transactions roll back or trigger a re
 `GET /api/v1/nextNonce`, so order flow recovers from nonce desyncs without a reconnect.
 
 `LighterExecutionClient::connect()` waits up to 30 seconds for every account stream
-(`account_all_orders`, `account_all_trades`, `account_all_positions`, `account_all_assets`) to
-deliver its first frame before returning. Lighter has no REST endpoint for account or position
+(`account_all_orders`, `account_all_trades`, `account_all_positions`, `account_all_assets`,
+`user_stats`) to deliver its first frame before returning. Lighter has no REST endpoint for account or position
 state, so the WebSocket frames are the only ground truth: returning earlier would let strategies
 race the venue's initial state and find the venue order id lookup table or position cache empty.
 The gate clears any prior-session position and account caches at the start of each connect attempt
