@@ -196,11 +196,18 @@ impl InteractiveBrokersExecutionClient {
         instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
         _exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
         _clock: &'static AtomicTime,
-        _account_id: AccountId,
+        account_id: AccountId,
         original_order: Option<&Arc<OrderAny>>,
         request_timeout_secs: u64,
     ) -> anyhow::Result<()> {
-        let target_ib_order_id = Self::target_ib_order_id_for_modify(cmd, order_id_map)?;
+        let target_ib_order_id = Self::target_ib_order_id_for_modify(
+            cmd,
+            client,
+            order_id_map,
+            account_id,
+            request_timeout_secs,
+        )
+        .await?;
 
         if let Some(original_order) = original_order {
             let ib_order_id = target_ib_order_id.context("Order ID not found in mapping")?;
@@ -247,15 +254,18 @@ impl InteractiveBrokersExecutionClient {
         .await
     }
 
-    fn target_ib_order_id_for_modify(
+    async fn target_ib_order_id_for_modify(
         cmd: &ModifyOrder,
+        client: &Arc<Client>,
         order_id_map: &Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
+        account_id: AccountId,
+        request_timeout_secs: u64,
     ) -> anyhow::Result<Option<i32>> {
         if let Some(venue_order_id) = &cmd.venue_order_id {
-            let order_id = venue_order_id
-                .as_str()
-                .parse()
-                .context("Failed to parse venue_order_id as IB order id")?;
+            let order_selector = IbOrderSelector::from_venue_order_id(venue_order_id)?;
+            let order_id =
+                Self::resolve_ib_order_id(client, order_selector, account_id, request_timeout_secs)
+                    .await?;
             return Ok(Some(order_id));
         }
 
@@ -281,7 +291,12 @@ impl InteractiveBrokersExecutionClient {
         }
 
         if let Some(trigger_price) = cmd.trigger_price {
-            ib_order.aux_price = Some(trigger_price.as_f64() / price_magnifier);
+            let converted_trigger_price = trigger_price.as_f64() / price_magnifier;
+            if matches!(ib_order.order_type.as_str(), "TRAIL" | "TRAIL LIMIT") {
+                ib_order.trail_stop_price = Some(converted_trigger_price);
+            } else {
+                ib_order.aux_price = Some(converted_trigger_price);
+            }
         }
     }
 
@@ -519,5 +534,73 @@ impl InteractiveBrokersExecutionClient {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_model::identifiers::Symbol;
+
+    use super::*;
+
+    fn modify_trigger_cmd() -> ModifyOrder {
+        ModifyOrder::new(
+            TraderId::from("TRADER-001"),
+            Some(ClientId::from("CLIENT-001")),
+            StrategyId::from("S-001"),
+            InstrumentId::new(Symbol::from("AAPL"), Venue::from("NASDAQ")),
+            ClientOrderId::from("O-001"),
+            Some(VenueOrderId::from("1")),
+            None,
+            None,
+            Some(Price::from("149.50")),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        )
+    }
+
+    fn instrument_provider() -> Arc<InteractiveBrokersInstrumentProvider> {
+        Arc::new(InteractiveBrokersInstrumentProvider::new(
+            crate::config::InteractiveBrokersInstrumentProviderConfig::default(),
+        ))
+    }
+
+    #[rstest::rstest]
+    fn modify_trailing_stop_routes_trigger_to_trail_stop_price() {
+        let mut ib_order = ibapi::orders::Order {
+            order_type: "TRAIL".to_string(),
+            aux_price: Some(0.5),
+            trailing_percent: Some(0.25),
+            ..Default::default()
+        };
+
+        InteractiveBrokersExecutionClient::apply_modify_fields_to_ib_order(
+            &modify_trigger_cmd(),
+            &mut ib_order,
+            &instrument_provider(),
+        );
+
+        assert_eq!(ib_order.aux_price, Some(0.5));
+        assert_eq!(ib_order.trailing_percent, Some(0.25));
+        assert_eq!(ib_order.trail_stop_price, Some(149.5));
+    }
+
+    #[rstest::rstest]
+    fn modify_stop_order_routes_trigger_to_aux_price() {
+        let mut ib_order = ibapi::orders::Order {
+            order_type: "STP".to_string(),
+            ..Default::default()
+        };
+
+        InteractiveBrokersExecutionClient::apply_modify_fields_to_ib_order(
+            &modify_trigger_cmd(),
+            &mut ib_order,
+            &instrument_provider(),
+        );
+
+        assert_eq!(ib_order.aux_price, Some(149.5));
+        assert_eq!(ib_order.trail_stop_price, None);
     }
 }

@@ -693,6 +693,16 @@ fn is_connection_drop_transport_error(err: &TransportError) -> bool {
     err.is_closed() || matches!(err, TransportError::Io(e) if is_connection_drop_io_error(e))
 }
 
+// Debug when we asked to disconnect (Disconnect/Closed), else Warn for a peer close
+fn read_termination_log_level(connection_state: &AtomicU8) -> log::Level {
+    let mode = ConnectionMode::from_atomic(connection_state);
+    if mode.is_disconnect() || mode.is_closed() {
+        log::Level::Debug
+    } else {
+        log::Level::Warn
+    }
+}
+
 #[cfg(test)]
 mod connection_error_tests {
     use std::io;
@@ -1059,7 +1069,8 @@ impl WebSocketClientInner {
                         }
                     }
                     Ok(Some(Ok(Message::Close(Some(frame))))) => {
-                        log::warn!(
+                        log::log!(
+                            read_termination_log_level(&connection_state),
                             "Received close frame, terminating: code={}, reason='{}'",
                             frame.code,
                             frame.reason
@@ -1067,7 +1078,10 @@ impl WebSocketClientInner {
                         break;
                     }
                     Ok(Some(Ok(Message::Close(None)))) => {
-                        log::warn!("Received close frame with no code or reason, terminating");
+                        log::log!(
+                            read_termination_log_level(&connection_state),
+                            "Received close frame with no code or reason, terminating"
+                        );
                         break;
                     }
                     Ok(Some(Err(e))) => {
@@ -1079,7 +1093,10 @@ impl WebSocketClientInner {
                         break;
                     }
                     Ok(None) => {
-                        log::warn!("Connection closed by peer (no close frame), terminating");
+                        log::log!(
+                            read_termination_log_level(&connection_state),
+                            "Connection closed by peer (no close frame), terminating"
+                        );
                         break;
                     }
                     Err(_) => {
@@ -1580,7 +1597,44 @@ impl WebSocketClient {
         keyed_quotas: Vec<(String, Quota)>,
         default_quota: Option<Quota>,
     ) -> Result<Self, TransportError> {
-        // Validate that handler mode has a message handler
+        let keyed_quotas = keyed_quotas
+            .into_iter()
+            .map(|(key, quota)| (Ustr::from(&key), quota))
+            .collect();
+        let rate_limiter = Arc::new(RateLimiter::new_with_quota(default_quota, keyed_quotas));
+        Self::connect_with_rate_limiter(
+            config,
+            message_handler,
+            ping_handler,
+            post_reconnection,
+            rate_limiter,
+        )
+        .await
+    }
+
+    /// Creates a websocket client in **handler mode** sharing an externally-owned rate limiter.
+    ///
+    /// Use this constructor to share a single [`RateLimiter`] across multiple
+    /// [`WebSocketClient`] instances (for example, the WebSocket clients owned
+    /// by an exchange adapter's data and execution clients). All quota state
+    /// lives inside the limiter, so passing the same `Arc` produces a single
+    /// shared bucket — the only way to honour a venue's per-IP / per-account
+    /// WS message cap when more than one connection is opened in-process.
+    ///
+    /// Behavior otherwise matches [`Self::connect`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The connection cannot be established.
+    /// - `message_handler` is `None` (use `connect_stream` instead).
+    pub async fn connect_with_rate_limiter(
+        config: WebSocketConfig,
+        message_handler: Option<MessageHandler>,
+        ping_handler: Option<PingHandler>,
+        post_reconnection: Option<Arc<dyn Fn() + Send + Sync>>,
+        rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
+    ) -> Result<Self, TransportError> {
         if message_handler.is_none() {
             return Err(TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1605,12 +1659,6 @@ impl WebSocketClient {
             post_reconnection,
             Arc::clone(&auth_tracker),
         );
-
-        let keyed_quotas = keyed_quotas
-            .into_iter()
-            .map(|(key, quota)| (Ustr::from(&key), quota))
-            .collect();
-        let rate_limiter = Arc::new(RateLimiter::new_with_quota(default_quota, keyed_quotas));
 
         Ok(Self {
             controller_task,

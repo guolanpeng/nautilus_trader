@@ -47,10 +47,10 @@ use ustr::Ustr;
 #[cfg(any(test, feature = "stubs"))]
 pub use crate::orders::builder::OrderTestBuilder;
 pub use crate::orders::{
-    any::{LimitOrderAny, OrderAny, PassiveOrderAny, StopOrderAny},
+    any::{LimitOrderAny, OrderAny, OrderReplayError, PassiveOrderAny, StopOrderAny},
     limit::LimitOrder,
     limit_if_touched::LimitIfTouchedOrder,
-    list::OrderList,
+    list::{OrderList, OrderListValidationError},
     market::MarketOrder,
     market_if_touched::MarketIfTouchedOrder,
     market_to_limit::MarketToLimitOrder,
@@ -220,6 +220,7 @@ impl OrderStatus {
             (Self::Initialized, OrderEventAny::Updated(_)) => Self::Initialized, // In-place modification
             (Self::Emulated, OrderEventAny::Canceled(_)) => Self::Canceled,  // Emulated orders
             (Self::Emulated, OrderEventAny::Expired(_)) => Self::Expired,  // Emulated orders
+            (Self::Emulated, OrderEventAny::Updated(_)) => Self::Emulated, // In-place modification
             (Self::Emulated, OrderEventAny::Released(_)) => Self::Released,  // Emulated orders
             (Self::Released, OrderEventAny::Submitted(_)) => Self::Submitted,  // Emulated orders
             (Self::Released, OrderEventAny::Denied(_)) => Self::Denied,  // Emulated orders

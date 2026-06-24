@@ -610,7 +610,7 @@ The adapter supports the following data subscriptions. All perpetual data types
 
 | Data type         | Sub. | Snapshot | Hist. | Nautilus type                 | Notes                                 |
 |-------------------|------|----------|-------|-------------------------------|---------------------------------------|
-| Trade ticks       | ✓    | -        | -     | `TradeTick`                   | WebSocket trades.                     |
+| Trade ticks       | ✓    | -        | ✓     | `TradeTick`                   | WebSocket trades; `recentTrades`.     |
 | Quote ticks       | ✓    | -        | -     | `QuoteTick`                   | Best bid/offer.                       |
 | Order book deltas | ✓    | ✓        | -     | `OrderBookDelta`              | L2 snapshots.                         |
 | Order book depth  | ✓    | -        | -     | `OrderBookDepth10`            | Top-10 L2 snapshots.                  |
@@ -623,9 +623,15 @@ The adapter supports the following data subscriptions. All perpetual data types
 | All dex contexts  | ✓    | -        | -     | `HyperliquidAllDexsAssetCtxs` | Custom data from `allDexsAssetCtxs`.  |
 
 :::note
-Historical quote and trade requests are not supported. Hyperliquid does not publish
-a public trade-tape endpoint; real-time trades are available via the WebSocket
-`trades` channel. `request_trades` returns an explicit error.
+Historical quote requests are not supported. Historical trade requests use the
+`recentTrades` info endpoint, which returns a recent snapshot of public trades
+(newest first) with no time range. `request_trades` filters that snapshot to the
+requested `[start, end]` window and applies `limit` by keeping the most recent
+trades. When the request reaches below the snapshot's oldest trade, the adapter
+logs a warning and serves the available subset (or an empty response). The
+endpoint depends on the Hyperliquid indexer: self-hosted `/info` nodes return
+HTTP 422, which the adapter treats as no coverage and answers with an empty
+response. Real-time trades remain available via the WebSocket `trades` channel.
 :::
 
 ### Order book precision controls
@@ -981,6 +987,20 @@ HTTP success, so a failed modify never leaves stale race state. Because detectio
 relies on the cached `venue_order_id`, the adapter also recovers a modify that times out on the
 HTTP call but still reaches the venue: the eventual WS `ACCEPTED(new_oid)` sees the old cached
 `oid` and translates to `OrderUpdated`. See [GH-3827](https://github.com/nautechsystems/nautilus_trader/issues/3827).
+
+The same marker guards the inflight query and single-order reconcile paths. While a modify is in
+flight, `query_order` and `generate_order_status_report` drop a `Canceled` for the superseded leg,
+so an out-of-band status probe that resolves the old `oid` before the replacement appears cannot
+terminate the live order. A non-cancel status for the old leg (such as a late `Filled`) is still
+forwarded so reconciliation can recover it.
+
+These paths also promote the replacement. Hyperliquid lists the replacement under the same `cloid`
+with a new `oid` in `frontendOpenOrders`, so when the replacement `ACCEPTED(new_oid)` was dropped
+on the WebSocket and no fill has arrived, the query resolves it by `cloid` and promotes it to
+`OrderUpdated` directly (rebinding the `cloid` to `new_oid` and clearing the pending-modify
+marker). The order is therefore not left bound to the canceled leg, and subsequent modifies and
+cancels target the live replacement. See
+[GH-4270](https://github.com/nautechsystems/nautilus_trader/issues/4270).
 
 :::note
 One narrow edge case remains when all three conditions occur together:

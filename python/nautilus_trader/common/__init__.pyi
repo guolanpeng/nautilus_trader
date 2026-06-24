@@ -21,7 +21,6 @@ __all__ = [
     "CustomData",
     "DataActor",
     "DataActorConfig",
-    "DatabaseConfig",
     "Environment",
     "FifoCache",
     "FileWriterConfig",
@@ -36,6 +35,7 @@ __all__ = [
     "MessageBus",
     "MessageBusConfig",
     "MessageBusListener",
+    "OrderFactory",
     "SerializationEncoding",
     "Signal",
     "TimeEvent",
@@ -58,7 +58,11 @@ class BusMessage:
     @property
     def topic(self) -> str: ...
     @property
+    def payload_type(self) -> str: ...
+    @property
     def payload(self) -> bytes: ...
+    @property
+    def encoding(self) -> SerializationEncoding: ...
 
 @typing.final
 class CacheConfig:
@@ -127,48 +131,6 @@ class DataActorConfig:
     ) -> None: ...
 
 @typing.final
-class DatabaseConfig:
-    def __init__(
-        self,
-        database_type: str | None = None,
-        host: str | None = None,
-        port: int | None = None,
-        username: str | None = None,
-        password: str | None = None,
-        ssl: bool | None = None,
-        connection_timeout: int | None = None,
-        response_timeout: int | None = None,
-        number_of_retries: int | None = None,
-        exponent_base: int | None = None,
-        max_delay: int | None = None,
-        factor: int | None = None,
-    ) -> None: ...
-    @property
-    def database_type(self) -> str: ...
-    @property
-    def host(self) -> str | None: ...
-    @property
-    def port(self) -> int | None: ...
-    @property
-    def username(self) -> str | None: ...
-    @property
-    def password(self) -> str | None: ...
-    @property
-    def ssl(self) -> bool: ...
-    @property
-    def connection_timeout(self) -> int: ...
-    @property
-    def response_timeout(self) -> int: ...
-    @property
-    def number_of_retries(self) -> int: ...
-    @property
-    def exponent_base(self) -> int: ...
-    @property
-    def max_delay(self) -> int: ...
-    @property
-    def factor(self) -> int: ...
-
-@typing.final
 class FileWriterConfig:
     def __init__(
         self,
@@ -214,8 +176,9 @@ class LoggerConfig:
 class MessageBusConfig:
     def __init__(
         self,
-        database: DatabaseConfig | None = None,
         encoding: SerializationEncoding | None = None,
+        encoding_market_data: SerializationEncoding | None = None,
+        encoding_builtin: SerializationEncoding | None = None,
         timestamps_as_iso8601: bool | None = None,
         buffer_interval_ms: int | None = None,
         autotrim_mins: int | None = None,
@@ -229,9 +192,11 @@ class MessageBusConfig:
         heartbeat_interval_secs: int | None = None,
     ) -> None: ...
     @property
-    def database(self) -> DatabaseConfig | None: ...
-    @property
     def encoding(self) -> SerializationEncoding: ...
+    @property
+    def encoding_market_data(self) -> SerializationEncoding | None: ...
+    @property
+    def encoding_builtin(self) -> SerializationEncoding | None: ...
     @property
     def timestamps_as_iso8601(self) -> bool: ...
     @property
@@ -904,24 +869,24 @@ class DataActor:
         self,
         data_type: model.DataType,
         client_id: model.ClientId,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         limit: int | None = None,
         params: dict | None = None,
     ) -> str: ...
     def request_instrument(
         self,
         instrument_id: model.InstrumentId,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> str: ...
     def request_instruments(
         self,
         venue: model.Venue | None = None,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> str: ...
@@ -932,11 +897,30 @@ class DataActor:
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> str: ...
+    def request_book_deltas(
+        self,
+        instrument_id: model.InstrumentId,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
+        limit: int | None = None,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> str: ...
+    def request_book_depth(
+        self,
+        instrument_id: model.InstrumentId,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
+        limit: int | None = None,
+        depth: int | None = None,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> str: ...
     def request_quotes(
         self,
         instrument_id: model.InstrumentId,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         limit: int | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
@@ -944,8 +928,8 @@ class DataActor:
     def request_trades(
         self,
         instrument_id: model.InstrumentId,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         limit: int | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
@@ -953,8 +937,8 @@ class DataActor:
     def request_funding_rates(
         self,
         instrument_id: model.InstrumentId,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         limit: int | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
@@ -962,8 +946,8 @@ class DataActor:
     def request_bars(
         self,
         bar_type: model.BarType,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         limit: int | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
@@ -1087,7 +1071,7 @@ class GreeksCalculator:
         vega_time_weight_base: int | None = None,
         vol_index_instrument_id: model.InstrumentId | None = None,
         vol_beta_weights: typing.Mapping[model.InstrumentId, float] | None = None,
-    ) -> model.GreeksData: ...
+    ) -> model.GreeksData | None: ...
     def modify_greeks(
         self,
         delta_input: float,
@@ -1164,7 +1148,7 @@ class MessageBus:
         instance_id: core.UUID4 | None = None,
         name: str | None = None,
         serializer: typing.Any | None = None,
-        database: typing.Any | None = None,
+        backing: typing.Any | None = None,
         config: typing.Any | None = None,
     ) -> None: ...
     @property
@@ -1202,6 +1186,240 @@ class MessageBus:
     def dispose(self) -> None: ...
     def add_streaming_type(self, cls: typing.Any) -> None: ...
     def add_listener(self, listener: typing.Any) -> None: ...
+
+@typing.final
+class OrderFactory:
+    def __init__(
+        self,
+        trader_id: model.TraderId,
+        strategy_id: model.StrategyId,
+        clock: Clock,
+        use_uuid_client_order_ids: bool = False,
+        use_hyphens_in_client_order_ids: bool = True,
+    ) -> None: ...
+    def get_client_order_id_count(self) -> int: ...
+    def get_order_list_id_count(self) -> int: ...
+    def generate_client_order_id(self) -> model.ClientOrderId: ...
+    def generate_order_list_id(self) -> model.OrderListId: ...
+    def reset(self) -> None: ...
+    def market(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        time_in_force: model.TimeInForce | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def limit(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        price: model.Price,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        post_only: bool | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        display_qty: model.Quantity | None = None,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def stop_market(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        trigger_price: model.Price,
+        trigger_type: model.TriggerType | None = None,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        display_qty: model.Quantity | None = None,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def stop_limit(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        price: model.Price,
+        trigger_price: model.Price,
+        trigger_type: model.TriggerType | None = None,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        post_only: bool | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        display_qty: model.Quantity | None = None,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def market_to_limit(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        display_qty: model.Quantity | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def market_if_touched(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        trigger_price: model.Price,
+        trigger_type: model.TriggerType | None = None,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def limit_if_touched(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        price: model.Price,
+        trigger_price: model.Price,
+        trigger_type: model.TriggerType | None = None,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        post_only: bool | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        display_qty: model.Quantity | None = None,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def trailing_stop_market(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        trailing_offset: decimal.Decimal,
+        trailing_offset_type: model.TrailingOffsetType | None = None,
+        activation_price: model.Price | None = None,
+        trigger_price: model.Price | None = None,
+        trigger_type: model.TriggerType | None = None,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        display_qty: model.Quantity | None = None,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def trailing_stop_limit(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        price: model.Price,
+        limit_offset: decimal.Decimal,
+        trailing_offset: decimal.Decimal,
+        trailing_offset_type: model.TrailingOffsetType | None = None,
+        activation_price: model.Price | None = None,
+        trigger_price: model.Price | None = None,
+        trigger_type: model.TriggerType | None = None,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        post_only: bool | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        display_qty: model.Quantity | None = None,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def bracket(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        quote_quantity: bool = False,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        contingency_type: model.ContingencyType = model.ContingencyType.OUO,
+        entry_order_type: model.OrderType = model.OrderType.MARKET,
+        entry_price: model.Price | None = None,
+        entry_trigger_price: model.Price | None = None,
+        expire_time: int | None = None,
+        time_in_force: model.TimeInForce = model.TimeInForce.GTC,
+        entry_post_only: bool = False,
+        entry_exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        entry_exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        entry_tags: typing.Sequence[str] | None = None,
+        entry_client_order_id: model.ClientOrderId | None = None,
+        tp_order_type: model.OrderType = model.OrderType.LIMIT,
+        tp_price: model.Price | None = None,
+        tp_trigger_price: model.Price | None = None,
+        tp_trigger_type: model.TriggerType = model.TriggerType.DEFAULT,
+        tp_activation_price: model.Price | None = None,
+        tp_trailing_offset: decimal.Decimal | None = None,
+        tp_trailing_offset_type: model.TrailingOffsetType = model.TrailingOffsetType.PRICE,
+        tp_limit_offset: decimal.Decimal | None = None,
+        tp_time_in_force: model.TimeInForce = model.TimeInForce.GTC,
+        tp_post_only: bool = True,
+        tp_exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        tp_exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tp_tags: typing.Sequence[str] | None = None,
+        tp_client_order_id: model.ClientOrderId | None = None,
+        sl_order_type: model.OrderType = model.OrderType.STOP_MARKET,
+        sl_trigger_price: model.Price | None = None,
+        sl_trigger_type: model.TriggerType = model.TriggerType.DEFAULT,
+        sl_activation_price: model.Price | None = None,
+        sl_trailing_offset: decimal.Decimal | None = None,
+        sl_trailing_offset_type: model.TrailingOffsetType = model.TrailingOffsetType.PRICE,
+        sl_time_in_force: model.TimeInForce = model.TimeInForce.GTC,
+        sl_exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        sl_exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        sl_tags: typing.Sequence[str] | None = None,
+        sl_client_order_id: model.ClientOrderId | None = None,
+    ) -> list: ...
 
 @typing.final
 class Signal:
@@ -1338,8 +1556,10 @@ class LogLevel(enum.Enum):
 
 @typing.final
 class SerializationEncoding(enum.Enum):
-    MSG_PACK = ...
     JSON = ...
+    MSG_PACK = ...
+    CAPNP = ...
+    SBE = ...
 
     def __hash__(self) -> int: ...
 

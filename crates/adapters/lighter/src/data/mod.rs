@@ -27,6 +27,7 @@ use ahash::AHashMap;
 use anyhow::Context;
 use dashmap::{DashMap, DashSet, mapref::entry::Entry};
 use nautilus_common::{
+    cache::InstrumentLookupError,
     clients::DataClient,
     live::{runner::get_data_event_sender, runtime::get_runtime},
     messages::{
@@ -153,13 +154,7 @@ impl LighterDataClient {
         let http_client =
             LighterHttpClient::from_raw_with_registry(raw_http, Arc::clone(&registry));
 
-        let ws_client = LighterWebSocketClient::new(
-            Some(config.ws_url()),
-            config.environment,
-            Arc::clone(&registry),
-            config.transport_backend,
-            config.proxy_url.clone(),
-        );
+        let ws_client = Self::create_ws_client(&config, Arc::clone(&registry));
 
         Ok(Self {
             clock,
@@ -188,6 +183,43 @@ impl LighterDataClient {
     #[must_use]
     pub fn has_credentials(&self) -> bool {
         self.credential.is_some()
+    }
+
+    fn create_ws_client(
+        config: &LighterDataClientConfig,
+        registry: Arc<MarketRegistry>,
+    ) -> LighterWebSocketClient {
+        LighterWebSocketClient::new(
+            Some(config.ws_url()),
+            config.environment,
+            registry,
+            config.transport_backend,
+            config.proxy_url.clone(),
+        )
+    }
+
+    fn take_ws_client(&mut self) -> LighterWebSocketClient {
+        std::mem::replace(
+            &mut self.ws_client,
+            Self::create_ws_client(&self.config, Arc::clone(&self.registry)),
+        )
+    }
+
+    fn spawn_ws_disconnect(&mut self) {
+        let ws_client = self.take_ws_client();
+        get_runtime().spawn(Self::disconnect_ws_client(ws_client));
+    }
+
+    async fn disconnect_ws_client(mut ws_client: LighterWebSocketClient) {
+        if let Err(e) = ws_client.disconnect().await {
+            log::warn!("Error disconnecting Lighter WebSocket client: {e}");
+        }
+    }
+
+    fn abort_tasks(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
     }
 
     async fn bootstrap_instruments(&self) -> anyhow::Result<Vec<InstrumentAny>> {
@@ -315,7 +347,7 @@ impl LighterDataClient {
                             // own clone of the WebSocket and routes them.
                             Some(
                                 NautilusWsMessage::ExecutionReports(_)
-                                | NautilusWsMessage::PositionSnapshot(_)
+                                | NautilusWsMessage::PositionSnapshot { .. }
                                 | NautilusWsMessage::AccountState(_)
                                 | NautilusWsMessage::SendTxAck { .. }
                                 | NautilusWsMessage::SendTxRejected { .. }
@@ -536,7 +568,7 @@ impl LighterDataClient {
         let instrument = self
             .instruments
             .get_cloned(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found in cache"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         anyhow::ensure!(
             matches!(instrument, InstrumentAny::CryptoPerpetual(_)),
@@ -559,7 +591,7 @@ impl LighterDataClient {
         let instrument = self
             .instruments
             .get_cloned(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found in cache"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
         let market_index = self.registry.market_index(&instrument_id).ok_or_else(|| {
             anyhow::anyhow!("No Lighter market_index registered for {instrument_id}")
         })?;
@@ -655,6 +687,8 @@ impl DataClient for LighterDataClient {
     fn stop(&mut self) -> anyhow::Result<()> {
         log::info!("Stopping Lighter data client {}", self.client_id);
         self.cancellation_token.cancel();
+        self.abort_tasks();
+        self.spawn_ws_disconnect();
         self.clear_instrument_status_subscriptions();
         self.clear_market_stats_subscriptions();
         self.is_connected.store(false, Ordering::Relaxed);
@@ -663,11 +697,13 @@ impl DataClient for LighterDataClient {
 
     fn reset(&mut self) -> anyhow::Result<()> {
         log::debug!("Resetting Lighter data client {}", self.client_id);
+        self.cancellation_token.cancel();
+        self.abort_tasks();
+        self.spawn_ws_disconnect();
         self.clear_instrument_status_subscriptions();
         self.clear_market_stats_subscriptions();
         self.is_connected.store(false, Ordering::Relaxed);
         self.cancellation_token = CancellationToken::new();
-        self.tasks.clear();
         Ok(())
     }
 
@@ -734,9 +770,8 @@ impl DataClient for LighterDataClient {
             }
         }
 
-        if let Err(e) = self.ws_client.disconnect().await {
-            log::warn!("Error disconnecting Lighter WebSocket client: {e}");
-        }
+        let ws_client = self.take_ws_client();
+        Self::disconnect_ws_client(ws_client).await;
 
         self.instruments.store(AHashMap::new());
         self.instrument_statuses.clear();
@@ -951,10 +986,9 @@ impl DataClient for LighterDataClient {
         );
 
         let instrument_id = bar_type.instrument_id();
-        anyhow::ensure!(
-            self.instruments.contains_key(&instrument_id),
-            "Instrument {instrument_id} not found in cache",
-        );
+        if !self.instruments.contains_key(&instrument_id) {
+            return Err(InstrumentLookupError::not_found(instrument_id).into());
+        }
 
         let ws = self.ws_client.clone();
         get_runtime().spawn(async move {
@@ -1281,7 +1315,7 @@ impl DataClient for LighterDataClient {
         let instrument = self
             .instruments
             .get_cloned(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found in cache"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
@@ -1340,7 +1374,7 @@ impl DataClient for LighterDataClient {
         let instrument = self
             .instruments
             .get_cloned(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found in cache"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
@@ -1388,7 +1422,7 @@ impl DataClient for LighterDataClient {
         let instrument = self
             .instruments
             .get_cloned(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found in cache"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         anyhow::ensure!(
             matches!(instrument, InstrumentAny::CryptoPerpetual(_)),
@@ -1444,7 +1478,7 @@ impl DataClient for LighterDataClient {
         let instrument = self
             .instruments
             .get_cloned(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found in cache"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let market_index = self.registry.market_index(&instrument_id).ok_or_else(|| {
             anyhow::anyhow!("No Lighter market_index registered for {instrument_id}")
@@ -1582,6 +1616,16 @@ mod tests {
         common::enums::{LighterFundingResolution, LighterProductType},
         http::query::{LighterFundingsQuery, LighterRecentTradesQuery},
     };
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
 
     const HTTP_ORDER_BOOK_DETAILS: &str =
         include_str!("../../test_data/http_order_book_details.json");
@@ -2071,6 +2115,33 @@ mod tests {
     }
 
     #[rstest]
+    fn test_subscribe_bars_missing_cached_instrument_returns_lookup_error() {
+        let mut client = create_data_client_for_test();
+        let instrument_id = InstrumentId::new(Symbol::new("ETH-PERP"), *LIGHTER_VENUE);
+        let bar_type = BarType::new(
+            instrument_id,
+            BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
+            AggregationSource::External,
+        );
+        let subscription = SubscribeBars::new(
+            bar_type,
+            Some(ClientId::new("LIGHTER")),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+
+        let err = DataClient::subscribe_bars(&mut client, subscription).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            InstrumentLookupError::not_found(instrument_id).to_string()
+        );
+    }
+
+    #[rstest]
     fn test_subscribe_bars_rejects_one_week_with_ws_message() {
         let mut client = create_data_client_for_test();
         let instrument_id = cache_test_instrument(&client, 0, "ETH", LighterProductType::Perp);
@@ -2525,6 +2596,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_reset_aborts_registered_tasks_before_rotating_token() {
+        let (mut client, _receiver) = create_data_client_with_receiver_for_test();
+        let old_token = client.cancellation_token.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+
+        let handle = get_runtime().spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        client.tasks.push(handle);
+        started_rx.await.expect("registered task started");
+
+        client.reset().expect("reset");
+
+        assert!(old_token.is_cancelled());
+        assert!(client.tasks.is_empty());
+        assert!(!client.cancellation_token.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), dropped_rx)
+            .await
+            .expect("registered task was not aborted")
+            .expect("drop signal sender dropped");
+    }
+
     // Tests that observe `has_credentials()` semantics under controlled env
     // state. Pinned to the workspace `serial_tests` group (see
     // `.config/nextest.toml`) so env-var mutation runs single-threaded.
@@ -2713,7 +2810,10 @@ mod tests {
         assert_eq!(query.resolution, LighterFundingResolution::OneHour);
         assert_eq!(query.start_timestamp, 1_778_702_400_000);
         assert_eq!(query.end_timestamp, 1_778_706_000_000);
-        assert_eq!(query.count_back, 2);
+        assert_eq!(
+            query.count_back,
+            i64::from(crate::http::client::LIGHTER_FUNDINGS_MAX_LIMIT)
+        );
         (StatusCode::OK, HTTP_FUNDINGS).into_response()
     }
 
@@ -2773,6 +2873,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             UnixNanos::default(),
             UnixNanos::default(),
         ))
@@ -2788,6 +2889,7 @@ mod tests {
             4,
             Price::from("0.01"),
             Quantity::from("0.0001"),
+            None,
             None,
             None,
             None,

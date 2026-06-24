@@ -38,7 +38,7 @@ use nautilus_core::{
 use nautilus_execution::{
     matching_core::RestingOrder,
     matching_engine::{config::OrderMatchingEngineConfig, engine::OrderMatchingEngine},
-    models::{fee::FeeModelAny, fill::FillModelAny, latency::LatencyModel},
+    models::{fee::FeeModelHandle, fill::FillModelAny, latency::LatencyModel},
 };
 use nautilus_model::{
     accounts::{Account, AccountAny, margin_model::MarginModelAny},
@@ -131,7 +131,7 @@ pub struct SimulatedExchange {
     book_type: BookType,
     default_leverage: Decimal,
     exec_client: Option<Rc<dyn ExecutionClient>>,
-    fee_model: FeeModelAny,
+    fee_model: FeeModelHandle,
     fill_model: FillModelAny,
     latency_model: Option<Box<dyn LatencyModel>>,
     instruments: AHashMap<InstrumentId, InstrumentAny>,
@@ -216,7 +216,7 @@ impl SimulatedExchange {
             book_type: config.book_type,
             default_leverage,
             exec_client: None,
-            fee_model: config.fee_model,
+            fee_model: config.fee_model.into(),
             fill_model: config.fill_model,
             latency_model: config.latency_model,
             instruments: AHashMap::new(),
@@ -276,7 +276,7 @@ impl SimulatedExchange {
     /// Sets the fill model for the exchange.
     pub fn set_fill_model(&mut self, fill_model: FillModelAny) {
         for matching_engine in self.matching_engines.values_mut() {
-            matching_engine.set_fill_model(fill_model.clone());
+            matching_engine.set_fill_model(fill_model.clone().into());
             log::info!(
                 "Setting fill model for {} to {}",
                 matching_engine.venue,
@@ -404,7 +404,7 @@ impl SimulatedExchange {
         let matching_engine = OrderMatchingEngine::new(
             instrument,
             raw_id,
-            self.fill_model.clone(),
+            self.fill_model.clone().into(),
             self.fee_model.clone(),
             self.book_type,
             self.oms_type,
@@ -679,12 +679,12 @@ impl SimulatedExchange {
                 TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_) => {
                     command.ts_init() + latency_model.get_insert_latency()
                 }
-                TradingCommand::ModifyOrder(_) => {
+                TradingCommand::ModifyOrder(_) | TradingCommand::ModifyOrders(_) => {
                     command.ts_init() + latency_model.get_update_latency()
                 }
                 TradingCommand::CancelOrder(_)
-                | TradingCommand::CancelAllOrders(_)
-                | TradingCommand::BatchCancelOrders(_) => {
+                | TradingCommand::CancelOrders(_)
+                | TradingCommand::CancelAllOrders(_) => {
                     command.ts_init() + latency_model.get_delete_latency()
                 }
                 _ => panic!("Cannot handle command: {command:?}"),
@@ -1183,7 +1183,7 @@ impl SimulatedExchange {
             let PositionEvent::PositionAdjusted(adjustment) = &event else {
                 continue;
             };
-            let topic = switchboard::get_event_positions_topic(adjustment.strategy_id);
+            let topic = switchboard::get_event_position_topic(adjustment.strategy_id);
             msgbus::publish_position_event(topic, &event);
         }
     }
@@ -1408,11 +1408,24 @@ impl SimulatedExchange {
             "Matching engine not found for instrument {instrument_id}",
         );
 
-        if let TradingCommand::ModifyOrder(ref command) = command
-            && self.process_modify_submitted_order(command)
-        {
-            return;
-        }
+        let command = match command {
+            TradingCommand::ModifyOrder(ref command)
+                if self.process_modify_submitted_order(command) =>
+            {
+                return;
+            }
+            TradingCommand::ModifyOrders(mut command) => {
+                command
+                    .modifies
+                    .retain(|modify| !self.process_modify_submitted_order(modify));
+
+                if command.modifies.is_empty() {
+                    return;
+                }
+                TradingCommand::ModifyOrders(command)
+            }
+            command => command,
+        };
 
         if let Some(matching_engine) = self.matching_engines.get_mut(&instrument_id) {
             let account_id = if let Some(exec_client) = &self.exec_client {
@@ -1434,14 +1447,17 @@ impl SimulatedExchange {
                 TradingCommand::ModifyOrder(ref command) => {
                     matching_engine.process_modify(command, account_id);
                 }
+                TradingCommand::ModifyOrders(ref command) => {
+                    matching_engine.process_batch_modify(command, account_id);
+                }
                 TradingCommand::CancelOrder(ref command) => {
                     matching_engine.process_cancel(command, account_id);
                 }
+                TradingCommand::CancelOrders(ref command) => {
+                    matching_engine.process_batch_cancel(command, account_id);
+                }
                 TradingCommand::CancelAllOrders(ref command) => {
                     matching_engine.process_cancel_all(command, account_id);
-                }
-                TradingCommand::BatchCancelOrders(ref command) => {
-                    matching_engine.process_batch_cancel(command, account_id);
                 }
                 TradingCommand::SubmitOrderList(ref command) => {
                     let mut orders: Vec<OrderAny> = self

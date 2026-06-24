@@ -100,7 +100,7 @@ repos:
         description: Checks GitHub Actions workflow syntax and structural correctness
 
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: v1.25.2
+    rev: v1.26.1
     hooks:
       - id: zizmor
         name: zizmor (security)
@@ -353,7 +353,7 @@ repos:
         types: [python]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.16
+    rev: v0.15.18
     hooks:
       - id: ruff
         name: ruff
@@ -400,7 +400,7 @@ repos:
         additional_dependencies: [msgspec, types-frozendict, types-pytz, types-redis, types-requests, types-toml]
 
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0.11.21 # Must match [tool.uv] required-version in pyproject.toml
+    rev: 0.11.23 # Must match [tool.uv] required-version in pyproject.toml
     hooks:
       - id: uv-lock
         files: ^(uv\.lock|python/uv\.lock)$

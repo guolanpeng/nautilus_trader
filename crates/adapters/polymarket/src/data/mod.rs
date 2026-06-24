@@ -20,6 +20,7 @@ mod dispatch;
 mod instruments;
 mod lifecycle;
 mod requests;
+mod runtime;
 mod subscriptions;
 
 use std::{
@@ -33,6 +34,7 @@ use std::{
 use ahash::AHashSet;
 use dashmap::DashMap;
 use nautilus_common::{
+    cache::InstrumentLookupError,
     clients::DataClient,
     live::{get_runtime, runner::get_data_event_sender},
     messages::{
@@ -68,6 +70,7 @@ use self::{
         request_book_snapshot, request_data, request_instrument, request_instruments,
         request_trades,
     },
+    runtime::is_instrument_expired,
     subscriptions::{resolve_token_id_from, sync_ws_subscription_async},
 };
 use crate::{
@@ -238,6 +241,41 @@ impl PolymarketDataClient {
         resolve_token_id_from(&self.instruments, instrument_id)
     }
 
+    fn ensure_live_subscription_allowed(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        let now_ns = self.clock.get_time_ns();
+        let loaded = self.instruments.load();
+        let Some(instrument) = loaded.get(&instrument_id) else {
+            return Ok(());
+        };
+
+        if is_instrument_expired(instrument, now_ns) {
+            anyhow::bail!(
+                "Instrument {instrument_id} is expired and no longer available for live subscription"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn ensure_market_data_request_allowed(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<InstrumentAny> {
+        let loaded = self.instruments.load();
+        let instrument = loaded
+            .get(&instrument_id)
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?
+            .clone();
+
+        if is_instrument_expired(&instrument, self.clock.get_time_ns()) {
+            anyhow::bail!(
+                "Instrument {instrument_id} is expired and no longer available for market data requests"
+            );
+        }
+
+        Ok(instrument)
+    }
+
     // Spawns an async task that reconciles the WS subscription for
     // `instrument_id`. The task holds `ws_sub_mutex` across the wire send so
     // concurrent subscribe/unsubscribe calls deliver commands to the WS handler
@@ -380,6 +418,7 @@ impl DataClient for PolymarketDataClient {
         }
 
         let instrument_id = cmd.instrument_id;
+        self.ensure_live_subscription_allowed(instrument_id)?;
         let cached = self.instruments.load().contains_key(&instrument_id);
 
         if !cached && !self.config.auto_load_missing_instruments {
@@ -406,6 +445,7 @@ impl DataClient for PolymarketDataClient {
 
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
+        self.ensure_live_subscription_allowed(instrument_id)?;
         let cached = self.instruments.load().contains_key(&instrument_id);
 
         if !cached && !self.config.auto_load_missing_instruments {
@@ -428,6 +468,7 @@ impl DataClient for PolymarketDataClient {
 
     fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
+        self.ensure_live_subscription_allowed(instrument_id)?;
         let cached = self.instruments.load().contains_key(&instrument_id);
 
         if !cached && !self.config.auto_load_missing_instruments {

@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Provides an ergonomic wrapper around the **dYdX v4 Indexer REST API** –
+//! Provides an ergonomic wrapper around the **dYdX v4 Indexer REST API**:
 //! <https://docs.dydx.xyz/api_integration-indexer/indexer_api>.
 //!
 //! This module exports two complementary HTTP clients following the standardized
@@ -59,6 +59,7 @@ use std::{
 
 use ahash::AHashMap;
 use chrono::{DateTime, Utc};
+use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
     UnixNanos,
     consts::NAUTILUS_USER_AGENT,
@@ -1109,7 +1110,7 @@ impl DydxHttpClient {
 
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let ticker = extract_raw_symbol(instrument_id.symbol.as_str());
         let price_precision = instrument.price_precision();
@@ -1241,7 +1242,7 @@ impl DydxHttpClient {
 
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let ticker = extract_raw_symbol(instrument_id.symbol.as_str());
         let price_precision = instrument.price_precision();
@@ -1425,7 +1426,7 @@ impl DydxHttpClient {
     ) -> anyhow::Result<OrderBookDeltas> {
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let ticker = extract_raw_symbol(instrument_id.symbol.as_str());
         let response = self.inner.get_orderbook(ticker).await?;

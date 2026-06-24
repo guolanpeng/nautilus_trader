@@ -43,8 +43,8 @@ fn data_to_pyobject(py: Python<'_>, item: Data) -> PyResult<Py<PyAny>> {
         Data::IndexPriceUpdate(price) => Py::new(py, price).map(pyo3::Py::into_any),
         Data::MarkPriceUpdate(price) => Py::new(py, price).map(pyo3::Py::into_any),
         Data::FundingRateUpdate(funding) => Py::new(py, funding).map(pyo3::Py::into_any),
-        Data::InstrumentStatus(status) => Py::new(py, status).map(pyo3::Py::into_any),
         Data::OptionGreeks(greeks) => Py::new(py, greeks).map(pyo3::Py::into_any),
+        Data::InstrumentStatus(status) => Py::new(py, status).map(pyo3::Py::into_any),
         Data::InstrumentClose(close) => Py::new(py, close).map(pyo3::Py::into_any),
         Data::Custom(custom) => Py::new(py, custom).map(pyo3::Py::into_any),
         #[cfg(feature = "defi")]
@@ -150,9 +150,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write quote ticks: {e}")))
     }
@@ -178,9 +184,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write trade ticks: {e}")))
     }
@@ -206,9 +218,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write order book deltas: {e}")))
     }
@@ -234,9 +252,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write bars: {e}")))
     }
@@ -262,9 +286,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write order book depths: {e}")))
     }
@@ -290,9 +320,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write mark price updates: {e}")))
     }
@@ -318,9 +354,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write index price updates: {e}")))
     }
@@ -346,9 +388,15 @@ impl PyParquetDataCatalog {
     ) -> PyResult<String> {
         let start_nanos = start.map(UnixNanos::from);
         let end_nanos = end.map(UnixNanos::from);
+        let data = data.into_boxed_slice();
 
         self.inner
-            .write_to_parquet(data, start_nanos, end_nanos, Some(skip_disjoint_check))
+            .write_to_parquet(
+                data.as_ref(),
+                start_nanos,
+                end_nanos,
+                Some(skip_disjoint_check),
+            )
             .map(|path| path.to_string_lossy().to_string())
             .map_err(|e| PyIOError::new_err(format!("Failed to write option greeks: {e}")))
     }
@@ -979,20 +1027,6 @@ impl PyParquetDataCatalog {
                     .map_err(|e| PyIOError::new_err(format!("Query failed: {e}")))?;
                 prices.into_iter().map(Data::from).collect()
             }
-            "instrument_status" => {
-                let statuses = self
-                    .inner
-                    .query_typed_data::<InstrumentStatus>(
-                        identifiers,
-                        start_nanos,
-                        end_nanos,
-                        where_clause,
-                        files,
-                        optimize_file_loading,
-                    )
-                    .map_err(|e| PyIOError::new_err(format!("Query failed: {e}")))?;
-                statuses.into_iter().map(Data::from).collect()
-            }
             "option_greeks" => {
                 let greeks = self
                     .inner
@@ -1006,6 +1040,20 @@ impl PyParquetDataCatalog {
                     )
                     .map_err(|e| PyIOError::new_err(format!("Query failed: {e}")))?;
                 greeks.into_iter().map(Data::from).collect()
+            }
+            "instrument_status" => {
+                let statuses = self
+                    .inner
+                    .query_typed_data::<InstrumentStatus>(
+                        identifiers,
+                        start_nanos,
+                        end_nanos,
+                        where_clause,
+                        files,
+                        optimize_file_loading,
+                    )
+                    .map_err(|e| PyIOError::new_err(format!("Query failed: {e}")))?;
+                statuses.into_iter().map(Data::from).collect()
             }
             "instrument_closes" => {
                 let closes = self

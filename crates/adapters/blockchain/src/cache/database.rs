@@ -21,7 +21,10 @@ use nautilus_model::{
     defi::{
         Block, Chain, DexType, Pool, PoolIdentifier, PoolLiquidityUpdate, PoolSwap, SharedChain,
         SharedDex, Token,
-        data::{DexPoolData, PoolFeeCollect, PoolFlash, block::BlockPosition},
+        data::{
+            DexPoolData, PoolFeeCollect, PoolFeeProtocolCollect, PoolFeeProtocolUpdate, PoolFlash,
+            block::BlockPosition,
+        },
         pool_analysis::{
             position::PoolPosition,
             snapshot::{PoolAnalytics, PoolSnapshot, PoolState},
@@ -53,6 +56,27 @@ pub struct BlockchainCacheDatabase {
     /// PostgreSQL connection pool used for database operations.
     pool: PgPool,
 }
+
+// Shared SELECT column list for `pool` row queries (load_pools, load_pool).
+const POOL_ROW_COLUMNS: &str = "
+    address,
+    pool_identifier,
+    dex_name,
+    creation_block,
+    COALESCE(
+        (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool.chain_id AND block.number = pool.creation_block),
+        (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool.chain_id AND pool_event_block.number = pool.creation_block)
+    ) as creation_block_timestamp,
+    token0_chain,
+    token0_address,
+    token1_chain,
+    token1_address,
+    fee,
+    tick_spacing,
+    initial_tick,
+    initial_sqrt_price_x96,
+    hook_address
+";
 
 impl BlockchainCacheDatabase {
     /// Initializes a new database instance by establishing a connection to PostgreSQL.
@@ -1067,36 +1091,41 @@ impl BlockchainCacheDatabase {
         chain: SharedChain,
         dex_id: &str,
     ) -> anyhow::Result<Vec<PoolRow>> {
-        sqlx::query_as::<_, PoolRow>(
-            "
-            SELECT
-                address,
-                pool_identifier,
-                dex_name,
-                creation_block,
-                COALESCE(
-                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool.chain_id AND block.number = pool.creation_block),
-                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool.chain_id AND pool_event_block.number = pool.creation_block)
-                ) as creation_block_timestamp,
-                token0_chain,
-                token0_address,
-                token1_chain,
-                token1_address,
-                fee,
-                tick_spacing,
-                initial_tick,
-                initial_sqrt_price_x96,
-                hook_address
-            FROM pool
-            WHERE chain_id = $1 AND dex_name = $2
-            ORDER BY creation_block ASC
-        ",
-        )
+        sqlx::query_as::<_, PoolRow>(AssertSqlSafe(format!(
+            "SELECT {POOL_ROW_COLUMNS} FROM pool WHERE chain_id = $1 AND dex_name = $2 ORDER BY creation_block ASC"
+        )))
         .bind(chain.chain_id as i32)
         .bind(dex_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to load pools: {e}"))
+    }
+
+    /// Loads a single pool row by its identifier.
+    ///
+    /// Returns `None` when the pool is not present in the database. Lets per-pool tools load only
+    /// the pool they analyze instead of the whole DEX pool set (see [`load_pools`]).
+    ///
+    /// [`load_pools`]: Self::load_pools
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub async fn load_pool(
+        &self,
+        chain: SharedChain,
+        dex_id: &str,
+        pool_identifier: &PoolIdentifier,
+    ) -> anyhow::Result<Option<PoolRow>> {
+        sqlx::query_as::<_, PoolRow>(AssertSqlSafe(format!(
+            "SELECT {POOL_ROW_COLUMNS} FROM pool WHERE chain_id = $1 AND dex_name = $2 AND pool_identifier = $3"
+        )))
+        .bind(chain.chain_id as i32)
+        .bind(dex_id)
+        .bind(pool_identifier.as_ref())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load pool {pool_identifier}: {e}"))
     }
 
     /// Toggles performance optimization settings for sync operations.
@@ -1455,6 +1484,162 @@ impl BlockchainCacheDatabase {
         .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_flash_event table: {e}"))
     }
 
+    /// Inserts multiple pool fee-protocol update events in a single database operation using UNNEST.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub async fn add_pool_fee_protocol_updates_batch(
+        &self,
+        chain_id: u32,
+        updates: &[PoolFeeProtocolUpdate],
+    ) -> anyhow::Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        // Prepare vectors for each column
+        let len = updates.len();
+        let mut chain_ids: Vec<i32> = Vec::with_capacity(len);
+        let mut dex_names: Vec<String> = Vec::with_capacity(len);
+        let mut pool_identifiers: Vec<String> = Vec::with_capacity(len);
+        let mut blocks: Vec<i64> = Vec::with_capacity(len);
+        let mut transaction_hashes: Vec<String> = Vec::with_capacity(len);
+        let mut transaction_indices: Vec<i32> = Vec::with_capacity(len);
+        let mut log_indices: Vec<i32> = Vec::with_capacity(len);
+        let mut fee_protocol0s: Vec<i16> = Vec::with_capacity(len);
+        let mut fee_protocol1s: Vec<i16> = Vec::with_capacity(len);
+
+        // Fill vectors from updates
+        for update in updates {
+            chain_ids.push(chain_id as i32);
+            dex_names.push(update.dex.name.to_string());
+            pool_identifiers.push(update.pool_identifier.to_string());
+            blocks.push(update.block as i64);
+            transaction_hashes.push(update.transaction_hash.clone());
+            transaction_indices.push(update.transaction_index as i32);
+            log_indices.push(update.log_index as i32);
+            fee_protocol0s.push(i16::from(update.fee_protocol0_new));
+            fee_protocol1s.push(i16::from(update.fee_protocol1_new));
+        }
+
+        // Execute batch insert with UNNEST
+        sqlx::query(
+            "
+            INSERT INTO pool_fee_protocol_update_event (
+                chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
+                log_index, fee_protocol0_new, fee_protocol1_new
+            )
+            SELECT
+                chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
+                log_index, fee_protocol0_new, fee_protocol1_new
+            FROM UNNEST(
+                $1::INT[], $2::TEXT[], $3::TEXT[], $4::INT[], $5::TEXT[], $6::INT[],
+                $7::INT[], $8::SMALLINT[], $9::SMALLINT[]
+            ) AS t(chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
+                   log_index, fee_protocol0_new, fee_protocol1_new)
+            ON CONFLICT (chain_id, transaction_hash, log_index) DO NOTHING
+           ",
+        )
+        .bind(&chain_ids[..])
+        .bind(&dex_names[..])
+        .bind(&pool_identifiers[..])
+        .bind(&blocks[..])
+        .bind(&transaction_hashes[..])
+        .bind(&transaction_indices[..])
+        .bind(&log_indices[..])
+        .bind(&fee_protocol0s[..])
+        .bind(&fee_protocol1s[..])
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            anyhow::anyhow!("Failed to batch insert into pool_fee_protocol_update_event table: {e}")
+        })
+    }
+
+    /// Inserts multiple pool protocol-fee withdrawal events in a single database operation using UNNEST.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub async fn add_pool_fee_protocol_collect_batch(
+        &self,
+        chain_id: u32,
+        collects: &[PoolFeeProtocolCollect],
+    ) -> anyhow::Result<()> {
+        if collects.is_empty() {
+            return Ok(());
+        }
+
+        // Prepare vectors for each column
+        let len = collects.len();
+        let mut chain_ids: Vec<i32> = Vec::with_capacity(len);
+        let mut dex_names: Vec<String> = Vec::with_capacity(len);
+        let mut pool_identifiers: Vec<String> = Vec::with_capacity(len);
+        let mut blocks: Vec<i64> = Vec::with_capacity(len);
+        let mut transaction_hashes: Vec<String> = Vec::with_capacity(len);
+        let mut transaction_indices: Vec<i32> = Vec::with_capacity(len);
+        let mut log_indices: Vec<i32> = Vec::with_capacity(len);
+        let mut senders: Vec<String> = Vec::with_capacity(len);
+        let mut recipients: Vec<String> = Vec::with_capacity(len);
+        let mut amount0s: Vec<String> = Vec::with_capacity(len);
+        let mut amount1s: Vec<String> = Vec::with_capacity(len);
+
+        // Fill vectors from collects
+        for collect in collects {
+            chain_ids.push(chain_id as i32);
+            dex_names.push(collect.dex.name.to_string());
+            pool_identifiers.push(collect.pool_identifier.to_string());
+            blocks.push(collect.block as i64);
+            transaction_hashes.push(collect.transaction_hash.clone());
+            transaction_indices.push(collect.transaction_index as i32);
+            log_indices.push(collect.log_index as i32);
+            senders.push(collect.sender.to_string());
+            recipients.push(collect.recipient.to_string());
+            amount0s.push(collect.amount0.to_string());
+            amount1s.push(collect.amount1.to_string());
+        }
+
+        // Execute batch insert with UNNEST
+        sqlx::query(
+            "
+            INSERT INTO pool_fee_protocol_collect_event (
+                chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
+                log_index, sender, recipient, amount0, amount1
+            )
+            SELECT
+                chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
+                log_index, sender, recipient, amount0::U256, amount1::U256
+            FROM UNNEST(
+                $1::INT[], $2::TEXT[], $3::TEXT[], $4::INT[], $5::TEXT[], $6::INT[],
+                $7::INT[], $8::TEXT[], $9::TEXT[], $10::TEXT[], $11::TEXT[]
+            ) AS t(chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
+                   log_index, sender, recipient, amount0, amount1)
+            ON CONFLICT (chain_id, transaction_hash, log_index) DO NOTHING
+           ",
+        )
+        .bind(&chain_ids[..])
+        .bind(&dex_names[..])
+        .bind(&pool_identifiers[..])
+        .bind(&blocks[..])
+        .bind(&transaction_hashes[..])
+        .bind(&transaction_indices[..])
+        .bind(&log_indices[..])
+        .bind(&senders[..])
+        .bind(&recipients[..])
+        .bind(&amount0s[..])
+        .bind(&amount1s[..])
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to batch insert into pool_fee_protocol_collect_event table: {e}"
+            )
+        })
+    }
+
     /// Adds a pool snapshot to the database.
     ///
     /// # Errors
@@ -1734,9 +1919,10 @@ impl BlockchainCacheDatabase {
         .map_err(|e| anyhow::anyhow!("Failed to update pool initial price and tick: {e}"))
     }
 
-    /// Loads the latest valid pool snapshot from the database.
+    /// Loads the latest usable pool snapshot from the database.
     ///
-    /// Returns the most recent snapshot that has been validated against on-chain state.
+    /// Returns the most recent snapshot usable as a replay start point: on-chain validated or
+    /// replay-derived. Snapshots that failed on-chain validation are excluded.
     ///
     /// # Errors
     ///
@@ -1753,8 +1939,9 @@ impl BlockchainCacheDatabase {
     /// Loads the latest pool snapshot from the database, optionally bounded by block.
     ///
     /// When `max_block` is `Some`, only snapshots at or before that block are considered, so a
-    /// backtest can restore pool state as of a replay start. When `require_valid` is `true`, only
-    /// snapshots validated against on-chain state are considered.
+    /// backtest can restore pool state as of a replay start. When `require_valid` is `true`,
+    /// snapshots that failed on-chain validation are excluded (both on-chain validated and
+    /// replay-derived snapshots are returned).
     ///
     /// # Errors
     ///
@@ -1786,7 +1973,7 @@ impl BlockchainCacheDatabase {
             FROM pool_snapshot
             WHERE chain_id = $1 AND pool_identifier = $2
                 AND ($3::BIGINT IS NULL OR block <= $3)
-                AND ($4 OR is_valid = TRUE)
+                AND ($4 OR validation_state <> 'invalid')
             ORDER BY block DESC, transaction_index DESC, log_index DESC
             LIMIT 1
             ",
@@ -1903,23 +2090,27 @@ impl BlockchainCacheDatabase {
         }
     }
 
-    /// Marks a pool snapshot as valid after successful on-chain verification.
+    /// Sets the validation state of a pool snapshot after a validation attempt.
+    ///
+    /// `state` is one of `on_chain` (hydrated and matched), `replay` (replay-derived, not checked),
+    /// or `invalid` (hydrated and mismatched).
     ///
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn mark_pool_snapshot_valid(
+    pub async fn set_pool_snapshot_validation_state(
         &self,
         chain_id: u32,
         pool_identifier: &PoolIdentifier,
         block: u64,
         transaction_index: u32,
         log_index: u32,
+        state: &str,
     ) -> anyhow::Result<()> {
         sqlx::query(
             "
             UPDATE pool_snapshot
-            SET is_valid = TRUE
+            SET validation_state = $6
             WHERE chain_id = $1
             AND pool_identifier = $2
             AND block = $3
@@ -1932,10 +2123,50 @@ impl BlockchainCacheDatabase {
         .bind(block as i64)
         .bind(transaction_index as i32)
         .bind(log_index as i32)
+        .bind(state)
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to mark pool snapshot as valid: {e}"))
+        .map_err(|e| anyhow::anyhow!("Failed to set pool snapshot validation state: {e}"))
+    }
+
+    /// Reads the stored `validation_state` for the snapshot at the given watermark.
+    ///
+    /// Returns `None` when no snapshot row exists at that position. Used to report the persisted
+    /// verdict (rather than re-deriving `replay`) when on-chain validation cannot reach the block.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub async fn get_pool_snapshot_validation_state(
+        &self,
+        chain_id: u32,
+        pool_identifier: &PoolIdentifier,
+        block: u64,
+        transaction_index: u32,
+        log_index: u32,
+    ) -> anyhow::Result<Option<String>> {
+        let row = sqlx::query(
+            "
+            SELECT validation_state
+            FROM pool_snapshot
+            WHERE chain_id = $1
+            AND pool_identifier = $2
+            AND block = $3
+            AND transaction_index = $4
+            AND log_index = $5
+            ",
+        )
+        .bind(chain_id as i32)
+        .bind(pool_identifier.as_ref())
+        .bind(block as i64)
+        .bind(transaction_index as i32)
+        .bind(log_index as i32)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get pool snapshot validation state: {e}"))?;
+
+        Ok(row.map(|row| row.get::<String, _>("validation_state")))
     }
 
     /// Loads all positions for a specific snapshot.
@@ -2114,7 +2345,9 @@ impl BlockchainCacheDatabase {
                 NULL::TEXT as flash_amount0,
                 NULL::TEXT as flash_amount1,
                 NULL::TEXT as flash_paid0,
-                NULL::TEXT as flash_paid1
+                NULL::TEXT as flash_paid1,
+                NULL::SMALLINT as fee_protocol0_new,
+                NULL::SMALLINT as fee_protocol1_new
             FROM pool_swap_event
             WHERE chain_id = $1 AND pool_identifier = $2
             AND ($3::BIGINT IS NULL OR block <= $3))
@@ -2148,7 +2381,9 @@ impl BlockchainCacheDatabase {
                 NULL::TEXT as flash_amount0,
                 NULL::TEXT as flash_amount1,
                 NULL::TEXT as flash_paid0,
-                NULL::TEXT as flash_paid1
+                NULL::TEXT as flash_paid1,
+                NULL::SMALLINT as fee_protocol0_new,
+                NULL::SMALLINT as fee_protocol1_new
             FROM pool_liquidity_event
             WHERE chain_id = $1 AND pool_identifier = $2
             AND ($3::BIGINT IS NULL OR block <= $3))
@@ -2182,8 +2417,82 @@ impl BlockchainCacheDatabase {
                 NULL::TEXT as flash_amount0,
                 NULL::TEXT as flash_amount1,
                 NULL::TEXT as flash_paid0,
-                NULL::TEXT as flash_paid1
+                NULL::TEXT as flash_paid1,
+                NULL::SMALLINT as fee_protocol0_new,
+                NULL::SMALLINT as fee_protocol1_new
             FROM pool_collect_event
+            WHERE chain_id = $1 AND pool_identifier = $2
+            AND ($3::BIGINT IS NULL OR block <= $3))
+            UNION ALL
+            (SELECT
+                'fee_protocol_update' as event_type,
+                chain_id,
+                pool_identifier,
+                block,
+                transaction_hash,
+                transaction_index,
+                log_index,
+                COALESCE(
+                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_fee_protocol_update_event.chain_id AND block.number = pool_fee_protocol_update_event.block),
+                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_fee_protocol_update_event.chain_id AND pool_event_block.number = pool_fee_protocol_update_event.block)
+                ) as block_timestamp,
+                NULL::TEXT as sender,
+                NULL::TEXT as recipient,
+                NULL::TEXT as owner,
+                NULL::TEXT as sqrt_price_x96,
+                NULL::TEXT as swap_liquidity,
+                NULL::INT AS swap_tick,
+                NULL::TEXT as swap_amount0,
+                NULL::TEXT as swap_amount1,
+                NULL::TEXT as position_liquidity,
+                NULL::TEXT as amount0,
+                NULL::TEXT as amount1,
+                NULL::INT as tick_lower,
+                NULL::INT as tick_upper,
+                NULL::TEXT as liquidity_event_type,
+                NULL::TEXT as flash_amount0,
+                NULL::TEXT as flash_amount1,
+                NULL::TEXT as flash_paid0,
+                NULL::TEXT as flash_paid1,
+                fee_protocol0_new::SMALLINT,
+                fee_protocol1_new::SMALLINT
+            FROM pool_fee_protocol_update_event
+            WHERE chain_id = $1 AND pool_identifier = $2
+            AND ($3::BIGINT IS NULL OR block <= $3))
+            UNION ALL
+            (SELECT
+                'fee_protocol_collect' as event_type,
+                chain_id,
+                pool_identifier,
+                block,
+                transaction_hash,
+                transaction_index,
+                log_index,
+                COALESCE(
+                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_fee_protocol_collect_event.chain_id AND block.number = pool_fee_protocol_collect_event.block),
+                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_fee_protocol_collect_event.chain_id AND pool_event_block.number = pool_fee_protocol_collect_event.block)
+                ) as block_timestamp,
+                sender,
+                recipient,
+                NULL::TEXT as owner,
+                NULL::TEXT as sqrt_price_x96,
+                NULL::TEXT as swap_liquidity,
+                NULL::INT AS swap_tick,
+                NULL::TEXT as swap_amount0,
+                NULL::TEXT as swap_amount1,
+                NULL::TEXT as position_liquidity,
+                amount0::TEXT,
+                amount1::TEXT,
+                NULL::INT as tick_lower,
+                NULL::INT as tick_upper,
+                NULL::TEXT as liquidity_event_type,
+                NULL::TEXT as flash_amount0,
+                NULL::TEXT as flash_amount1,
+                NULL::TEXT as flash_paid0,
+                NULL::TEXT as flash_paid1,
+                NULL::SMALLINT as fee_protocol0_new,
+                NULL::SMALLINT as fee_protocol1_new
+            FROM pool_fee_protocol_collect_event
             WHERE chain_id = $1 AND pool_identifier = $2
             AND ($3::BIGINT IS NULL OR block <= $3))
             UNION ALL
@@ -2216,7 +2525,9 @@ impl BlockchainCacheDatabase {
                 amount0::TEXT as flash_amount0,
                 amount1::TEXT as flash_amount1,
                 paid0::TEXT as flash_paid0,
-                paid1::TEXT as flash_paid1
+                paid1::TEXT as flash_paid1,
+                NULL::SMALLINT as fee_protocol0_new,
+                NULL::SMALLINT as fee_protocol1_new
             FROM pool_flash_event
             WHERE chain_id = $1 AND pool_identifier = $2
             AND ($3::BIGINT IS NULL OR block <= $3))
@@ -2252,7 +2563,9 @@ impl BlockchainCacheDatabase {
                 NULL::TEXT as flash_amount0,
                 NULL::TEXT as flash_amount1,
                 NULL::TEXT as flash_paid0,
-                NULL::TEXT as flash_paid1
+                NULL::TEXT as flash_paid1,
+                NULL::SMALLINT as fee_protocol0_new,
+                NULL::SMALLINT as fee_protocol1_new
             FROM pool_swap_event
             WHERE chain_id = $1 AND pool_identifier = $2
             AND (block > $3 OR (block = $3 AND transaction_index > $4) OR (block = $3 AND transaction_index = $4 AND log_index > $5))
@@ -2287,7 +2600,9 @@ impl BlockchainCacheDatabase {
                 NULL::TEXT as flash_amount0,
                 NULL::TEXT as flash_amount1,
                 NULL::TEXT as flash_paid0,
-                NULL::TEXT as flash_paid1
+                NULL::TEXT as flash_paid1,
+                NULL::SMALLINT as fee_protocol0_new,
+                NULL::SMALLINT as fee_protocol1_new
             FROM pool_liquidity_event
             WHERE chain_id = $1 AND pool_identifier = $2
             AND (block > $3 OR (block = $3 AND transaction_index > $4) OR (block = $3 AND transaction_index = $4 AND log_index > $5))
@@ -2322,8 +2637,84 @@ impl BlockchainCacheDatabase {
                 NULL::TEXT as flash_amount0,
                 NULL::TEXT as flash_amount1,
                 NULL::TEXT as flash_paid0,
-                NULL::TEXT as flash_paid1
+                NULL::TEXT as flash_paid1,
+                NULL::SMALLINT as fee_protocol0_new,
+                NULL::SMALLINT as fee_protocol1_new
             FROM pool_collect_event
+            WHERE chain_id = $1 AND pool_identifier = $2
+            AND (block > $3 OR (block = $3 AND transaction_index > $4) OR (block = $3 AND transaction_index = $4 AND log_index > $5))
+            AND ($6::BIGINT IS NULL OR block <= $6))
+            UNION ALL
+            (SELECT
+                'fee_protocol_update' as event_type,
+                chain_id,
+                pool_identifier,
+                block,
+                transaction_hash,
+                transaction_index,
+                log_index,
+                COALESCE(
+                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_fee_protocol_update_event.chain_id AND block.number = pool_fee_protocol_update_event.block),
+                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_fee_protocol_update_event.chain_id AND pool_event_block.number = pool_fee_protocol_update_event.block)
+                ) as block_timestamp,
+                NULL::TEXT as sender,
+                NULL::TEXT as recipient,
+                NULL::TEXT as owner,
+                NULL::TEXT as sqrt_price_x96,
+                NULL::TEXT as swap_liquidity,
+                NULL::INT AS swap_tick,
+                NULL::TEXT as swap_amount0,
+                NULL::TEXT as swap_amount1,
+                NULL::TEXT as position_liquidity,
+                NULL::TEXT as amount0,
+                NULL::TEXT as amount1,
+                NULL::INT as tick_lower,
+                NULL::INT as tick_upper,
+                NULL::TEXT as liquidity_event_type,
+                NULL::TEXT as flash_amount0,
+                NULL::TEXT as flash_amount1,
+                NULL::TEXT as flash_paid0,
+                NULL::TEXT as flash_paid1,
+                fee_protocol0_new::SMALLINT,
+                fee_protocol1_new::SMALLINT
+            FROM pool_fee_protocol_update_event
+            WHERE chain_id = $1 AND pool_identifier = $2
+            AND (block > $3 OR (block = $3 AND transaction_index > $4) OR (block = $3 AND transaction_index = $4 AND log_index > $5))
+            AND ($6::BIGINT IS NULL OR block <= $6))
+            UNION ALL
+            (SELECT
+                'fee_protocol_collect' as event_type,
+                chain_id,
+                pool_identifier,
+                block,
+                transaction_hash,
+                transaction_index,
+                log_index,
+                COALESCE(
+                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_fee_protocol_collect_event.chain_id AND block.number = pool_fee_protocol_collect_event.block),
+                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_fee_protocol_collect_event.chain_id AND pool_event_block.number = pool_fee_protocol_collect_event.block)
+                ) as block_timestamp,
+                sender,
+                recipient,
+                NULL::TEXT as owner,
+                NULL::TEXT as sqrt_price_x96,
+                NULL::TEXT as swap_liquidity,
+                NULL::INT AS swap_tick,
+                NULL::TEXT as swap_amount0,
+                NULL::TEXT as swap_amount1,
+                NULL::TEXT as position_liquidity,
+                amount0::TEXT,
+                amount1::TEXT,
+                NULL::INT as tick_lower,
+                NULL::INT as tick_upper,
+                NULL::TEXT as liquidity_event_type,
+                NULL::TEXT as flash_amount0,
+                NULL::TEXT as flash_amount1,
+                NULL::TEXT as flash_paid0,
+                NULL::TEXT as flash_paid1,
+                NULL::SMALLINT as fee_protocol0_new,
+                NULL::SMALLINT as fee_protocol1_new
+            FROM pool_fee_protocol_collect_event
             WHERE chain_id = $1 AND pool_identifier = $2
             AND (block > $3 OR (block = $3 AND transaction_index > $4) OR (block = $3 AND transaction_index = $4 AND log_index > $5))
             AND ($6::BIGINT IS NULL OR block <= $6))
@@ -2357,7 +2748,9 @@ impl BlockchainCacheDatabase {
                 amount0::TEXT as flash_amount0,
                 amount1::TEXT as flash_amount1,
                 paid0::TEXT as flash_paid0,
-                paid1::TEXT as flash_paid1
+                paid1::TEXT as flash_paid1,
+                NULL::SMALLINT as fee_protocol0_new,
+                NULL::SMALLINT as fee_protocol1_new
             FROM pool_flash_event
             WHERE chain_id = $1 AND pool_identifier = $2
             AND (block > $3 OR (block = $3 AND transaction_index > $4) OR (block = $3 AND transaction_index = $4 AND log_index > $5))

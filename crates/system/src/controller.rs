@@ -17,14 +17,15 @@ use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use nautilus_common::{
     actor::{
-        DataActor, DataActorCore, data_actor::DataActorConfig, registry::try_get_actor_unchecked,
+        DataActor, DataActorCore, DataActorNative, data_actor::DataActorConfig,
+        registry::try_get_actor_unchecked,
     },
     component::Component,
     msgbus::{Endpoint, MStr, TypedHandler, get_message_bus},
     nautilus_actor,
 };
 use nautilus_model::identifiers::{ActorId, StrategyId};
-use nautilus_trading::Strategy;
+use nautilus_trading::{Strategy, StrategyNative};
 
 use crate::{messages::ControllerCommand, trader::Trader};
 
@@ -104,7 +105,7 @@ impl Controller {
     /// Returns an error if actor registration or startup fails.
     pub fn create_actor<T>(&self, actor: T, start: bool) -> anyhow::Result<ActorId>
     where
-        T: DataActor + Component + Debug + 'static,
+        T: DataActor + DataActorNative + Component + Debug + 'static,
     {
         let actor_id = actor.actor_id();
         self.trader.borrow_mut().add_actor(actor)?;
@@ -126,7 +127,7 @@ impl Controller {
     ) -> anyhow::Result<ActorId>
     where
         F: FnOnce() -> anyhow::Result<T>,
-        T: DataActor + Component + Debug + 'static,
+        T: DataActor + DataActorNative + Component + Debug + 'static,
     {
         let actor = factory()?;
         self.create_actor(actor, start)
@@ -139,7 +140,7 @@ impl Controller {
     /// Returns an error if strategy registration or startup fails.
     pub fn create_strategy<T>(&self, mut strategy: T, start: bool) -> anyhow::Result<StrategyId>
     where
-        T: Strategy + Component + Debug + 'static,
+        T: Strategy + StrategyNative + DataActorNative + Component + Debug + 'static,
     {
         let strategy_id = self
             .trader
@@ -164,7 +165,7 @@ impl Controller {
     ) -> anyhow::Result<StrategyId>
     where
         F: FnOnce() -> anyhow::Result<T>,
-        T: Strategy + Component + Debug + 'static,
+        T: Strategy + StrategyNative + DataActorNative + Component + Debug + 'static,
     {
         let strategy = factory()?;
         self.create_strategy(strategy, start)
@@ -194,7 +195,7 @@ impl Controller {
     ///
     /// Returns an error if the actor cannot be removed.
     pub fn remove_actor(&self, actor_id: &ActorId) -> anyhow::Result<()> {
-        if actor_id.inner() == self.actor_id().inner() {
+        if actor_id.inner() == self.core.actor_id().inner() {
             return Ok(());
         }
 
@@ -288,7 +289,7 @@ impl Controller {
     }
 
     fn register_execute_endpoint(&self) {
-        let controller_id = self.actor_id().inner();
+        let controller_id = self.core.actor_id().inner();
         let handler = TypedHandler::from(move |command: &ControllerCommand| {
             if let Some(mut controller) = try_get_actor_unchecked::<Self>(&controller_id) {
                 if let Err(e) = controller.execute(command.clone()) {
@@ -546,7 +547,7 @@ mod tests {
                 ..Default::default()
             }),
         );
-        let controller_id = controller.actor_id();
+        let controller_id = controller.core.actor_id();
 
         trader.borrow_mut().add_actor(controller).unwrap();
         trader.borrow_mut().start().unwrap();

@@ -35,6 +35,7 @@ use std::{collections::HashMap, fmt::Debug, num::NonZeroU32, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
     consts::NAUTILUS_USER_AGENT, datetime::SECONDS_IN_DAY, hex, nanos::UnixNanos, time::AtomicTime,
 };
@@ -48,7 +49,7 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use nautilus_network::{
-    http::{HttpClient, HttpResponse, Method},
+    http::{HttpClient, HttpResponse, Method, USER_AGENT},
     ratelimiter::quota::Quota,
 };
 use serde::Serialize;
@@ -458,7 +459,7 @@ impl BinanceRawSpotHttpClient {
 
     fn default_headers(credential: &Option<SigningCredential>) -> HashMap<String, String> {
         let mut headers = HashMap::new();
-        headers.insert("User-Agent".to_string(), NAUTILUS_USER_AGENT.to_string());
+        headers.insert(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string());
         headers.insert("Accept".to_string(), "application/sbe".to_string());
         headers.insert("X-MBX-SBE".to_string(), SBE_SCHEMA_HEADER.to_string());
 
@@ -1584,7 +1585,7 @@ impl BinanceSpotHttpClient {
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<TradeTick>> {
         let symbol = instrument_id.symbol.inner();
-        let instrument = self.instrument_from_cache(symbol)?;
+        let instrument = self.instrument_from_cache_by_id(instrument_id)?;
         let ts_init = self.generate_ts_init();
 
         let trades = self
@@ -1628,8 +1629,9 @@ impl BinanceSpotHttpClient {
             a => anyhow::bail!("Binance does not support {a:?} aggregation"),
         };
 
-        let symbol = bar_type.instrument_id().symbol;
-        let instrument = self.instrument_from_cache(symbol.inner())?;
+        let instrument_id = bar_type.instrument_id();
+        let symbol = instrument_id.symbol;
+        let instrument = self.instrument_from_cache_by_id(instrument_id)?;
         let ts_init = self.generate_ts_init();
 
         let klines = self
@@ -1645,6 +1647,16 @@ impl BinanceSpotHttpClient {
             .map_err(|e| anyhow::anyhow!(e))?;
 
         parse_klines_to_bars(&klines, bar_type, &instrument, ts_init)
+    }
+
+    fn instrument_from_cache_by_id(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<InstrumentAny> {
+        self.instruments_cache
+            .get(&instrument_id.symbol.inner())
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id).into())
     }
 
     /// Requests the account state with Nautilus types.

@@ -25,10 +25,11 @@ use std::{
     rc::Rc,
 };
 
+use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use nautilus_common::{
     actor::{
-        Actor, DataActor,
+        Actor, DataActor, DataActorNative,
         data_actor::DataActorCore,
         registry::{try_get_actor_unchecked, with_actor_registry},
     },
@@ -39,15 +40,16 @@ use nautilus_common::{
     python::{
         cache::PyCache,
         clock::PyClock,
+        config_error_to_pyvalue_err,
         indicators::{registered_python_indicators, wrap_python_indicator},
         logging::PyLogger,
+        order_factory::PyOrderFactory,
     },
     signal::Signal,
     timer::{TimeEvent, TimeEventCallback},
 };
 use nautilus_core::{
     Params, from_pydict,
-    nanos::UnixNanos,
     python::{IntoPyObjectNautilusExt, to_pyruntime_err, to_pyvalue_err},
 };
 use nautilus_model::{
@@ -86,7 +88,10 @@ use pyo3::{
 };
 use ustr::Ustr;
 
-use crate::strategy::{ImportableStrategyConfig, Strategy, StrategyConfig, StrategyCore};
+use crate::strategy::{
+    BatchModifyOrder, ImportableStrategyConfig, Strategy, StrategyConfig, StrategyCore,
+    StrategyNative,
+};
 
 #[pyo3::pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -135,8 +140,8 @@ impl StrategyConfig {
         log_commands: bool,
         log_rejected_due_post_only_as_warning: bool,
         _kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> Self {
-        Self {
+    ) -> PyResult<Self> {
+        let config = Self {
             strategy_id,
             order_id_tag,
             use_uuid_client_order_ids,
@@ -153,7 +158,9 @@ impl StrategyConfig {
             log_events,
             log_commands,
             log_rejected_due_post_only_as_warning,
-        }
+        };
+        config.validate().map_err(config_error_to_pyvalue_err)?;
+        Ok(config)
     }
 
     #[getter]
@@ -832,25 +839,37 @@ impl Deref for PyStrategyInner {
     type Target = DataActorCore;
 
     fn deref(&self) -> &Self::Target {
-        &self.core
+        DataActorNative::core(&self.core)
     }
 }
 
 impl DerefMut for PyStrategyInner {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        DataActorNative::core_mut(&mut self.core)
+    }
+}
+
+impl DataActorNative for PyStrategyInner {
+    fn core(&self) -> &DataActorCore {
+        DataActorNative::core(&self.core)
+    }
+
+    fn core_mut(&mut self) -> &mut DataActorCore {
+        DataActorNative::core_mut(&mut self.core)
+    }
+}
+
+impl StrategyNative for PyStrategyInner {
+    fn strategy_core(&self) -> &StrategyCore {
+        &self.core
+    }
+
+    fn strategy_core_mut(&mut self) -> &mut StrategyCore {
         &mut self.core
     }
 }
 
 impl Strategy for PyStrategyInner {
-    fn core(&self) -> &StrategyCore {
-        &self.core
-    }
-
-    fn core_mut(&mut self) -> &mut StrategyCore {
-        &mut self.core
-    }
-
     fn external_order_claims(&self) -> Option<Vec<InstrumentId>> {
         self.core.config.external_order_claims.clone()
     }
@@ -1393,10 +1412,23 @@ impl PyStrategy {
     fn py_portfolio(&self) -> PyResult<PyPortfolio> {
         let inner = self.inner();
         if inner.core.actor.is_registered() {
-            Ok(PyPortfolio::from_rc(inner.core.portfolio().clone()))
+            Ok(PyPortfolio::from_rc(inner.portfolio_rc()))
         } else {
             Err(to_pyruntime_err(
                 "Strategy must be registered with a trader before accessing portfolio",
+            ))
+        }
+    }
+
+    #[getter]
+    #[pyo3(name = "order_factory")]
+    fn py_order_factory(&self) -> PyResult<PyOrderFactory> {
+        let inner = self.inner();
+        if inner.core.actor.is_registered() {
+            Ok(PyOrderFactory::from_rc(inner.order_factory_rc()))
+        } else {
+            Err(to_pyruntime_err(
+                "Strategy must be registered with a trader before accessing order_factory",
             ))
         }
     }
@@ -1507,13 +1539,17 @@ impl PyStrategy {
     #[getter]
     #[pyo3(name = "registered_indicators")]
     fn py_registered_indicators(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        registered_python_indicators(py, self.inner().core.registered_indicators())
+        let inner = self.inner();
+        registered_python_indicators(
+            py,
+            DataActorNative::core(&inner.core).registered_indicators(),
+        )
     }
 
     #[pyo3(name = "indicators_initialized")]
     fn py_indicators_initialized(&self, _py: Python<'_>) -> PyResult<bool> {
-        self.inner()
-            .core
+        let inner = self.inner();
+        DataActorNative::core(&inner.core)
             .indicators_initialized()
             .map_err(to_pyruntime_err)
     }
@@ -1526,8 +1562,8 @@ impl PyStrategy {
         indicator: Py<PyAny>,
     ) {
         let indicator = wrap_python_indicator(py, indicator);
-        self.inner_mut()
-            .core
+        let inner = self.inner_mut();
+        DataActorNative::core_mut(&mut inner.core)
             .register_indicator_for_quote_ticks(instrument_id, indicator);
     }
 
@@ -1539,8 +1575,8 @@ impl PyStrategy {
         indicator: Py<PyAny>,
     ) {
         let indicator = wrap_python_indicator(py, indicator);
-        self.inner_mut()
-            .core
+        let inner = self.inner_mut();
+        DataActorNative::core_mut(&mut inner.core)
             .register_indicator_for_trade_ticks(instrument_id, indicator);
     }
 
@@ -1552,9 +1588,8 @@ impl PyStrategy {
         indicator: Py<PyAny>,
     ) {
         let indicator = wrap_python_indicator(py, indicator);
-        self.inner_mut()
-            .core
-            .register_indicator_for_bars(bar_type, indicator);
+        let inner = self.inner_mut();
+        DataActorNative::core_mut(&mut inner.core).register_indicator_for_bars(bar_type, indicator);
     }
 
     #[pyo3(name = "submit_order")]
@@ -1636,6 +1671,25 @@ impl PyStrategy {
             params_map,
         )
         .map_err(to_pyruntime_err)
+    }
+
+    #[pyo3(name = "modify_orders")]
+    #[pyo3(signature = (updates, client_id=None, params=None))]
+    fn py_modify_orders(
+        &mut self,
+        updates: Vec<BatchModifyOrder>,
+        client_id: Option<ClientId>,
+        params: Option<Py<PyDict>>,
+    ) -> PyResult<()> {
+        let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
+            match params {
+                Some(dict) => from_pydict(py, &dict),
+                None => Ok(None),
+            }
+        })?;
+
+        Strategy::modify_orders(self.inner_mut(), updates, client_id, params_map)
+            .map_err(to_pyruntime_err)
     }
 
     #[pyo3(name = "cancel_order")]
@@ -2661,8 +2715,8 @@ impl PyStrategy {
         &mut self,
         data_type: DataType,
         client_id: ClientId,
-        start: Option<u64>,
-        end: Option<u64>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         limit: Option<usize>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
@@ -2673,9 +2727,6 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let start = start.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-        let end = end.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-
         let request_id = DataActor::request_data(
             self.inner_mut(),
             data_type,
@@ -2694,8 +2745,8 @@ impl PyStrategy {
     fn py_request_instrument(
         &mut self,
         instrument_id: InstrumentId,
-        start: Option<u64>,
-        end: Option<u64>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
@@ -2705,9 +2756,6 @@ impl PyStrategy {
                 None => Ok(None),
             }
         })?;
-        let start = start.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-        let end = end.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-
         let request_id = DataActor::request_instrument(
             self.inner_mut(),
             instrument_id,
@@ -2725,8 +2773,8 @@ impl PyStrategy {
     fn py_request_instruments(
         &mut self,
         venue: Option<Venue>,
-        start: Option<u64>,
-        end: Option<u64>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
     ) -> PyResult<String> {
@@ -2736,9 +2784,6 @@ impl PyStrategy {
                 None => Ok(None),
             }
         })?;
-        let start = start.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-        let end = end.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-
         let request_id = DataActor::request_instruments(
             self.inner_mut(),
             venue,
@@ -2779,13 +2824,13 @@ impl PyStrategy {
         Ok(request_id.to_string())
     }
 
-    #[pyo3(name = "request_quotes")]
+    #[pyo3(name = "request_book_deltas")]
     #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None))]
-    fn py_request_quotes(
+    fn py_request_book_deltas(
         &mut self,
         instrument_id: InstrumentId,
-        start: Option<u64>,
-        end: Option<u64>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
@@ -2797,9 +2842,72 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let start = start.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-        let end = end.map(|ts| UnixNanos::from(ts).to_datetime_utc());
+        let request_id = DataActor::request_book_deltas(
+            self.inner_mut(),
+            instrument_id,
+            start,
+            end,
+            limit,
+            client_id,
+            params_map,
+        )
+        .map_err(to_pyvalue_err)?;
+        Ok(request_id.to_string())
+    }
 
+    #[pyo3(name = "request_book_depth")]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, depth=None, client_id=None, params=None))]
+    #[expect(clippy::too_many_arguments)]
+    fn py_request_book_depth(
+        &mut self,
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<usize>,
+        depth: Option<usize>,
+        client_id: Option<ClientId>,
+        params: Option<Py<PyDict>>,
+    ) -> PyResult<String> {
+        let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
+            match params {
+                Some(dict) => from_pydict(py, &dict),
+                None => Ok(None),
+            }
+        })?;
+        let limit = limit.and_then(NonZeroUsize::new);
+        let depth = depth.and_then(NonZeroUsize::new);
+        let request_id = DataActor::request_book_depth(
+            self.inner_mut(),
+            instrument_id,
+            start,
+            end,
+            limit,
+            depth,
+            client_id,
+            params_map,
+        )
+        .map_err(to_pyvalue_err)?;
+        Ok(request_id.to_string())
+    }
+
+    #[pyo3(name = "request_quotes")]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None))]
+    fn py_request_quotes(
+        &mut self,
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<usize>,
+        client_id: Option<ClientId>,
+        params: Option<Py<PyDict>>,
+    ) -> PyResult<String> {
+        let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
+            match params {
+                Some(dict) => from_pydict(py, &dict),
+                None => Ok(None),
+            }
+        })?;
+        let limit = limit.and_then(NonZeroUsize::new);
         let request_id = DataActor::request_quotes(
             self.inner_mut(),
             instrument_id,
@@ -2818,8 +2926,8 @@ impl PyStrategy {
     fn py_request_trades(
         &mut self,
         instrument_id: InstrumentId,
-        start: Option<u64>,
-        end: Option<u64>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
@@ -2831,9 +2939,6 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let start = start.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-        let end = end.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-
         let request_id = DataActor::request_trades(
             self.inner_mut(),
             instrument_id,
@@ -2852,8 +2957,8 @@ impl PyStrategy {
     fn py_request_funding_rates(
         &mut self,
         instrument_id: InstrumentId,
-        start: Option<u64>,
-        end: Option<u64>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
@@ -2865,9 +2970,6 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let start = start.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-        let end = end.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-
         let request_id = DataActor::request_funding_rates(
             self.inner_mut(),
             instrument_id,
@@ -2886,8 +2988,8 @@ impl PyStrategy {
     fn py_request_bars(
         &mut self,
         bar_type: BarType,
-        start: Option<u64>,
-        end: Option<u64>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
@@ -2899,9 +3001,6 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let start = start.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-        let end = end.map(|ts| UnixNanos::from(ts).to_datetime_utc());
-
         let request_id = DataActor::request_bars(
             self.inner_mut(),
             bar_type,
@@ -3930,7 +4029,7 @@ class IndicatorEventStrategy:
                 .py_submit_order_list(py, order_list, None, None, Some(params.unbind()))
                 .unwrap();
 
-            let cache = rust_strategy.inner().core.cache();
+            let cache = DataActor::cache(rust_strategy.inner());
             let cached_order1 = cache.order(&client_order_id1).unwrap();
             let cached_order2 = cache.order(&client_order_id2).unwrap();
             let order_list_id = cached_order1.order_list_id().unwrap();
@@ -3978,7 +4077,7 @@ class IndicatorEventStrategy:
             let py_order = order_any_to_pyobject(py, order).unwrap();
 
             {
-                let mut clock = rust_strategy.inner_mut().core.clock();
+                let mut clock = rust_strategy.inner_mut().core.clock_mut();
                 clock
                     .set_time_alert_ns(&timer_name, UnixNanos::from(1), None, None)
                     .unwrap();
@@ -3996,7 +4095,7 @@ class IndicatorEventStrategy:
             let clock_timer_exists = rust_strategy
                 .inner_mut()
                 .core
-                .clock()
+                .clock_mut()
                 .timer_names()
                 .contains(&timer_name.as_str());
 

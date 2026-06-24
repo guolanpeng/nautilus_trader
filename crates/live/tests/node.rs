@@ -62,7 +62,8 @@ use nautilus_model::{
     types::{AccountBalance, MarginBalance, Price, Quantity},
 };
 use nautilus_trading::{
-    ExecutionAlgorithm, ExecutionAlgorithmConfig, ExecutionAlgorithmCore, nautilus_strategy,
+    ExecutionAlgorithmConfig, ExecutionAlgorithmCore, nautilus_execution_algorithm,
+    nautilus_strategy,
     strategy::{StrategyConfig, StrategyCore},
 };
 use rstest::rstest;
@@ -104,16 +105,19 @@ nautilus_strategy!(TestStrategy);
 #[derive(Debug)]
 struct ClaimingTestStrategy {
     core: StrategyCore,
+    external_order_claims: Vec<InstrumentId>,
 }
 
 impl ClaimingTestStrategy {
     fn new(strategy_id: StrategyId, instrument_id: InstrumentId) -> Self {
+        let external_order_claims = vec![instrument_id];
         Self {
             core: StrategyCore::new(StrategyConfig {
                 strategy_id: Some(strategy_id),
-                external_order_claims: Some(vec![instrument_id]),
+                external_order_claims: Some(external_order_claims.clone()),
                 ..Default::default()
             }),
+            external_order_claims,
         }
     }
 }
@@ -122,7 +126,7 @@ impl DataActor for ClaimingTestStrategy {}
 
 nautilus_strategy!(ClaimingTestStrategy, {
     fn external_order_claims(&self) -> Option<Vec<InstrumentId>> {
-        self.core.config.external_order_claims.clone()
+        Some(self.external_order_claims.clone())
     }
 });
 
@@ -141,17 +145,11 @@ impl TestExecAlgorithm {
 
 impl DataActor for TestExecAlgorithm {}
 
-nautilus_actor!(TestExecAlgorithm);
-
-impl ExecutionAlgorithm for TestExecAlgorithm {
-    fn core_mut(&mut self) -> &mut ExecutionAlgorithmCore {
-        &mut self.core
-    }
-
+nautilus_execution_algorithm!(TestExecAlgorithm, {
     fn on_order(&mut self, _order: OrderAny) -> anyhow::Result<()> {
         Ok(())
     }
-}
+});
 
 #[rstest]
 fn test_handle_initial_state() {

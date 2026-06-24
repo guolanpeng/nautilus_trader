@@ -116,6 +116,10 @@ pub fn generate_reconciliation_order_events(
 /// Returns `None` for pending venue states (`PendingUpdate`, `PendingCancel`)
 /// regardless of local state, since an unconfirmed amend or cancel must not
 /// drive any local mutation until the venue surfaces a confirmed status.
+///
+/// Returns `None` for a `Canceled` report that references a previously-promoted
+/// `venue_order_id` whose successor is still live in the cache (the cancel-half
+/// of a cancel-replace modify).
 #[must_use]
 pub fn reconcile_order_report(
     order: &OrderAny,
@@ -174,7 +178,31 @@ pub fn reconcile_order_report(
                 None
             }
         }
-        OrderStatus::Canceled => Some(create_reconciliation_canceled(order, report, ts_now)),
+        OrderStatus::Canceled => {
+            // TODO: Venue cancel-replace handling that belongs in the adapters, not generic
+            // reconciliation. Remove once each cancel-replace adapter suppresses its stale leg
+            // on the query/reconcile path; until then this is the engine's only cover for a
+            // superseded-leg Canceled arriving via inflight query or reconnect snapshot.
+            let report_venue_order_id = report.venue_order_id;
+            if let Some(cached_venue_order_id) = order.venue_order_id()
+                && cached_venue_order_id != report_venue_order_id
+                && order
+                    .venue_order_ids()
+                    .iter()
+                    .any(|v| **v == report_venue_order_id)
+            {
+                log::info!(
+                    "Suppressing Canceled for {} on previously-promoted venue_order_id {}: \
+                     current venue_order_id is {}",
+                    order.client_order_id(),
+                    report_venue_order_id,
+                    cached_venue_order_id,
+                );
+                return None;
+            }
+
+            Some(create_reconciliation_canceled(order, report, ts_now))
+        }
         OrderStatus::Expired => Some(create_reconciliation_expired(order, report, ts_now)),
 
         OrderStatus::PartiallyFilled | OrderStatus::Filled => {

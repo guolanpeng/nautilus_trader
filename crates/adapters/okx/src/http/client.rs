@@ -47,6 +47,7 @@ use std::{
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
     AtomicMap, AtomicTime, UnixNanos, consts::NAUTILUS_USER_AGENT,
     datetime::NANOSECONDS_IN_MILLISECOND, env::get_or_env_var, string::secret::REDACTED,
@@ -111,7 +112,7 @@ use crate::{
     common::{
         consts::{
             OKX_FIELD_SCODE, OKX_FIELD_SMSG, OKX_HTTP_URL, OKX_NAUTILUS_BROKER_ID,
-            OKX_SUPPORTED_ORDER_TYPES, OKX_SUPPORTED_TIME_IN_FORCE, should_retry_error_code,
+            OKX_SUPPORTED_ORDER_TYPES, OKX_SUPPORTED_TIME_IN_FORCE,
         },
         credential::Credential,
         enums::{
@@ -762,7 +763,7 @@ impl OKXRawHttpClient {
                 if resp.status.is_success() {
                     let okx_response: OKXResponse<T> = deserialize_okx_response(&resp.body)
                         .map_err(|e| {
-                            log::error!("Failed to deserialize OKXResponse: {e}");
+                            log::warn!("Failed to deserialize OKXResponse: {e}");
                             OKXHttpError::JsonError(e.to_string())
                         })?;
 
@@ -779,7 +780,7 @@ impl OKXRawHttpClient {
                     if resp.status.as_u16() == StatusCode::NOT_FOUND.as_u16() {
                         log::debug!("HTTP 404 with body: {error_body}");
                     } else {
-                        log::error!(
+                        log::warn!(
                             "HTTP error {} with body: {error_body}",
                             resp.status.as_str()
                         );
@@ -811,16 +812,7 @@ impl OKXRawHttpClient {
         //
         // Note: OKX returns many permanent errors which should NOT be retried
         // (e.g., "Invalid instrument", "Insufficient balance", "Invalid API Key")
-        let should_retry = |error: &OKXHttpError| -> bool {
-            match error {
-                OKXHttpError::HttpClientError(_) => true,
-                OKXHttpError::UnexpectedStatus { status, .. } => {
-                    status.as_u16() >= 500 || status.as_u16() == 429
-                }
-                OKXHttpError::OkxError { error_code, .. } => should_retry_error_code(error_code),
-                _ => false,
-            }
-        };
+        let should_retry = |error: &OKXHttpError| -> bool { error.is_retryable() };
 
         let create_error = |msg: String| -> OKXHttpError {
             if msg == "canceled" {
@@ -830,7 +822,8 @@ impl OKXRawHttpClient {
             }
         };
 
-        self.retry_manager
+        let result = self
+            .retry_manager
             .execute_with_retry_with_cancel(
                 path,
                 operation,
@@ -838,7 +831,15 @@ impl OKXRawHttpClient {
                 create_error,
                 &self.cancellation_token,
             )
-            .await
+            .await;
+
+        if let Err(ref e) = result
+            && e.is_retryable()
+        {
+            log::error!("Request exhausted retries: path={path}, error={e}");
+        }
+
+        result
     }
 
     /// Sets the position mode for an account.
@@ -1757,6 +1758,15 @@ impl OKXHttpClient {
             .ok_or_else(|| anyhow::anyhow!("Instrument {symbol} not in cache"))
     }
 
+    fn instrument_from_cache_by_id(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<InstrumentAny> {
+        self.instruments_cache
+            .get_cloned(&instrument_id.symbol.inner())
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id).into())
+    }
+
     /// Cancel all pending HTTP requests.
     pub fn cancel_all_requests(&self) {
         self.inner.cancel_all_requests();
@@ -2179,7 +2189,7 @@ impl OKXHttpClient {
 
         let raw_inst = resp
             .first()
-            .ok_or_else(|| anyhow::anyhow!("Instrument {symbol} not found"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         // Skip pre-open instruments which have incomplete/empty field values
         if raw_inst.state == OKXInstrumentStatus::Preopen {
@@ -2521,7 +2531,7 @@ impl OKXHttpClient {
         instrument_id: InstrumentId,
         depth: Option<u32>,
     ) -> anyhow::Result<OrderBook> {
-        let inst = self.instrument_from_cache(instrument_id.symbol.inner())?;
+        let inst = self.instrument_from_cache_by_id(instrument_id)?;
         let price_precision = inst.price_precision();
         let size_precision = inst.size_precision();
 
@@ -2579,7 +2589,7 @@ impl OKXHttpClient {
         instrument_id: InstrumentId,
         depth: Option<u32>,
     ) -> anyhow::Result<OrderBookDeltas> {
-        let inst = self.instrument_from_cache(instrument_id.symbol.inner())?;
+        let inst = self.instrument_from_cache_by_id(instrument_id)?;
         let price_precision = inst.price_precision();
         let size_precision = inst.size_precision();
 
@@ -2787,7 +2797,7 @@ impl OKXHttpClient {
         let end_ms = end.map(|e| e.timestamp_millis());
 
         let ts_init = self.generate_ts_init();
-        let inst = self.instrument_from_cache(instrument_id.symbol.inner())?;
+        let inst = self.instrument_from_cache_by_id(instrument_id)?;
 
         // Historical pagination walks backwards using trade IDs, OKX does not honour timestamps for
         // standalone `before` requests (type=2)
@@ -3193,8 +3203,9 @@ impl OKXHttpClient {
         });
         let now_ms = now.timestamp_millis();
 
-        let symbol = bar_type.instrument_id().symbol;
-        let inst = self.instrument_from_cache(symbol.inner())?;
+        let instrument_id = bar_type.instrument_id();
+        let symbol = instrument_id.symbol;
+        let inst = self.instrument_from_cache_by_id(instrument_id)?;
 
         let mut out: Vec<Bar> = Vec::new();
         let mut pages = 0usize;
@@ -5868,15 +5879,9 @@ impl OKXHttpClient {
                 return Ok(reports);
             }
 
-            // OKX's `/orders-algo-history` endpoint rejects calls that
-            // carry neither a `state` nor an `algoId` / `algoClOrdId`
-            // narrowing with code 50015. The reconciliation path wants
-            // only currently-live algo orders (those already appear in
-            // the pending response above), so skip the history leg when
-            // the caller supplied no narrowing. Specific-lookup callers
-            // still hit history because `has_specific_lookup` implies
-            // `algoId` or `algoClOrdId`, which the endpoint accepts.
-            if state.is_some() || has_specific_lookup {
+            // `/orders-algo-history` rejects anything but `state`/`algoId`
+            // with 50015; `algoClOrdId` alone is not accepted.
+            if state.is_some() || algo_id.is_some() {
                 let remaining = limit.map(|l| (l as usize).saturating_sub(reports.len()));
                 let history = self.paginate_algo_history(&params, remaining).await?;
                 self.collect_algo_reports(

@@ -98,7 +98,7 @@ mod macros;
 
 #[doc(hidden)]
 pub mod _macro_reexports {
-    pub use nautilus_common::actor::DataActorCore;
+    pub use nautilus_common::actor::{DataActorCore, DataActorNative};
 }
 
 pub mod algorithm;
@@ -109,10 +109,12 @@ pub mod strategy;
 pub mod examples;
 
 pub use algorithm::{
-    ExecutionAlgorithm, ExecutionAlgorithmConfig, ExecutionAlgorithmCore,
+    ExecutionAlgorithm, ExecutionAlgorithmConfig, ExecutionAlgorithmCore, ExecutionAlgorithmNative,
     ImportableExecAlgorithmConfig, TwapAlgorithm, TwapAlgorithmConfig,
 };
-pub use strategy::{ImportableStrategyConfig, Strategy, StrategyConfig, StrategyCore};
+pub use strategy::{
+    ImportableStrategyConfig, Strategy, StrategyConfig, StrategyCore, StrategyNative,
+};
 
 #[cfg(feature = "python")]
 pub mod python;

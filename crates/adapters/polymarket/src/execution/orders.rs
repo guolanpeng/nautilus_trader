@@ -13,7 +13,10 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_common::messages::execution::{ModifyOrder, SubmitOrder, SubmitOrderList};
+use nautilus_common::{
+    cache::InstrumentLookupError,
+    messages::execution::{ModifyOrder, SubmitOrder, SubmitOrderList},
+};
 use nautilus_model::{
     enums::{LiquiditySide, OrderSide, OrderType, TimeInForce},
     identifiers::VenueOrderId,
@@ -78,9 +81,8 @@ impl PolymarketExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         let fill_tracker = self.fill_tracker.clone();
+        let order_identities = self.order_identities.clone();
         let pending_submits = self.pending_submits.clone();
-        let pending_fills = self.pending_fills.clone();
-        let pending_order_reports = self.pending_order_reports.clone();
         let pending_cancels = self.pending_cancels.clone();
         let account_id = self.core.account_id;
         let size_precision = instrument.size_precision();
@@ -104,8 +106,7 @@ impl PolymarketExecutionClient {
                         &emitter,
                         clock,
                         &fill_tracker,
-                        &pending_fills,
-                        &pending_order_reports,
+                        &order_identities,
                         &pending_cancels,
                         account_id,
                         size_precision,
@@ -132,9 +133,8 @@ impl PolymarketExecutionClient {
                         &emitter,
                         clock,
                         &fill_tracker,
+                        &order_identities,
                         &pending_submits,
-                        &pending_fills,
-                        &pending_order_reports,
                         &pending_cancels,
                         account_id,
                         size_precision,
@@ -153,8 +153,7 @@ impl PolymarketExecutionClient {
                     }
                 }
                 Err(e) => {
-                    let ts_now = clock.get_time_ns();
-                    emitter.emit_order_rejected(&order, &format!("{e}"), ts_now, false);
+                    reject_submit_order(&order, &format!("{e}"), &emitter, clock, &pending_cancels);
                 }
             }
             Ok(())
@@ -198,9 +197,8 @@ impl PolymarketExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         let fill_tracker = self.fill_tracker.clone();
+        let order_identities = self.order_identities.clone();
         let pending_submits = self.pending_submits.clone();
-        let pending_fills = self.pending_fills.clone();
-        let pending_order_reports = self.pending_order_reports.clone();
         let pending_cancels = self.pending_cancels.clone();
         let account_id = self.core.account_id;
         let size_precision = instrument.size_precision();
@@ -280,8 +278,7 @@ impl PolymarketExecutionClient {
                         &emitter,
                         clock,
                         &fill_tracker,
-                        &pending_fills,
-                        &pending_order_reports,
+                        &order_identities,
                         &pending_cancels,
                         account_id,
                         size_precision,
@@ -303,11 +300,10 @@ impl PolymarketExecutionClient {
                         check_fok_status(
                             &submitter,
                             &order_id,
+                            &order,
                             &fill_tracker,
                             &emitter,
                             account_id,
-                            order.instrument_id(),
-                            order.order_side(),
                             size_precision,
                             price_precision,
                             clock,
@@ -346,9 +342,8 @@ impl PolymarketExecutionClient {
                             &emitter,
                             clock,
                             &fill_tracker,
+                            &order_identities,
                             &pending_submits,
-                            &pending_fills,
-                            &pending_order_reports,
                             &pending_cancels,
                             account_id,
                             size_precision,
@@ -387,7 +382,7 @@ impl PolymarketExecutionClient {
             None => {
                 self.emitter.emit_order_denied(
                     order,
-                    &format!("Instrument not found: {}", order.instrument_id()),
+                    &InstrumentLookupError::not_found(order.instrument_id()).to_string(),
                 );
                 None
             }
@@ -395,14 +390,7 @@ impl PolymarketExecutionClient {
     }
 
     pub(super) fn submit_order_command(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
-        let order = self
-            .core
-            .cache()
-            .order(&cmd.client_order_id)
-            .map(|o| o.clone())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Order not found in cache for {}", cmd.client_order_id)
-            })?;
+        let order = self.core.cache().try_order_owned(&cmd.client_order_id)?;
 
         if order.is_closed() {
             log::warn!("Cannot submit closed order {}", order.client_order_id());
@@ -511,9 +499,8 @@ impl PolymarketExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         let fill_tracker = self.fill_tracker.clone();
+        let order_identities = self.order_identities.clone();
         let pending_submits = self.pending_submits.clone();
-        let pending_fills = self.pending_fills.clone();
-        let pending_order_reports = self.pending_order_reports.clone();
         let pending_cancels = self.pending_cancels.clone();
         let pending_tasks = self.pending_tasks.clone();
         let stopping = self.stopping.clone();
@@ -572,9 +559,8 @@ impl PolymarketExecutionClient {
                         &emitter,
                         clock,
                         &fill_tracker,
+                        &order_identities,
                         &pending_submits,
-                        &pending_fills,
-                        &pending_order_reports,
                         &pending_cancels,
                         account_id,
                     )
@@ -597,8 +583,7 @@ impl PolymarketExecutionClient {
                                 &emitter,
                                 clock,
                                 &fill_tracker,
-                                &pending_fills,
-                                &pending_order_reports,
+                                &order_identities,
                                 &pending_cancels,
                                 &pending_tasks,
                                 &stopping,
@@ -619,9 +604,8 @@ impl PolymarketExecutionClient {
                                         &emitter,
                                         clock,
                                         &fill_tracker,
+                                        &order_identities,
                                         &pending_submits,
-                                        &pending_fills,
-                                        &pending_order_reports,
                                         &pending_cancels,
                                         account_id,
                                         batch_order.size_precision,

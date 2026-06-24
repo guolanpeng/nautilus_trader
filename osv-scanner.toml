@@ -48,24 +48,12 @@ id = "RUSTSEC-2025-0100"
 reason = "unic-ucd-ident unmaintained, transitive via pyo3-stub-gen (dev tool only)"
 
 [[IgnoredVulns]]
-id = "RUSTSEC-2026-0176"
-reason = "pyo3 list/tuple iterator OOB read; no local affected API use"
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0177"
-reason = "pyo3 PyCFunction Sync bound; local wrappers enforce Sync"
-
-[[IgnoredVulns]]
 id = "RUSTSEC-2025-0141"
 reason = "bincode unmaintained, transitive via hypersync-client (not a security vulnerability)"
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0173"
 reason = "proc-macro-error2 unmaintained via alloy and tabled_derive; no patch available"
-
-[[IgnoredVulns]]
-id = "GHSA-7gcm-g887-7qv7"
-reason = "protobuf JSON recursion DoS, no fix available yet, low risk for internal use (we don't parse untrusted JSON with protobuf)"
 
 [[IgnoredVulns]]
 id = "GHSA-6w46-j5rx-g56g"

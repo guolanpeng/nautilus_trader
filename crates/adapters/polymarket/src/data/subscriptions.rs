@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{AtomicMap, AtomicSet};
 use nautilus_model::{
     identifiers::InstrumentId,
@@ -22,14 +23,14 @@ use nautilus_model::{
 };
 use ustr::Ustr;
 
-pub(super) fn resolve_token_id_from(
+pub(crate) fn resolve_token_id_from(
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     instrument_id: InstrumentId,
 ) -> anyhow::Result<String> {
     let loaded = instruments.load();
     let instrument = loaded
         .get(&instrument_id)
-        .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found"))?;
+        .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
     Ok(instrument.raw_symbol().as_str().to_string())
 }
 
@@ -41,7 +42,7 @@ pub(super) fn resolve_token_id_from(
     clippy::too_many_arguments,
     reason = "shared state comes in as Arc refs"
 )]
-pub(super) async fn sync_ws_subscription_async(
+pub(crate) async fn sync_ws_subscription_async(
     instrument_id: InstrumentId,
     token_id_str: String,
     active_quote_subs: Arc<AtomicSet<InstrumentId>>,

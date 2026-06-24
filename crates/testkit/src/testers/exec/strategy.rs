@@ -13,8 +13,16 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::num::NonZeroUsize;
+
 use ahash::AHashSet;
-use nautilus_common::{actor::DataActor, enums::LogColor, log_info, log_warn, timer::TimeEvent};
+use nautilus_common::{
+    actor::{DataActor, DataActorNative},
+    config::ConfigError,
+    enums::LogColor,
+    log_info, log_warn,
+    timer::TimeEvent,
+};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, IndexPriceUpdate, MarkPriceUpdate, OrderBookDeltas, QuoteTick, TradeTick},
@@ -27,7 +35,7 @@ use nautilus_model::{
 };
 use nautilus_trading::{
     nautilus_strategy,
-    strategy::{Strategy, StrategyCore},
+    strategy::{Strategy, StrategyCore, StrategyNative},
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 
@@ -83,10 +91,7 @@ impl DataActor for ExecTester {
         let instrument_id = self.config.instrument_id;
         let client_id = self.config.client_id;
 
-        let instrument = {
-            let cache = self.cache();
-            cache.instrument(&instrument_id).cloned()
-        };
+        let instrument = self.cache().instrument(&instrument_id);
 
         if let Some(inst) = instrument {
             self.initialize_with_instrument(inst, true)?;
@@ -127,7 +132,12 @@ impl DataActor for ExecTester {
 
         let instrument_id = self.config.instrument_id;
         let client_id = self.config.client_id;
-        let strategy_id = StrategyId::from(self.core.actor_id.inner().as_str());
+        let strategy_id = StrategyId::from(
+            DataActorNative::core(&self.core)
+                .actor_id()
+                .inner()
+                .as_str(),
+        );
 
         if self.config.cancel_orders_on_stop {
             self.cancel_active_orders(instrument_id, strategy_id, client_id);
@@ -164,7 +174,9 @@ impl DataActor for ExecTester {
             if self.config.subscribe_book {
                 self.unsubscribe_book_at_interval(
                     instrument_id,
-                    self.config.book_interval_ms,
+                    NonZeroUsize::new(self.config.book_interval_ms).ok_or_else(|| {
+                        ConfigError::range("book_interval_ms", "must be positive, was 0")
+                    })?,
                     client_id,
                     None,
                 );
@@ -204,7 +216,7 @@ impl DataActor for ExecTester {
             log_info!("\n{instrument_id}\n{book_str}", color = LogColor::Cyan);
 
             // Log own order book if available
-            if self.is_registered() {
+            if DataActorNative::core(&self.core).is_registered() {
                 let cache = self.cache();
                 if let Some(own_book) = cache.own_order_book(&instrument_id) {
                     let own_book_str = own_book.pprint(num_levels, None);
@@ -309,8 +321,17 @@ impl ExecTester {
             self.subscribe_book_at_interval(
                 instrument_id,
                 self.config.book_type,
-                self.config.book_depth,
-                self.config.book_interval_ms,
+                self.config
+                    .book_depth
+                    .map(|depth| {
+                        NonZeroUsize::new(depth).ok_or_else(|| {
+                            ConfigError::range("book_depth", "must be positive, was 0")
+                        })
+                    })
+                    .transpose()?,
+                NonZeroUsize::new(self.config.book_interval_ms).ok_or_else(|| {
+                    ConfigError::range("book_interval_ms", "must be positive, was 0")
+                })?,
                 client_id,
                 None,
             );
@@ -342,7 +363,7 @@ impl ExecTester {
     }
 
     fn expire_time_from_delta(&self, mins: u64) -> UnixNanos {
-        let current_ns = self.timestamp_ns();
+        let current_ns = DataActorNative::core(&self.core).timestamp_ns();
         let delta_ns = mins.saturating_mul(60).saturating_mul(1_000_000_000);
         UnixNanos::from(current_ns.as_u64() + delta_ns)
     }
@@ -497,7 +518,7 @@ impl ExecTester {
         let Some(cid) = cid else {
             return;
         };
-        let latest = self.cache().order(&cid).map(|o| o.clone());
+        let latest = self.cache().order(&cid);
         if let Some(latest) = latest {
             match side {
                 OrderSide::Buy => self.buy_order = Some(latest),
@@ -516,7 +537,7 @@ impl ExecTester {
         let Some(cid) = cid else {
             return;
         };
-        let latest = self.cache().order(&cid).map(|o| o.clone());
+        let latest = self.cache().order(&cid);
         if let Some(latest) = latest {
             match side {
                 OrderSide::Buy => self.buy_stop_order = Some(latest),
@@ -791,19 +812,24 @@ impl ExecTester {
         let quantity = instrument.make_qty(self.config.order_qty.as_f64(), None);
         let (time_in_force, expire_time) =
             self.resolve_time_in_force(self.config.limit_time_in_force);
+        let instrument_id = self.config.instrument_id;
+        let post_only = self.config.use_post_only || self.config.test_reject_post_only;
+        let quote_quantity = self.config.use_quote_quantity;
+        let display_qty = self.config.order_display_qty;
+        let emulation_trigger = self.config.emulation_trigger;
 
-        let buy_order = self.core.order_factory().limit(
-            self.config.instrument_id,
+        let buy_order = self.order_factory().limit(
+            instrument_id,
             OrderSide::Buy,
             quantity,
             buy_price,
             Some(time_in_force),
             expire_time,
-            Some(self.config.use_post_only || self.config.test_reject_post_only),
+            Some(post_only),
             None,
-            Some(self.config.use_quote_quantity),
-            self.config.order_display_qty,
-            self.config.emulation_trigger,
+            Some(quote_quantity),
+            display_qty,
+            emulation_trigger,
             None,
             None,
             None,
@@ -811,18 +837,18 @@ impl ExecTester {
             None,
         );
 
-        let sell_order = self.core.order_factory().limit(
-            self.config.instrument_id,
+        let sell_order = self.order_factory().limit(
+            instrument_id,
             OrderSide::Sell,
             quantity,
             sell_price,
             Some(time_in_force),
             expire_time,
-            Some(self.config.use_post_only || self.config.test_reject_post_only),
+            Some(post_only),
             None,
-            Some(self.config.use_quote_quantity),
-            self.config.order_display_qty,
-            self.config.emulation_trigger,
+            Some(quote_quantity),
+            display_qty,
+            emulation_trigger,
             None,
             None,
             None,
@@ -1050,19 +1076,24 @@ impl ExecTester {
             self.resolve_time_in_force(self.config.limit_time_in_force);
 
         let quantity = instrument.make_qty(self.config.order_qty.as_f64(), None);
+        let instrument_id = self.config.instrument_id;
+        let post_only = self.config.use_post_only || self.config.test_reject_post_only;
+        let quote_quantity = self.config.use_quote_quantity;
+        let display_qty = self.config.order_display_qty;
+        let emulation_trigger = self.config.emulation_trigger;
 
-        let order = self.core.order_factory().limit(
-            self.config.instrument_id,
+        let order = self.order_factory().limit(
+            instrument_id,
             order_side,
             quantity,
             price,
             Some(time_in_force),
             expire_time,
-            Some(self.config.use_post_only || self.config.test_reject_post_only),
+            Some(post_only),
             None, // reduce_only
-            Some(self.config.use_quote_quantity),
-            self.config.order_display_qty,
-            self.config.emulation_trigger,
+            Some(quote_quantity),
+            display_qty,
+            emulation_trigger,
             None, // trigger_instrument_id
             None, // exec_algorithm_id
             None, // exec_algorithm_params
@@ -1116,22 +1147,30 @@ impl ExecTester {
 
         // Use instrument's make_qty to ensure correct precision
         let quantity = instrument.make_qty(self.config.order_qty.as_f64(), None);
+        let instrument_id = self.config.instrument_id;
+        let trigger_type = self.config.stop_trigger_type;
+        let quote_quantity = self.config.use_quote_quantity;
+        let display_qty = self.config.order_display_qty;
+        let emulation_trigger = self.config.emulation_trigger;
+        let stop_order_type = self.config.stop_order_type;
+        let trailing_offset = self.config.trailing_offset;
+        let trailing_offset_type = self.config.trailing_offset_type;
 
-        let factory = self.core.order_factory();
+        let mut factory = self.order_factory();
 
-        let mut order: OrderAny = match self.config.stop_order_type {
+        let mut order: OrderAny = match stop_order_type {
             OrderType::StopMarket => factory.stop_market(
-                self.config.instrument_id,
+                instrument_id,
                 order_side,
                 quantity,
                 trigger_price,
-                Some(self.config.stop_trigger_type),
+                Some(trigger_type),
                 Some(time_in_force),
                 expire_time,
                 None, // reduce_only
-                Some(self.config.use_quote_quantity),
+                Some(quote_quantity),
                 None, // display_qty
-                self.config.emulation_trigger,
+                emulation_trigger,
                 None, // trigger_instrument_id
                 None, // exec_algorithm_id
                 None, // exec_algorithm_params
@@ -1143,19 +1182,19 @@ impl ExecTester {
                     anyhow::bail!("STOP_LIMIT order requires limit_price");
                 };
                 factory.stop_limit(
-                    self.config.instrument_id,
+                    instrument_id,
                     order_side,
                     quantity,
                     limit_price,
                     trigger_price,
-                    Some(self.config.stop_trigger_type),
+                    Some(trigger_type),
                     Some(time_in_force),
                     expire_time,
                     None, // post_only
                     None, // reduce_only
-                    Some(self.config.use_quote_quantity),
-                    self.config.order_display_qty,
-                    self.config.emulation_trigger,
+                    Some(quote_quantity),
+                    display_qty,
+                    emulation_trigger,
                     None, // trigger_instrument_id
                     None, // exec_algorithm_id
                     None, // exec_algorithm_params
@@ -1164,16 +1203,16 @@ impl ExecTester {
                 )
             }
             OrderType::MarketIfTouched => factory.market_if_touched(
-                self.config.instrument_id,
+                instrument_id,
                 order_side,
                 quantity,
                 trigger_price,
-                Some(self.config.stop_trigger_type),
+                Some(trigger_type),
                 Some(time_in_force),
                 expire_time,
                 None, // reduce_only
-                Some(self.config.use_quote_quantity),
-                self.config.emulation_trigger,
+                Some(quote_quantity),
+                emulation_trigger,
                 None, // trigger_instrument_id
                 None, // exec_algorithm_id
                 None, // exec_algorithm_params
@@ -1185,19 +1224,19 @@ impl ExecTester {
                     anyhow::bail!("LIMIT_IF_TOUCHED order requires limit_price");
                 };
                 factory.limit_if_touched(
-                    self.config.instrument_id,
+                    instrument_id,
                     order_side,
                     quantity,
                     limit_price,
                     trigger_price,
-                    Some(self.config.stop_trigger_type),
+                    Some(trigger_type),
                     Some(time_in_force),
                     expire_time,
                     None, // post_only
                     None, // reduce_only
-                    Some(self.config.use_quote_quantity),
-                    self.config.order_display_qty,
-                    self.config.emulation_trigger,
+                    Some(quote_quantity),
+                    display_qty,
+                    emulation_trigger,
                     None, // trigger_instrument_id
                     None, // exec_algorithm_id
                     None, // exec_algorithm_params
@@ -1206,24 +1245,24 @@ impl ExecTester {
                 )
             }
             OrderType::TrailingStopMarket => {
-                let Some(trailing_offset) = self.config.trailing_offset else {
+                let Some(trailing_offset) = trailing_offset else {
                     anyhow::bail!("TRAILING_STOP_MARKET order requires trailing_offset config");
                 };
                 factory.trailing_stop_market(
-                    self.config.instrument_id,
+                    instrument_id,
                     order_side,
                     quantity,
                     trailing_offset,
-                    Some(self.config.trailing_offset_type),
+                    Some(trailing_offset_type),
                     None,
                     Some(trigger_price),
-                    Some(self.config.stop_trigger_type),
+                    Some(trigger_type),
                     Some(time_in_force),
                     expire_time,
                     None, // reduce_only
-                    Some(self.config.use_quote_quantity),
+                    Some(quote_quantity),
                     None, // display_qty
-                    self.config.emulation_trigger,
+                    emulation_trigger,
                     None, // trigger_instrument_id
                     None, // exec_algorithm_id
                     None, // exec_algorithm_params
@@ -1232,9 +1271,10 @@ impl ExecTester {
                 )
             }
             _ => {
-                anyhow::bail!("Unknown stop order type: {:?}", self.config.stop_order_type);
+                anyhow::bail!("Unknown stop order type: {stop_order_type:?}");
             }
         };
+        drop(factory);
 
         if let OrderAny::TrailingStopMarket(order) = &mut order {
             order.activation_price = Some(trigger_price);
@@ -1315,25 +1355,28 @@ impl ExecTester {
         let sl_trigger_price = clamp_price_to_range(unclamped_sl_trigger_price, instrument, clamp);
 
         let entry_post_only = self.config.use_post_only || self.config.test_reject_post_only;
+        let instrument_id = self.config.instrument_id;
+        let quote_quantity = self.config.use_quote_quantity;
+        let emulation_trigger = self.config.emulation_trigger;
+        let stop_trigger_type = self.config.stop_trigger_type;
         let orders = self
-            .core
             .order_factory()
             .bracket()
-            .instrument_id(self.config.instrument_id)
+            .instrument_id(instrument_id)
             .order_side(order_side)
             .quantity(quantity)
-            .quote_quantity(self.config.use_quote_quantity)
+            .quote_quantity(quote_quantity)
             .entry_order_type(OrderType::Limit)
             .entry_price(entry_price)
             .time_in_force(time_in_force)
             .entry_post_only(entry_post_only)
-            .maybe_emulation_trigger(self.config.emulation_trigger)
+            .maybe_emulation_trigger(emulation_trigger)
             .maybe_expire_time(expire_time)
             .tp_price(tp_price)
             .tp_post_only(entry_post_only)
             .tp_time_in_force(time_in_force)
             .sl_trigger_price(sl_trigger_price)
-            .sl_trigger_type(self.config.stop_trigger_type)
+            .sl_trigger_type(stop_trigger_type)
             .sl_time_in_force(sl_time_in_force)
             .call();
 
@@ -1382,14 +1425,17 @@ impl ExecTester {
         } else {
             None
         };
+        let instrument_id = self.config.instrument_id;
+        let time_in_force = self.config.open_position_time_in_force;
+        let quote_quantity = self.config.use_quote_quantity;
 
-        let order = self.core.order_factory().market(
-            self.config.instrument_id,
+        let order = self.order_factory().market(
+            instrument_id,
             order_side,
             quantity,
-            Some(self.config.open_position_time_in_force),
+            Some(time_in_force),
             reduce_only,
-            Some(self.config.use_quote_quantity),
+            Some(quote_quantity),
             None, // exec_algorithm_id
             None, // exec_algorithm_params
             None, // tags
@@ -1520,7 +1566,7 @@ impl ExecTester {
                 }
                 let cid = order.client_order_id();
                 if seen.insert(cid) {
-                    candidates.push(order.cloned());
+                    candidates.push(order);
                 }
             }
         }

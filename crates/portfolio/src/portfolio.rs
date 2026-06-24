@@ -19,15 +19,15 @@ use std::{cell::RefCell, collections::VecDeque, fmt::Debug, rc::Rc};
 
 use ahash::{AHashMap, AHashSet};
 use indexmap::{IndexMap, IndexSet};
-use nautilus_analysis::analyzer::PortfolioAnalyzer;
+use nautilus_analysis::{analyzer::PortfolioAnalyzer, snapshot::PortfolioStatistics};
 use nautilus_common::{
-    cache::Cache,
+    cache::{AccountLookupError, Cache},
     clock::Clock,
     enums::LogColor,
     msgbus::{self, MessagingSwitchboard, TypedHandler, TypedIntoHandler},
     timer::{TimeEvent, TimeEventCallback},
 };
-use nautilus_core::{UUID4, WeakCell, datetime::NANOSECONDS_IN_MILLISECOND};
+use nautilus_core::{UUID4, UnixNanos, WeakCell, datetime::NANOSECONDS_IN_MILLISECOND};
 use nautilus_model::{
     accounts::{Account, AccountAny},
     data::{Bar, MarkPriceUpdate, QuoteTick},
@@ -53,6 +53,7 @@ struct PortfolioState {
     analyzer: PortfolioAnalyzer,
     unrealized_pnls: IndexMap<InstrumentId, Money>,
     realized_pnls: IndexMap<InstrumentId, Money>,
+    recorded_closed_position_cycles: AHashSet<(PositionId, UnixNanos)>,
     snapshot_sum_per_position: AHashMap<PositionId, Money>,
     snapshot_last_per_position: AHashMap<PositionId, Money>,
     snapshot_processed_counts: AHashMap<PositionId, usize>,
@@ -90,6 +91,7 @@ impl PortfolioState {
             analyzer: PortfolioAnalyzer::default(),
             unrealized_pnls: IndexMap::new(),
             realized_pnls: IndexMap::new(),
+            recorded_closed_position_cycles: AHashSet::new(),
             snapshot_sum_per_position: AHashMap::new(),
             snapshot_last_per_position: AHashMap::new(),
             snapshot_processed_counts: AHashMap::new(),
@@ -112,6 +114,7 @@ impl PortfolioState {
         self.net_positions.clear();
         self.unrealized_pnls.clear();
         self.realized_pnls.clear();
+        self.recorded_closed_position_cycles.clear();
         self.snapshot_sum_per_position.clear();
         self.snapshot_last_per_position.clear();
         self.snapshot_processed_counts.clear();
@@ -1111,14 +1114,12 @@ impl Portfolio {
 
         for position in &positions_open {
             // Get account for THIS position
-            let account = if let Some(account) = cache.account(&position.account_id) {
-                account
-            } else {
-                log::error!(
-                    "Cannot calculate net exposure: no account for {}",
-                    position.account_id
-                );
-                return None;
+            let account = match cache.try_account(&position.account_id) {
+                Ok(account) => account,
+                Err(e) => {
+                    log::error!("Cannot calculate net exposure: {e}");
+                    return None;
+                }
             };
 
             // Validate consistent base currency across accounts
@@ -1480,9 +1481,33 @@ impl Portfolio {
     }
 
     /// Returns realized PnLs recorded during portfolio event processing.
+    ///
+    /// Each record is `(position_id, ts_event, realized_pnl)`.
     #[must_use]
-    pub fn recorded_realized_pnls(&self) -> AHashMap<Currency, IndexMap<PositionId, f64>> {
+    pub fn recorded_realized_pnls(&self) -> AHashMap<Currency, Vec<(PositionId, UnixNanos, f64)>> {
         self.inner.borrow().analyzer.recorded_realized_pnls.clone()
+    }
+
+    /// Computes an owned [`PortfolioStatistics`] snapshot from the portfolio's current cache state.
+    ///
+    /// Aggregates balances across every account, includes cached positions and their snapshots, and
+    /// merges close-time PnLs recorded during processing. Recomputes on each call; callers on hot paths
+    /// should invoke it sparingly.
+    #[must_use]
+    pub fn statistics(&self) -> PortfolioStatistics {
+        let cache = self.cache.borrow();
+        let accounts = cache.accounts_all_owned();
+        let positions: Vec<Position> = cache
+            .positions(None, None, None, None, None)
+            .into_iter()
+            .map(|p| p.cloned())
+            .collect();
+        let mut snapshots = Vec::new();
+        for position in &positions {
+            snapshots.extend(cache.position_snapshots(Some(&position.id), None));
+        }
+        let recorded = self.inner.borrow().analyzer.recorded_realized_pnls.clone();
+        PortfolioAnalyzer::from_accounts(&accounts, &positions, &snapshots, recorded).statistics()
     }
 
     /// Updates portfolio calculations based on a position event.
@@ -2247,11 +2272,12 @@ fn update_order(
     let (instrument, orders_open) = {
         let cache_ref = cache.borrow();
 
-        let account = if let Some(account) = cache_ref.account(&account_id) {
-            account
-        } else {
-            log::error!("Cannot update order: no account registered for {account_id}");
-            return;
+        let account = match cache_ref.try_account(&account_id) {
+            Ok(account) => account,
+            Err(e) => {
+                log::error!("Cannot update order: {e}");
+                return;
+            }
         };
 
         match &*account {
@@ -2325,11 +2351,15 @@ fn update_order(
     };
 
     // No cache borrow held: AccountsManager borrows cache internally for xrate lookups.
-    let mut working_account = if let Some(account) = cache.borrow_mut().take_account(&account_id) {
-        account
-    } else {
-        log::error!("Cannot update order: no account registered for {account_id}");
-        return;
+    let mut working_account = match cache.borrow_mut().take_account(&account_id) {
+        Some(account) => account,
+        None => {
+            log::error!(
+                "Cannot update order: {}",
+                AccountLookupError::not_found(account_id)
+            );
+            return;
+        }
     };
 
     if let OrderEventAny::Filled(order_filled) = event {
@@ -2614,20 +2644,42 @@ fn record_closed_position_pnl(
         return;
     };
 
-    inner
-        .borrow_mut()
-        .analyzer
-        .record_trade(&position.id, &realized_pnl);
+    let mut inner_ref = inner.borrow_mut();
 
-    let Some(account) = cache_ref.account(&event.account_id()) else {
+    if !inner_ref
+        .recorded_closed_position_cycles
+        .insert((position.id, position.ts_opened))
+    {
         return;
-    };
-    let Some(base_currency) = account.base_currency() else {
-        return;
-    };
+    }
+
+    let converted_pnl =
+        converted_realized_pnl(&cache_ref, config, event, position_id, realized_pnl);
+
+    let ts_event = position.ts_last;
+    inner_ref
+        .analyzer
+        .record_trade(&position.id, ts_event, &realized_pnl);
+
+    if let Some(converted_pnl) = converted_pnl {
+        inner_ref
+            .analyzer
+            .record_trade(&position.id, ts_event, &converted_pnl);
+    }
+}
+
+fn converted_realized_pnl(
+    cache_ref: &Cache,
+    config: PortfolioConfig,
+    event: &PositionEvent,
+    position_id: PositionId,
+    realized_pnl: Money,
+) -> Option<Money> {
+    let account = cache_ref.account(&event.account_id())?;
+    let base_currency = account.base_currency()?;
 
     if realized_pnl.currency == base_currency {
-        return;
+        return None;
     }
 
     let xrate = if config.use_mark_xrates {
@@ -2648,22 +2700,17 @@ fn record_closed_position_pnl(
             "Cannot record account-currency realized PnL for {position_id}: conversion failed from {} to {base_currency}",
             realized_pnl.currency
         );
-        return;
+        return None;
     };
 
     let amount = (realized_pnl.as_decimal() * xrate).round_dp(u32::from(base_currency.precision));
-    let amount = match Money::from_decimal(amount, base_currency) {
-        Ok(amount) => amount,
+    match Money::from_decimal(amount, base_currency) {
+        Ok(amount) => Some(amount),
         Err(e) => {
             log::warn!("Cannot record account-currency realized PnL for {position_id}: {e}");
-            return;
+            None
         }
-    };
-
-    inner
-        .borrow_mut()
-        .analyzer
-        .record_trade(&position.id, &amount);
+    }
 }
 
 fn update_account(
