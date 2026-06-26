@@ -110,7 +110,7 @@ use nautilus_trading::{
     ExecutionAlgorithm, ExecutionAlgorithmNative,
     strategy::{Strategy, StrategyNative},
 };
-use tabled::{Table, Tabled, settings::Style};
+use tabled::{builder::Builder, settings::Style};
 
 use crate::{
     execution::{
@@ -271,7 +271,7 @@ impl LiveNode {
     ///
     /// # Errors
     ///
-    /// Returns an error when plug-ins are configured without `nautilus-plugin-host`.
+    /// Returns an error when plug-ins are configured without host-side support.
     #[cfg(feature = "plugin")]
     pub(crate) fn load_configured_plugins(&self) -> anyhow::Result<()> {
         if self.config.plugins.is_empty() {
@@ -279,7 +279,7 @@ impl LiveNode {
         }
 
         anyhow::bail!(
-            "LiveNodeConfig.plugins requires nautilus-plugin-host; nautilus-plugin is the guest SDK only"
+            "LiveNodeConfig.plugins requires host-side plug-in support; nautilus-plugin is the guest SDK only"
         )
     }
 
@@ -287,7 +287,7 @@ impl LiveNode {
     ///
     /// # Errors
     ///
-    /// Returns an error when plug-ins are configured without `nautilus-plugin-host`.
+    /// Returns an error when plug-ins are configured without host-side support.
     #[cfg(not(feature = "plugin"))]
     pub(crate) fn load_configured_plugins(&self) -> anyhow::Result<()> {
         if self.config.plugins.is_empty() {
@@ -295,7 +295,7 @@ impl LiveNode {
         }
 
         anyhow::bail!(
-            "LiveNodeConfig.plugins requires nautilus-plugin-host; nautilus-plugin is the guest SDK only"
+            "LiveNodeConfig.plugins requires host-side plug-in support; nautilus-plugin is the guest SDK only"
         )
     }
 
@@ -303,7 +303,7 @@ impl LiveNode {
     ///
     /// # Errors
     ///
-    /// Returns an error because dynamic plug-in hosting lives in `nautilus-plugin-host`.
+    /// Returns an error because dynamic plug-in hosting lives in the host-side integration.
     #[cfg(feature = "plugin")]
     #[expect(
         clippy::needless_pass_by_value,
@@ -313,7 +313,7 @@ impl LiveNode {
         config.validate_runtime_support(self.config.plugins.len())?;
 
         anyhow::bail!(
-            "LiveNode::add_plugin requires nautilus-plugin-host; nautilus-plugin is the guest SDK only"
+            "LiveNode::add_plugin requires host-side plug-in support; nautilus-plugin is the guest SDK only"
         )
     }
 
@@ -321,7 +321,7 @@ impl LiveNode {
     ///
     /// # Errors
     ///
-    /// Always returns an error explaining that `nautilus-plugin-host` is required.
+    /// Always returns an error explaining that host-side support is required.
     #[cfg(not(feature = "plugin"))]
     #[expect(
         clippy::needless_pass_by_value,
@@ -330,7 +330,7 @@ impl LiveNode {
     pub fn add_plugin(&mut self, config: PluginConfig) -> anyhow::Result<()> {
         let _ = config;
         anyhow::bail!(
-            "LiveNode::add_plugin requires nautilus-plugin-host; nautilus-plugin is the guest SDK only"
+            "LiveNode::add_plugin requires host-side plug-in support; nautilus-plugin is the guest SDK only"
         )
     }
 
@@ -529,16 +529,6 @@ impl LiveNode {
     }
 
     fn log_connection_status(&self) {
-        #[derive(Tabled)]
-        struct ClientStatus {
-            #[tabled(rename = "Client")]
-            client: String,
-            #[tabled(rename = "Type")]
-            client_type: &'static str,
-            #[tabled(rename = "Connected")]
-            connected: bool,
-        }
-
         let data_status = self.kernel.data_client_connection_status();
         let exec_status = self.kernel.exec_client_connection_status();
 
@@ -560,7 +550,7 @@ impl LiveNode {
             });
         }
 
-        let table = Table::new(&rows).with(Style::rounded()).to_string();
+        let table = render_client_statuses(rows);
 
         log::warn!(
             "Timed out ({:?}) waiting for engines to connect\n\n{table}\n\n\
@@ -703,7 +693,7 @@ impl LiveNode {
     ///
     /// # Shutdown Sequence
     ///
-    /// 1. Signal received (SIGINT or handle stop).
+    /// 1. Signal received (SIGINT, SIGTERM, or handle stop).
     /// 2. Trader components stopped (triggers order cancellations, etc.).
     /// 3. Event loop continues processing residual events for the configured grace period.
     /// 4. Kernel finalized, clients disconnected, remaining events drained.
@@ -991,7 +981,9 @@ impl LiveNode {
         let mut open_order_report_task: Option<OpenOrderReportTask> = None;
         let mut position_report_task: Option<PositionReportTask> = None;
         let ctrl_c = dst::signal::ctrl_c();
+        let terminate = dst::signal::terminate();
         tokio::pin!(ctrl_c);
+        tokio::pin!(terminate);
 
         loop {
             let shutdown_deadline = self.shutdown_deadline;
@@ -1006,6 +998,13 @@ impl LiveNode {
                     match result {
                         Ok(()) => log::info!("Received SIGINT, shutting down"),
                         Err(e) => log::error!("Failed to listen for SIGINT: {e}"),
+                    }
+                    self.initiate_shutdown();
+                }
+                result = &mut terminate, if is_running => {
+                    match result {
+                        Ok(()) => log::info!("Received SIGTERM, shutting down"),
+                        Err(e) => log::error!("Failed to listen for SIGTERM: {e}"),
                     }
                     self.initiate_shutdown();
                 }
@@ -2122,6 +2121,27 @@ impl PendingEvents {
     }
 }
 
+struct ClientStatus {
+    client: String,
+    client_type: &'static str,
+    connected: bool,
+}
+
+fn render_client_statuses(rows: Vec<ClientStatus>) -> String {
+    let mut builder = Builder::with_capacity(rows.len() + 1, 3);
+    builder.push_record(["Client", "Type", "Connected"]);
+
+    for row in rows {
+        builder.push_record([
+            row.client,
+            row.client_type.to_string(),
+            row.connected.to_string(),
+        ]);
+    }
+
+    builder.build().with(Style::rounded()).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -2164,6 +2184,32 @@ mod tests {
     use rstest::*;
 
     use super::*;
+
+    #[rstest]
+    fn test_render_client_statuses() {
+        let rows = vec![
+            ClientStatus {
+                client: "BINANCE".to_string(),
+                client_type: "Data",
+                connected: true,
+            },
+            ClientStatus {
+                client: "SIM".to_string(),
+                client_type: "Execution",
+                connected: false,
+            },
+        ];
+
+        let output = render_client_statuses(rows);
+        let expected = "╭─────────┬───────────┬───────────╮\n\
+│ Client  │ Type      │ Connected │\n\
+├─────────┼───────────┼───────────┤\n\
+│ BINANCE │ Data      │ true      │\n\
+│ SIM     │ Execution │ false     │\n\
+╰─────────┴───────────┴───────────╯";
+
+        assert_eq!(output, expected);
+    }
 
     #[derive(Debug)]
     struct ReplayKernelEventStore {
