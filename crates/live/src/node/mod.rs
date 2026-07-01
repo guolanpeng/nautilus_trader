@@ -77,7 +77,7 @@
 //! maintenance below 100ms (defaults are seconds to minutes). Cadence drifts
 //! by at most one body duration per fire.
 
-use std::{fmt::Debug, future::Future, pin::Pin, time::Duration};
+use std::{collections::HashSet, fmt::Debug, future::Future, pin::Pin, time::Duration};
 
 use indexmap::IndexSet;
 use nautilus_common::{
@@ -101,7 +101,7 @@ use nautilus_core::{
 };
 use nautilus_model::{
     events::OrderEventAny,
-    identifiers::{ClientOrderId, TraderId, Venue},
+    identifiers::{ClientOrderId, InstrumentId, StrategyId, TraderId, Venue},
     orders::Order,
     reports::{OrderStatusReport, PositionStatusReport},
 };
@@ -1601,26 +1601,74 @@ impl LiveNode {
             );
         }
 
-        // Register external order claims before adding strategy (which moves it)
+        // Capture strategy-owned values before adding the strategy, which moves it
         let strategy_id = self
             .kernel
             .trader
             .borrow()
             .prepare_strategy_for_registration(&mut strategy)?;
-        if let Some(claims) = strategy.external_order_claims() {
-            for instrument_id in &claims {
-                self.exec_manager
-                    .claim_external_orders(*instrument_id, strategy_id)?;
-            }
-            log_info!(
-                "Registered external order claims for {}: {:?}",
-                strategy_id,
-                claims,
-                color = LogColor::Blue
-            );
+        let oms_type = StrategyNative::strategy_core(&strategy).config.oms_type;
+        if let Some(claims) = strategy
+            .external_order_claims()
+            .filter(|claims| !claims.is_empty())
+        {
+            self.register_external_order_claims(strategy_id, &claims)?;
         }
 
-        self.kernel.trader.borrow_mut().add_strategy(strategy)
+        self.kernel.trader.borrow_mut().add_strategy(strategy)?;
+
+        if let Some(oms_type) = oms_type {
+            self.kernel
+                .exec_engine
+                .borrow_mut()
+                .register_oms_type(strategy_id, oms_type);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn register_external_order_claims(
+        &mut self,
+        strategy_id: StrategyId,
+        claims: &[InstrumentId],
+    ) -> anyhow::Result<()> {
+        let mut instrument_ids = HashSet::new();
+
+        for instrument_id in claims {
+            if !instrument_ids.insert(*instrument_id) {
+                anyhow::bail!(
+                    "External order claim for {instrument_id} already exists for {strategy_id}"
+                );
+            }
+        }
+
+        {
+            let exec_engine = self.kernel.exec_engine.borrow();
+
+            for instrument_id in &instrument_ids {
+                if let Some(existing) = self.exec_manager.get_external_order_claim(instrument_id) {
+                    anyhow::bail!(
+                        "External order claim for {instrument_id} already exists for {existing}"
+                    );
+                }
+
+                if let Some(existing) = exec_engine.get_external_order_claim(instrument_id) {
+                    anyhow::bail!(
+                        "External order claim for {instrument_id} already exists for {existing}"
+                    );
+                }
+            }
+        }
+
+        for instrument_id in &instrument_ids {
+            self.exec_manager
+                .claim_external_orders(*instrument_id, strategy_id)?;
+        }
+
+        self.kernel
+            .exec_engine
+            .borrow_mut()
+            .register_external_order_claims(strategy_id, &instrument_ids)
     }
 
     /// Adds an execution algorithm to the trader.
@@ -2161,9 +2209,11 @@ mod tests {
         replace_exec_cmd_sender,
     };
     use nautilus_common::{
+        actor::DataActor,
         cache::Cache,
         clock::Clock,
         enums::SerializationEncoding,
+        messages::execution::{SubmitOrder, TradingCommand},
         msgbus::{
             self, BusMessage, BusPayloadType, MessageBusBacking, MessageBusBackingFactory,
             MessageBusConfig, MessageBusExternalEgress, MessageBusExternalIngress,
@@ -2171,16 +2221,24 @@ mod tests {
         },
     };
     use nautilus_core::{UUID4, UnixNanos};
-    use nautilus_execution::engine::{ExecutionEngine, SnapshotAnchorer};
+    use nautilus_execution::engine::{
+        ExecutionEngine, SnapshotAnchorer, stubs::StubExecutionClient,
+    };
     use nautilus_model::{
         data::QuoteTick,
-        enums::OrderType,
-        identifiers::{AccountId, ClientId, InstrumentId, TraderId, VenueOrderId},
+        enums::{OmsType, OrderStatus, OrderType},
+        identifiers::{
+            AccountId, ClientId, InstrumentId, PositionId, StrategyId, TraderId, VenueOrderId,
+        },
         instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
         orders::{OrderTestBuilder, stubs::TestOrderEventStubs},
         types::{Price, Quantity},
     };
     use nautilus_system::{KernelEventStore, RegisteredComponents, event_store::EventStoreConfig};
+    use nautilus_trading::{
+        nautilus_strategy,
+        strategy::{config::StrategyConfig, core::StrategyCore},
+    };
     use rstest::*;
 
     use super::*;
@@ -2261,6 +2319,27 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct TestStrategy {
+        core: StrategyCore,
+    }
+
+    impl TestStrategy {
+        fn new(config: StrategyConfig) -> Self {
+            Self {
+                core: StrategyCore::new(config),
+            }
+        }
+    }
+
+    impl DataActor for TestStrategy {}
+
+    nautilus_strategy!(TestStrategy, {
+        fn external_order_claims(&self) -> Option<Vec<InstrumentId>> {
+            self.core.config.external_order_claims.clone()
+        }
+    });
+
     fn live_node_with_replay_store(fail_restore: bool) -> LiveNode {
         // load_state must be true: the kernel rejects event-store replay otherwise,
         // and LiveNodeConfig defaults it to false.
@@ -2277,6 +2356,204 @@ mod tests {
             });
 
         builder.build().unwrap()
+    }
+
+    #[rstest]
+    fn test_add_strategy_registers_external_order_claims_with_manager_and_engine() {
+        let mut node = LiveNode::builder(TraderId::from("TESTER-001"), Environment::Sandbox)
+            .unwrap()
+            .with_reconciliation(false)
+            .with_delay_post_stop_secs(0)
+            .with_timeout_connection(1)
+            .build()
+            .unwrap();
+        let instrument_id = InstrumentId::from("AUDUSD.SIM");
+        let strategy_id = StrategyId::from("CLAIMS-001");
+
+        node.add_strategy(TestStrategy::new(StrategyConfig {
+            strategy_id: Some(strategy_id),
+            external_order_claims: Some(vec![instrument_id]),
+            ..Default::default()
+        }))
+        .unwrap();
+
+        assert_eq!(
+            node.exec_manager.get_external_order_claim(&instrument_id),
+            Some(strategy_id)
+        );
+
+        {
+            let exec_engine = node.kernel().exec_engine.borrow();
+            assert_eq!(
+                exec_engine.get_external_order_claim(&instrument_id),
+                Some(strategy_id)
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_add_strategy_rejects_duplicate_external_order_claim_without_overwriting() {
+        let mut node = LiveNode::builder(TraderId::from("TESTER-001"), Environment::Sandbox)
+            .unwrap()
+            .with_reconciliation(false)
+            .with_delay_post_stop_secs(0)
+            .with_timeout_connection(1)
+            .build()
+            .unwrap();
+        let instrument_id = InstrumentId::from("AUDUSD.SIM");
+        let strategy_id = StrategyId::from("CLAIMS-001");
+        let duplicate_strategy_id = StrategyId::from("OTHER-002");
+
+        node.add_strategy(TestStrategy::new(StrategyConfig {
+            strategy_id: Some(strategy_id),
+            external_order_claims: Some(vec![instrument_id]),
+            ..Default::default()
+        }))
+        .unwrap();
+
+        let result = node.add_strategy(TestStrategy::new(StrategyConfig {
+            strategy_id: Some(duplicate_strategy_id),
+            external_order_claims: Some(vec![instrument_id]),
+            ..Default::default()
+        }));
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already exists for CLAIMS-001")
+        );
+        assert_eq!(
+            node.exec_manager.get_external_order_claim(&instrument_id),
+            Some(strategy_id)
+        );
+
+        {
+            let exec_engine = node.kernel().exec_engine.borrow();
+            assert_eq!(
+                exec_engine.get_external_order_claim(&instrument_id),
+                Some(strategy_id)
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_add_strategy_rejects_repeated_external_order_claim_without_registering() {
+        let mut node = LiveNode::builder(TraderId::from("TESTER-001"), Environment::Sandbox)
+            .unwrap()
+            .with_reconciliation(false)
+            .with_delay_post_stop_secs(0)
+            .with_timeout_connection(1)
+            .build()
+            .unwrap();
+        let instrument_id = InstrumentId::from("AUDUSD.SIM");
+        let strategy_id = StrategyId::from("CLAIMS-001");
+
+        let result = node.add_strategy(TestStrategy::new(StrategyConfig {
+            strategy_id: Some(strategy_id),
+            external_order_claims: Some(vec![instrument_id, instrument_id]),
+            ..Default::default()
+        }));
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already exists for CLAIMS-001")
+        );
+        assert_eq!(
+            node.exec_manager.get_external_order_claim(&instrument_id),
+            None
+        );
+
+        {
+            let exec_engine = node.kernel().exec_engine.borrow();
+            assert_eq!(exec_engine.get_external_order_claim(&instrument_id), None);
+        }
+    }
+
+    #[rstest]
+    fn test_add_strategy_registers_configured_hedging_oms_type() {
+        let mut node = LiveNode::builder(TraderId::from("TESTER-001"), Environment::Sandbox)
+            .unwrap()
+            .with_reconciliation(false)
+            .with_delay_post_stop_secs(0)
+            .with_timeout_connection(1)
+            .build()
+            .unwrap();
+        let strategy_id = StrategyId::from("FUNDING_ARBITRAGE-001");
+
+        node.add_strategy(TestStrategy::new(StrategyConfig {
+            strategy_id: Some(strategy_id),
+            oms_type: Some(OmsType::Hedging),
+            ..Default::default()
+        }))
+        .unwrap();
+
+        let instrument = crypto_perpetual_ethusdt();
+        let instrument_id = instrument.id();
+        let client_id = ClientId::from("STUB");
+
+        node.kernel
+            .cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CryptoPerpetual(instrument))
+            .unwrap();
+        node.kernel
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(StubExecutionClient::new(
+                client_id,
+                AccountId::from("TEST-ACCOUNT"),
+                instrument_id.venue,
+                OmsType::Netting,
+                None,
+            )))
+            .unwrap();
+
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(node.trader_id())
+            .strategy_id(strategy_id)
+            .instrument_id(instrument_id)
+            .quantity(Quantity::from("1.000"))
+            .build();
+        let position_id = PositionId::new("CUSTOM-POSITION-001");
+
+        node.kernel
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), Some(position_id), Some(client_id), true)
+            .unwrap();
+
+        let submit_order = SubmitOrder::new(
+            order.trader_id(),
+            Some(client_id),
+            strategy_id,
+            instrument_id,
+            order.client_order_id(),
+            order.init_event().clone(),
+            order.exec_algorithm_id(),
+            Some(position_id),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+
+        node.kernel
+            .exec_engine
+            .borrow()
+            .execute(TradingCommand::SubmitOrder(submit_order));
+
+        let exec_engine = node.kernel.exec_engine.borrow();
+        let cache = exec_engine.cache().borrow();
+        let cached_order = cache
+            .order(&order.client_order_id())
+            .expect("Order should be cached");
+
+        assert_eq!(cached_order.status(), OrderStatus::Initialized);
     }
 
     #[rstest]

@@ -259,7 +259,7 @@ impl DatabentoDataClient {
         let mut channels = self.cmd_channels.lock().expect(MUTEX_POISONED);
 
         if !channels.contains_key(dataset) {
-            log::info!("Creating new feed handler for dataset: {dataset}");
+            log::debug!("Creating new feed handler for dataset: {dataset}");
             let cmd_tx = self.initialize_live_feed(dataset.to_string());
             channels.insert(dataset.to_string(), cmd_tx);
 
@@ -369,7 +369,7 @@ impl DatabentoDataClient {
                                 }
                             }
                             Some(DatabentoMessage::Instrument(instrument)) => {
-                                log::info!("Received instrument definition: {}", instrument.id());
+                                log::debug!("Received instrument definition: {}", instrument.id());
                                 if let Err(e) = data_sender.send(DataEvent::Instrument(*instrument)) {
                                     log::error!("Failed to send instrument: {e}");
                                 }
@@ -403,7 +403,7 @@ impl DatabentoDataClient {
                                 log::error!("Feed handler error: {error}");
                             }
                             Some(DatabentoMessage::Close) => {
-                                log::info!("Feed handler closed");
+                                log::debug!("Feed handler closed");
                                 break;
                             }
                             None => {
@@ -536,8 +536,6 @@ impl DataClient for DatabentoDataClient {
     ///
     /// Returns an error if the subscription request fails.
     fn subscribe_instrument(&mut self, cmd: SubscribeInstrument) -> anyhow::Result<()> {
-        log::debug!("Subscribe instrument: {cmd:?}");
-
         let dataset = self.get_dataset_for_venue(cmd.instrument_id.venue)?;
         let start_after_subscribe = self.get_or_create_feed_handler(&dataset);
 
@@ -561,8 +559,6 @@ impl DataClient for DatabentoDataClient {
     ///
     /// Returns an error if the subscription request fails.
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
-        log::debug!("Subscribe quotes: {cmd:?}");
-
         let dataset = self.get_dataset_for_venue(cmd.instrument_id.venue)?;
         let symbol = cmd.instrument_id.symbol.to_string();
         let price_precision = price_precision_from_params(cmd.params.as_ref())?
@@ -594,8 +590,6 @@ impl DataClient for DatabentoDataClient {
     ///
     /// Returns an error if the subscription request fails.
     fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
-        log::debug!("Subscribe trades: {cmd:?}");
-
         let dataset = self.get_dataset_for_venue(cmd.instrument_id.venue)?;
         let symbol = cmd.instrument_id.symbol.to_string();
         let price_precision = price_precision_from_params(cmd.params.as_ref())?
@@ -627,8 +621,6 @@ impl DataClient for DatabentoDataClient {
     ///
     /// Returns an error if the subscription request fails.
     fn subscribe_book_deltas(&mut self, cmd: SubscribeBookDeltas) -> anyhow::Result<()> {
-        log::debug!("Subscribe book deltas: {cmd:?}");
-
         let dataset = self.get_dataset_for_venue(cmd.instrument_id.venue)?;
         let start_after_subscribe = self.get_or_create_feed_handler(&dataset);
 
@@ -655,8 +647,6 @@ impl DataClient for DatabentoDataClient {
         &mut self,
         cmd: SubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
-        log::debug!("Subscribe instrument status: {cmd:?}");
-
         let dataset = self.get_dataset_for_venue(cmd.instrument_id.venue)?;
         let start_after_subscribe = self.get_or_create_feed_handler(&dataset);
 
@@ -676,8 +666,6 @@ impl DataClient for DatabentoDataClient {
 
     // Unsubscribe methods
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
-        log::debug!("Unsubscribe quotes: {cmd:?}");
-
         // Note: Databento live API doesn't support granular unsubscribing.
         // The feed handler manages subscriptions and can handle reconnections
         // with the appropriate subscription state.
@@ -690,8 +678,6 @@ impl DataClient for DatabentoDataClient {
     }
 
     fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
-        log::debug!("Unsubscribe trades: {cmd:?}");
-
         // Note: Databento live API doesn't support granular unsubscribing.
         // The feed handler manages subscriptions and can handle reconnections
         // with the appropriate subscription state.
@@ -704,8 +690,6 @@ impl DataClient for DatabentoDataClient {
     }
 
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
-        log::debug!("Unsubscribe book deltas: {cmd:?}");
-
         // Note: Databento live API doesn't support granular unsubscribing.
         // The feed handler manages subscriptions and can handle reconnections
         // with the appropriate subscription state.
@@ -721,8 +705,6 @@ impl DataClient for DatabentoDataClient {
         &mut self,
         cmd: &UnsubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
-        log::debug!("Unsubscribe instrument status: {cmd:?}");
-
         // Note: Databento live API doesn't support granular unsubscribing.
         // The feed handler manages subscriptions and can handle reconnections
         // with the appropriate subscription state.
@@ -757,7 +739,7 @@ impl DataClient for DatabentoDataClient {
 
             match historical_client.get_range_instruments(query_params).await {
                 Ok(instruments) => {
-                    log::info!("Retrieved {} instruments", instruments.len());
+                    log::debug!("Retrieved {} instruments", instruments.len());
 
                     let response = DataResponse::Instruments(InstrumentsResponse::new(
                         request_id,
@@ -890,7 +872,7 @@ impl DataClient for DatabentoDataClient {
                 .await
             {
                 Ok(quotes) => {
-                    log::info!("Retrieved {} quotes", quotes.len());
+                    log::debug!("Retrieved {} quotes", quotes.len());
                     let response = DataResponse::Quotes(QuotesResponse::new(
                         request_id,
                         client_id,
@@ -972,7 +954,7 @@ impl DataClient for DatabentoDataClient {
                 .await
             {
                 Ok(trades) => {
-                    log::info!("Retrieved {} trades", trades.len());
+                    log::debug!("Retrieved {} trades", trades.len());
                     let response = DataResponse::Trades(TradesResponse::new(
                         request_id,
                         client_id,
@@ -1079,7 +1061,7 @@ impl DataClient for DatabentoDataClient {
                 .await
             {
                 Ok(bars) => {
-                    log::info!("Retrieved {} bars", bars.len());
+                    log::debug!("Retrieved {} bars", bars.len());
                     let response = DataResponse::Bars(BarsResponse::new(
                         request_id,
                         client_id,
@@ -1159,7 +1141,7 @@ impl DataClient for DatabentoDataClient {
                 .await
             {
                 Ok(depths) => {
-                    log::info!("Retrieved {} order book depths", depths.len());
+                    log::debug!("Retrieved {} order book depths", depths.len());
                     let response = DataResponse::BookDepth(BookDepthResponse::new(
                         request_id,
                         client_id,
@@ -1233,7 +1215,7 @@ impl DataClient for DatabentoDataClient {
 
             match historical_client.get_range_order_book_deltas(params).await {
                 Ok(deltas) => {
-                    log::info!("Retrieved {} order book deltas", deltas.len());
+                    log::debug!("Retrieved {} order book deltas", deltas.len());
                     let response = DataResponse::BookDeltas(BookDeltasResponse::new(
                         request_id,
                         client_id,
