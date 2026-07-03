@@ -33,6 +33,7 @@ logs/
 *.dbn
 *.dbn.zst
 *.parquet
+*.feather
 
 # IntelliJ and VSCode project
 *.iml

@@ -25,7 +25,6 @@ nautilus-lighter = { workspace = true }
 nautilus-live = { workspace = true, features = ["node", "streaming"] }
 nautilus-model = { workspace = true }
 nautilus-system = { workspace = true }
-nautilus-testkit = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }

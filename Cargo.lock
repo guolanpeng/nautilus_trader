@@ -2238,7 +2238,6 @@ dependencies = [
  "nautilus-live",
  "nautilus-model",
  "nautilus-system",
- "nautilus-testkit",
  "serde",
  "serde_yaml",
  "tokio",
