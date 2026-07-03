@@ -3,6 +3,7 @@ use std::{
     path::PathBuf,
 };
 
+use anyhow::Context;
 use log::LevelFilter;
 use nautilus_binance::{
     common::{
@@ -131,13 +132,29 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
-    let config = CollectorConfig::from_yaml_str(&std::fs::read_to_string(&config_path)?)?;
+    let config_yaml = std::fs::read_to_string(&config_path).with_context(|| {
+        format!(
+            "failed to read collector config from {}",
+            config_path.display()
+        )
+    })?;
+    let config = CollectorConfig::from_yaml_str(&config_yaml).with_context(|| {
+        format!(
+            "failed to parse collector config from {}",
+            config_path.display()
+        )
+    })?;
     let plans = config.exchange_plans()?;
 
     let catalog_path = std::env::var("COLLECTOR_CATALOG_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_CATALOG_PATH));
-    std::fs::create_dir_all(&catalog_path)?;
+    std::fs::create_dir_all(&catalog_path).with_context(|| {
+        format!(
+            "failed to create collector catalog directory {}",
+            catalog_path.display()
+        )
+    })?;
 
     let streaming_config = StreamingConfig::builder()
         .catalog_path(catalog_path.to_string_lossy().into_owned())
