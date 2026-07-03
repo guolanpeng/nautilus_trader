@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use nautilus_model::identifiers::InstrumentId;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -54,11 +53,9 @@ impl CollectorConfig {
 
     fn exchange_plans(&self) -> anyhow::Result<BTreeMap<Exchange, ExchangePlan>> {
         let mut plans = BTreeMap::new();
-        add_subscriptions(
-            &mut plans,
-            &self.book_deltas,
-            |plan| plan.subscribe_book_deltas = true,
-        );
+        add_subscriptions(&mut plans, &self.book_deltas, |plan| {
+            plan.subscribe_book_deltas = true
+        });
         add_subscriptions(&mut plans, &self.quotes, |plan| {
             plan.subscribe_quotes = true;
         });
@@ -92,13 +89,6 @@ fn add_subscriptions<F>(
         enable(plan);
         plan.instruments.extend(instruments.iter().cloned());
     }
-}
-
-fn instrument_ids(plan: &ExchangePlan) -> Vec<InstrumentId> {
-    plan.instruments
-        .iter()
-        .map(|instrument| InstrumentId::from(instrument.as_str()))
-        .collect()
 }
 
 fn main() {
