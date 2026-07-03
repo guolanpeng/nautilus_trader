@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let binance_config = BinanceDataClientConfig {
         product_type: BinanceProductType::UsdM,
-        environment: BINANCE_ENVIRONMENT,
+        environment: BinanceEnvironment::Live,
         api_key: None,
         api_secret: None,
         ..Default::default()
@@ -71,9 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tester_config = DataTesterConfig::builder()
         .client_id(client_id)
         .instrument_ids(instrument_ids)
-        .subscribe_book_at_interval(true)
-        .book_depth(20)
-        .book_interval_ms(10)
+        // .subscribe_book_at_interval(true)
+        .subscribe_trades(true)
+        // .book_depth(NonZeroUsize::new(20).unwrap())
+        // .book_interval_ms(NonZeroUsize::new(10).unwrap())
         .manage_book(true)
         .build()?;
     let tester = DataTester::new(tester_config);

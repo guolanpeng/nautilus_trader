@@ -1,0 +1,36 @@
+specification {
+    element system
+    element component
+}
+
+model {
+    system nautilus 'NautilusTrader' {
+        component actor 'Actor / Strategy'
+        component dataCommandSender 'DataCommandSender / Runner'
+        component dataEngine 'DataEngine' 'Processes and routes market data throughout the system' {
+            component queueExecuteEndpoint 'DataEngine.queue_execute'
+            component executeEndpoint 'DataEngine.execute'
+            component commandHandlers 'Command handlers'
+
+            executeEndpoint -> commandHandlers 'delegates DataCommand by type'
+        }
+
+        actor -> dataCommandSender 'sends DataCommand to DataEngine.queue_execute'
+        dataCommandSender -> dataEngine 'dispatches DataCommand to DataEngine.execute'
+    }
+}
+
+views {
+    view index of nautilus {
+        title 'NautilusTrader - DataCommand to DataEngine'
+
+        include actor
+        include dataCommandSender
+        include dataEngine
+    }
+
+    view dataEngine of nautilus.dataEngine {
+        title 'DataEngine'
+        include *
+    }
+}
