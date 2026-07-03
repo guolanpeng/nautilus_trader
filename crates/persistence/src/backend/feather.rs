@@ -17,6 +17,9 @@ use std::{
     any::Any,
     cell::RefCell,
     collections::{HashMap, HashSet},
+    fs::File,
+    io::BufWriter,
+    path::{Path as StdPath, PathBuf},
     rc::Rc,
     sync::Arc,
 };
@@ -169,6 +172,58 @@ impl FeatherBuffer {
     }
 }
 
+pub struct LocalFeatherWriter {
+    /// Arrow `StreamWriter` backed by a local file.
+    writer: StreamWriter<BufWriter<File>>,
+    /// Current approximate uncompressed data size in bytes.
+    size: u64,
+    /// Schema of the data being written.
+    schema: Schema,
+    /// Maximum buffer size in bytes.
+    max_buffer_size: u64,
+}
+
+impl LocalFeatherWriter {
+    fn new(
+        path: &StdPath,
+        schema: &Schema,
+        rotation_config: &RotationConfig,
+    ) -> Result<Self, ArrowError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = File::create(path)?;
+        let writer = StreamWriter::try_new(BufWriter::new(file), schema)?;
+        let mut max_buffer_size = 1_000_000_000_000; // 1 GB
+
+        if let RotationConfig::Size { max_size } = rotation_config {
+            max_buffer_size = *max_size;
+        }
+
+        Ok(Self {
+            writer,
+            size: 0,
+            schema: schema.clone(),
+            max_buffer_size,
+        })
+    }
+
+    fn write_record_batch(&mut self, batch: &RecordBatch) -> Result<bool, ArrowError> {
+        self.writer.write(batch)?;
+        self.size += batch.get_array_memory_size() as u64;
+        Ok(self.size >= self.max_buffer_size)
+    }
+
+    fn flush(&mut self) -> Result<(), ArrowError> {
+        self.writer.flush()
+    }
+
+    fn finish(&mut self) -> Result<(), ArrowError> {
+        self.writer.finish()?;
+        self.writer.flush()
+    }
+}
+
 /// Configuration for file rotation.
 #[derive(Debug, Clone)]
 pub enum RotationConfig {
@@ -216,6 +271,10 @@ pub struct FeatherWriter {
     per_instrument_types: HashSet<String>,
     /// Map of active `FeatherBuffers` keyed by their path.
     writers: HashMap<FileWriterPath, FeatherBuffer>,
+    /// Map of active local file writers keyed by their path.
+    local_writers: HashMap<FileWriterPath, LocalFeatherWriter>,
+    /// Local filesystem root when writing directly to local files.
+    local_root_path: Option<PathBuf>,
     /// Map of next rotation times keyed by their path.
     next_rotation_times: HashMap<FileWriterPath, UnixNanos>,
     /// Runtime handle for async operations.
@@ -234,7 +293,7 @@ impl std::fmt::Debug for FeatherWriter {
             .field("base_path", &self.base_path)
             .field("rotation_config", &self.rotation_config)
             .field("flush_interval_ms", &self.flush_interval_ms)
-            .field("writers", &self.writers.len())
+            .field("writers", &(self.writers.len() + self.local_writers.len()))
             .finish_non_exhaustive()
     }
 }
@@ -250,6 +309,56 @@ impl FeatherWriter {
         per_instrument_types: Option<HashSet<String>>,
         flush_interval_ms: Option<u64>,
     ) -> Self {
+        Self::new_inner(
+            base_path,
+            store,
+            clock,
+            rotation_config,
+            included_types,
+            per_instrument_types,
+            flush_interval_ms,
+            None,
+        )
+    }
+
+    /// Creates a new [`FeatherWriter`] that writes directly to local files.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors FeatherWriter::new plus local root"
+    )]
+    pub fn new_local(
+        base_path: String,
+        store: Arc<dyn ObjectStore>,
+        clock: Rc<RefCell<dyn Clock>>,
+        rotation_config: RotationConfig,
+        included_types: Option<HashSet<String>>,
+        per_instrument_types: Option<HashSet<String>>,
+        flush_interval_ms: Option<u64>,
+        local_root_path: PathBuf,
+    ) -> Self {
+        Self::new_inner(
+            base_path,
+            store,
+            clock,
+            rotation_config,
+            included_types,
+            per_instrument_types,
+            flush_interval_ms,
+            Some(local_root_path),
+        )
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "centralizes constructors")]
+    fn new_inner(
+        base_path: String,
+        store: Arc<dyn ObjectStore>,
+        clock: Rc<RefCell<dyn Clock>>,
+        rotation_config: RotationConfig,
+        included_types: Option<HashSet<String>>,
+        per_instrument_types: Option<HashSet<String>>,
+        flush_interval_ms: Option<u64>,
+        local_root_path: Option<PathBuf>,
+    ) -> Self {
         // Get the runtime handle for async operations
         let runtime = nautilus_common::live::get_runtime().handle().clone();
         let flush_interval_ms = flush_interval_ms.unwrap_or(1000); // Default 1 second
@@ -263,6 +372,8 @@ impl FeatherWriter {
             included_types,
             per_instrument_types: per_instrument_types.unwrap_or_default(),
             writers: HashMap::new(),
+            local_writers: HashMap::new(),
+            local_root_path,
             next_rotation_times: HashMap::new(),
             runtime,
             flush_interval_ms,
@@ -290,7 +401,23 @@ impl FeatherWriter {
 
         let path = self.get_writer_path(&data)?;
 
-        // Create a new FileWriter if one does not exist.
+        if self.local_root_path.is_some() {
+            if !self.local_writers.contains_key(&path) {
+                self.create_writer::<T>(path.clone(), &data)?;
+            }
+
+            let batch = T::encode_batch(&T::metadata(&data), &[data])?;
+            if let Some(writer) = self.local_writers.get_mut(&path) {
+                let should_rotate = writer.write_record_batch(&batch)?;
+                if should_rotate || self.check_scheduled_rotation(&path) {
+                    self.rotate_local_writer(&path).await?;
+                }
+            }
+
+            self.check_flush().await?;
+            return Ok(());
+        }
+
         if !self.writers.contains_key(&path) {
             self.create_writer::<T>(path.clone(), &data)?;
         }
@@ -355,6 +482,22 @@ impl FeatherWriter {
         for group in groups.into_values() {
             let path = self.get_writer_path(&group[0])?;
             let metadata = T::chunk_metadata(&group);
+
+            if self.local_root_path.is_some() {
+                if !self.local_writers.contains_key(&path) {
+                    self.create_writer_with_metadata::<T>(path.clone(), metadata.clone())?;
+                }
+
+                let batch = T::encode_batch(&metadata, &group)?;
+                if let Some(writer) = self.local_writers.get_mut(&path) {
+                    let should_rotate = writer.write_record_batch(&batch)?;
+                    if should_rotate || self.check_scheduled_rotation(&path) {
+                        self.rotate_local_writer(&path).await?;
+                    }
+                }
+
+                continue;
+            }
 
             if !self.writers.contains_key(&path) {
                 self.create_writer_with_metadata::<T>(path.clone(), metadata.clone())?;
@@ -502,8 +645,25 @@ impl FeatherWriter {
         Ok(())
     }
 
+    async fn rotate_local_writer(
+        &mut self,
+        path: &FileWriterPath,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut writer = self.local_writers.remove(path).unwrap();
+        writer.finish()?;
+        let new_path = self.regen_writer_path(path);
+        let file_path = self.local_file_path(&new_path)?;
+        let writer = LocalFeatherWriter::new(&file_path, &writer.schema, &self.rotation_config)?;
+        self.local_writers.insert(new_path, writer);
+        Ok(())
+    }
+
     /// Creates (and inserts) a new `FileWriter` for type T.
-    fn create_writer<T>(&mut self, path: FileWriterPath, data: &T) -> Result<(), ArrowError>
+    fn create_writer<T>(
+        &mut self,
+        path: FileWriterPath,
+        data: &T,
+    ) -> Result<(), Box<dyn std::error::Error>>
     where
         T: EncodeToRecordBatch + CatalogPathPrefix + 'static,
     {
@@ -518,7 +678,7 @@ impl FeatherWriter {
         &mut self,
         path: FileWriterPath,
         metadata: HashMap<String, String>,
-    ) -> Result<(), ArrowError>
+    ) -> Result<(), Box<dyn std::error::Error>>
     where
         T: EncodeToRecordBatch + CatalogPathPrefix + 'static,
     {
@@ -528,8 +688,14 @@ impl FeatherWriter {
             T::get_schema(None)
         };
 
-        let writer = FeatherBuffer::new(&schema, self.rotation_config.clone())?;
-        self.writers.insert(path, writer);
+        if self.local_root_path.is_some() {
+            let file_path = self.local_file_path(&path)?;
+            let writer = LocalFeatherWriter::new(&file_path, &schema, &self.rotation_config)?;
+            self.local_writers.insert(path, writer);
+        } else {
+            let writer = FeatherBuffer::new(&schema, self.rotation_config.clone())?;
+            self.writers.insert(path, writer);
+        }
         Ok(())
     }
 
@@ -539,16 +705,26 @@ impl FeatherWriter {
         path: FileWriterPath,
         type_name: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if self.writers.contains_key(&path) {
+        if self.writers.contains_key(&path) || self.local_writers.contains_key(&path) {
             return Ok(());
         }
         let base_schema = get_arrow_schema(type_name).ok_or_else(|| {
             format!("Custom data type \"{type_name}\" is not registered for Arrow encoding")
         })?;
         let schema = schema_with_data_type_column(base_schema.as_ref(), type_name);
-        let writer = FeatherBuffer::new(&schema, self.rotation_config.clone())
-            .map_err(|e| format!("Failed to create feather buffer for custom {type_name}: {e}"))?;
-        self.writers.insert(path, writer);
+
+        if self.local_root_path.is_some() {
+            let file_path = self.local_file_path(&path)?;
+            let writer = LocalFeatherWriter::new(&file_path, &schema, &self.rotation_config)?;
+            self.local_writers.insert(path, writer);
+        } else {
+            let writer =
+                FeatherBuffer::new(&schema, self.rotation_config.clone()).map_err(|e| {
+                    format!("Failed to create feather buffer for custom {type_name}: {e}")
+                })?;
+            self.writers.insert(path, writer);
+        }
+
         Ok(())
     }
 
@@ -591,6 +767,14 @@ impl FeatherWriter {
     ///
     /// Returns an error if buffer finalization or object store writes fail.
     pub async fn flush(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.local_root_path.is_some() {
+            for writer in self.local_writers.values_mut() {
+                writer.flush()?;
+            }
+            self.last_flush_ns = self.clock.borrow().timestamp_ns();
+            return Ok(());
+        }
+
         // Collect paths and their current buffers before flushing
         let paths_to_flush: Vec<FileWriterPath> = self.writers.keys().cloned().collect();
 
@@ -621,6 +805,14 @@ impl FeatherWriter {
     ///
     /// Returns an error if flushing buffered data fails.
     pub async fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.local_root_path.is_some() {
+            for writer in self.local_writers.values_mut() {
+                writer.finish()?;
+            }
+            self.local_writers.clear();
+            return Ok(());
+        }
+
         self.flush().await?;
         self.writers.clear();
         Ok(())
@@ -629,7 +821,7 @@ impl FeatherWriter {
     /// Returns whether the writer has been closed (all writers cleared).
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.writers.is_empty()
+        self.writers.is_empty() && self.local_writers.is_empty()
     }
 
     /// Returns information about the current files being written.
@@ -646,6 +838,13 @@ impl FeatherWriter {
                 None => path.type_str.clone(),
             };
             info.insert(key, (buffer.size, path.path.to_string()));
+        }
+        for (path, writer) in &self.local_writers {
+            let key = match &path.instrument_id {
+                Some(id) => format!("{}:{}", path.type_str, id),
+                None => path.type_str.clone(),
+            };
+            info.insert(key, (writer.size, path.path.to_string()));
         }
         info
     }
@@ -727,6 +926,15 @@ impl FeatherWriter {
         let type_str = format!("data/custom/{type_name}");
         let instrument_id = identifier.map(String::from);
 
+        if let Some(existing) = self
+            .writers
+            .keys()
+            .chain(self.local_writers.keys())
+            .find(|k| k.type_str == type_str && k.instrument_id == instrument_id)
+        {
+            return existing.clone();
+        }
+
         let mut path = Path::from(self.base_path.clone());
         path = path.join("data").join("custom").join(type_name.to_string());
 
@@ -776,6 +984,13 @@ impl FeatherWriter {
         {
             return Ok(existing.clone());
         }
+        if let Some(existing) = self
+            .local_writers
+            .keys()
+            .find(|k| k.type_str == type_str && k.instrument_id == instrument_id)
+        {
+            return Ok(existing.clone());
+        }
 
         let timestamp = self.clock.borrow().timestamp_ns();
         let mut path = Path::from(self.base_path.clone());
@@ -794,6 +1009,18 @@ impl FeatherWriter {
             type_str: type_str.to_string(),
             instrument_id,
         })
+    }
+
+    fn local_file_path(
+        &self,
+        path: &FileWriterPath,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let local_root = self
+            .local_root_path
+            .as_ref()
+            .ok_or("local_root_path is required for local writer")?;
+        let relative = path.path.to_string();
+        Ok(local_root.join(relative.trim_start_matches('/')))
     }
 
     /// Writes a Data enum value to the appropriate writer.
@@ -846,13 +1073,18 @@ impl FeatherWriter {
         }
 
         let path = self.get_writer_path_custom(type_name, identifier.as_deref());
-        if !self.writers.contains_key(&path) {
+        if !self.writers.contains_key(&path) && !self.local_writers.contains_key(&path) {
             self.create_custom_writer(path.clone(), type_name)?;
         }
 
         let batch = Self::encode_custom_to_batch(custom)?;
 
-        if let Some(writer) = self.writers.get_mut(&path) {
+        if let Some(writer) = self.local_writers.get_mut(&path) {
+            let should_rotate = writer.write_record_batch(&batch)?;
+            if should_rotate || self.check_scheduled_rotation(&path) {
+                self.rotate_local_writer(&path).await?;
+            }
+        } else if let Some(writer) = self.writers.get_mut(&path) {
             let should_rotate = writer.write_record_batch(&batch)?;
             if should_rotate || self.check_scheduled_rotation(&path) {
                 self.rotate_writer(&path).await?;
@@ -1574,6 +1806,75 @@ mod tests {
 
         // Verify that writes succeeded (check_flush was called, even if it didn't flush)
         // The flush_interval_ms is set, so check_flush runs but won't flush without time advancement
+    }
+
+    #[tokio::test]
+    async fn test_local_flush_keeps_writing_same_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_str().unwrap().to_string();
+        let local_fs = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(local_fs);
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+
+        let mut per_instrument = HashSet::new();
+        per_instrument.insert(QuoteTick::path_prefix().to_string());
+
+        let mut writer = FeatherWriter::new_local(
+            base_path.clone(),
+            store,
+            clock,
+            RotationConfig::NoRotation,
+            None,
+            Some(per_instrument),
+            Some(1_000),
+            temp_dir.path().to_path_buf(),
+        );
+
+        let instrument_id = InstrumentId::from("AUD/USD.SIM");
+        let quote1 = QuoteTick::new(
+            instrument_id,
+            Price::from("1.0"),
+            Price::from("1.1"),
+            Quantity::from("1000"),
+            Quantity::from("1000"),
+            UnixNanos::from(1000),
+            UnixNanos::from(1000),
+        );
+        let quote2 = QuoteTick::new(
+            instrument_id,
+            Price::from("1.2"),
+            Price::from("1.3"),
+            Quantity::from("2000"),
+            Quantity::from("2000"),
+            UnixNanos::from(2000),
+            UnixNanos::from(2000),
+        );
+
+        writer.write(quote1).await.unwrap();
+        let path_before_flush = writer.get_writer_path(&quote1).unwrap().path;
+
+        writer.flush().await.unwrap();
+        writer.write(quote2).await.unwrap();
+        let path_after_flush = writer.get_writer_path(&quote2).unwrap().path;
+
+        assert_eq!(path_after_flush, path_before_flush);
+
+        writer.close().await.unwrap();
+
+        let file_path = temp_dir
+            .path()
+            .join(path_before_flush.to_string().trim_start_matches('/'));
+        let file = std::fs::File::open(file_path).unwrap();
+        let reader = StreamReader::try_new(file, None).unwrap();
+        let metadata = reader.schema().metadata().clone();
+        let mut recovered = Vec::new();
+        for batch in reader {
+            recovered.extend(QuoteTick::decode_data_batch(&metadata, batch.unwrap()).unwrap());
+        }
+
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0], Data::from(quote1));
+        assert_eq!(recovered[1], Data::from(quote2));
     }
 
     #[tokio::test]

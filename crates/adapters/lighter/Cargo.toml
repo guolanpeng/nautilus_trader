@@ -24,7 +24,9 @@ crate-type = ["rlib"]
 default = ["high-precision"]
 examples = [
   "dep:reqwest",
+  "dep:nautilus-system",
   "nautilus-live/node",
+  "nautilus-live/streaming",
   "nautilus-network/transport-sockudo",
 ]
 extension-module = [
@@ -175,6 +177,13 @@ test = false
 [[example]]
 name = "lighter-data-tester"
 path = "examples/node_data_tester.rs"
+required-features = ["examples"]
+doc = false
+
+# Run with `cargo run --example lighter-record-btc --package nautilus-lighter --features examples`.
+[[example]]
+name = "lighter-record-btc"
+path = "examples/record_btc.rs"
 required-features = ["examples"]
 doc = false
 

@@ -133,6 +133,7 @@ impl PyStreamingFeatherWriter {
         let is_local_store = matches!(&location.kind, ObjectStoreLocationKind::Local);
         let object_store = location.object_store;
         let base_path = location.base_path;
+        let local_path = location.local_path;
 
         // Handle replace parameter - delete existing files if requested
         if replace {
@@ -218,15 +219,31 @@ impl PyStreamingFeatherWriter {
         let _cache = cache;
 
         // Create FeatherWriter
-        let writer = FeatherWriter::new(
-            base_path,
-            object_store,
-            clock_rc,
-            rotation_config,
-            type_filter,
-            Some(per_instrument_types),
-            flush_interval_ms, // Auto-flush interval in milliseconds
-        );
+        let writer = if is_local_store {
+            let local_path = local_path.ok_or_else(|| {
+                PyIOError::new_err("Local object store did not resolve a local path")
+            })?;
+            FeatherWriter::new_local(
+                base_path,
+                object_store,
+                clock_rc,
+                rotation_config,
+                type_filter,
+                Some(per_instrument_types),
+                flush_interval_ms, // Auto-flush interval in milliseconds
+                local_path,
+            )
+        } else {
+            FeatherWriter::new(
+                base_path,
+                object_store,
+                clock_rc,
+                rotation_config,
+                type_filter,
+                Some(per_instrument_types),
+                flush_interval_ms, // Auto-flush interval in milliseconds
+            )
+        };
 
         Ok(Self {
             writer: Rc::new(RefCell::new(writer)),

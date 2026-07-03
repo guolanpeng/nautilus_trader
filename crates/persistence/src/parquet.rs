@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ahash::AHashMap;
@@ -66,6 +67,7 @@ pub struct ObjectStoreLocation {
     pub base_path: String,
     pub original_uri: String,
     pub kind: ObjectStoreLocationKind,
+    pub local_path: Option<PathBuf>,
 }
 
 impl ObjectStoreLocation {
@@ -522,7 +524,7 @@ pub fn create_object_store_location_from_path(
 ) -> anyhow::Result<ObjectStoreLocation> {
     let uri = normalize_path_to_uri(path);
 
-    let (object_store, base_path, original_uri) = match uri.as_str() {
+    let (object_store, base_path, original_uri, local_path) = match uri.as_str() {
         #[cfg(feature = "cloud")]
         s if s.starts_with("s3://") => create_s3_store(&uri, storage_options),
         #[cfg(feature = "cloud")]
@@ -567,6 +569,7 @@ pub fn create_object_store_location_from_path(
         base_path,
         original_uri,
         kind,
+        local_path,
     })
 }
 
@@ -715,7 +718,7 @@ pub(crate) fn decode_object_store_segment(segment: &str) -> String {
 fn create_local_store(
     uri: &str,
     is_file_uri: bool,
-) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
+) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String, Option<PathBuf>)> {
     let path = if is_file_uri {
         file_uri_to_native_path(uri)
     } else {
@@ -723,7 +726,12 @@ fn create_local_store(
     };
 
     let local_store = object_store::local::LocalFileSystem::new_with_prefix(&path)?;
-    Ok((Arc::new(local_store), String::new(), uri.to_string()))
+    Ok((
+        Arc::new(local_store),
+        String::new(),
+        uri.to_string(),
+        Some(PathBuf::from(path)),
+    ))
 }
 
 /// Helper function to create S3 object store with options.
@@ -731,7 +739,7 @@ fn create_local_store(
 fn create_s3_store(
     uri: &str,
     storage_options: Option<AHashMap<String, String>>,
-) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
+) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String, Option<PathBuf>)> {
     let (url, path) = parse_url_and_path(uri)?;
     let bucket = extract_host(&url, "Invalid S3 URI: missing bucket")?;
 
@@ -769,7 +777,7 @@ fn create_s3_store(
     }
 
     let s3_store = builder.build()?;
-    Ok((Arc::new(s3_store), path, uri.to_string()))
+    Ok((Arc::new(s3_store), path, uri.to_string(), None))
 }
 
 /// Helper function to create GCS object store with options.
@@ -777,7 +785,7 @@ fn create_s3_store(
 fn create_gcs_store(
     uri: &str,
     storage_options: Option<AHashMap<String, String>>,
-) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
+) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String, Option<PathBuf>)> {
     let (url, path) = parse_url_and_path(uri)?;
     let bucket = extract_host(&url, "Invalid GCS URI: missing bucket")?;
 
@@ -818,7 +826,7 @@ fn create_gcs_store(
     }
 
     let gcs_store = builder.build()?;
-    Ok((Arc::new(gcs_store), path, uri.to_string()))
+    Ok((Arc::new(gcs_store), path, uri.to_string(), None))
 }
 
 /// Helper function to create Azure object store with options.
@@ -826,7 +834,7 @@ fn create_gcs_store(
 fn create_azure_store(
     uri: &str,
     storage_options: Option<AHashMap<String, String>>,
-) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
+) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String, Option<PathBuf>)> {
     let (url, _) = parse_url_and_path(uri)?;
     let container = extract_host(&url, "Invalid Azure URI: missing container")?;
 
@@ -877,7 +885,7 @@ fn create_azure_store(
     }
 
     let azure_store = builder.build()?;
-    Ok((Arc::new(azure_store), path, uri.to_string()))
+    Ok((Arc::new(azure_store), path, uri.to_string(), None))
 }
 
 /// Helper function to create Azure object store from abfs:// URI with options.
@@ -885,7 +893,7 @@ fn create_azure_store(
 fn create_abfs_store(
     uri: &str,
     storage_options: Option<AHashMap<String, String>>,
-) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
+) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String, Option<PathBuf>)> {
     let (url, path) = parse_url_and_path(uri)?;
     let host = extract_host(&url, "Invalid ABFS URI: missing host")?;
 
@@ -948,7 +956,7 @@ fn create_abfs_store(
     }
 
     let azure_store = builder.build()?;
-    Ok((Arc::new(azure_store), path, uri.to_string()))
+    Ok((Arc::new(azure_store), path, uri.to_string(), None))
 }
 
 /// Helper function to create HTTP object store with options.
@@ -956,7 +964,7 @@ fn create_abfs_store(
 fn create_http_store(
     uri: &str,
     storage_options: Option<AHashMap<String, String>>,
-) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
+) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String, Option<PathBuf>)> {
     let (_, path) = parse_url_and_path(uri)?;
     let base_url = remote_store_root_url(uri)?
         .as_str()
@@ -976,7 +984,7 @@ fn create_http_store(
     }
 
     let http_store = builder.build()?;
-    Ok((Arc::new(http_store), path, uri.to_string()))
+    Ok((Arc::new(http_store), path, uri.to_string(), None))
 }
 
 /// Helper function to parse URL and extract path component.

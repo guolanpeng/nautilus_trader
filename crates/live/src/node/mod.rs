@@ -180,15 +180,31 @@ fn create_streaming_writer(
         replace_existing_streaming_path(&location, &base_path)?;
     }
 
-    let writer = FeatherWriter::new(
-        base_path,
-        location.object_store,
-        kernel.clock(),
-        feather_rotation_config(&streaming.rotation_config),
-        None,
-        Some(per_instrument_streaming_types()),
-        Some(streaming.flush_interval_ms),
-    );
+    let writer = if matches!(&location.kind, ObjectStoreLocationKind::Local) {
+        let local_path = location
+            .local_path
+            .ok_or_else(|| anyhow::anyhow!("local streaming path was not resolved"))?;
+        FeatherWriter::new_local(
+            base_path,
+            location.object_store,
+            kernel.clock(),
+            feather_rotation_config(&streaming.rotation_config),
+            None,
+            Some(per_instrument_streaming_types()),
+            Some(streaming.flush_interval_ms),
+            local_path,
+        )
+    } else {
+        FeatherWriter::new(
+            base_path,
+            location.object_store,
+            kernel.clock(),
+            feather_rotation_config(&streaming.rotation_config),
+            None,
+            Some(per_instrument_streaming_types()),
+            Some(streaming.flush_interval_ms),
+        )
+    };
 
     Ok(Rc::new(RefCell::new(writer)))
 }
