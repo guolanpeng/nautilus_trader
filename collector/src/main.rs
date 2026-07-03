@@ -253,8 +253,12 @@ fn data_tester_config(exchange: Exchange, plan: ExchangePlan) -> anyhow::Result<
     let instrument_ids = plan
         .instruments
         .into_iter()
-        .map(InstrumentId::from)
-        .collect::<Vec<_>>();
+        .map(|instrument| {
+            instrument
+                .parse::<InstrumentId>()
+                .with_context(|| format!("invalid instrument id {instrument:?}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     Ok(DataTesterConfig::builder()
         .client_id(client_id)
@@ -355,5 +359,18 @@ trades:
                 "ETH-PERP.LIGHTER".to_string()
             ])
         );
+    }
+
+    #[test]
+    fn rejects_invalid_instrument_id_without_panicking() {
+        let plan = ExchangePlan {
+            instruments: BTreeSet::from(["BTCUSDT".to_string()]),
+            subscribe_trades: true,
+            ..Default::default()
+        };
+
+        let error = data_tester_config(Exchange::Binance, plan).unwrap_err();
+
+        assert!(error.to_string().contains("BTCUSDT"));
     }
 }
