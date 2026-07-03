@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "collector",
   "crates",
   "crates/adapters/architect_ax",
   "crates/adapters/betfair",
