@@ -1,0 +1,15 @@
+book_deltas:
+  binance:
+    - BTCUSDT-PERP.BINANCE
+  hyperliquid:
+    - BTC-USD-PERP.HYPERLIQUID
+  lighter:
+    - BTC-PERP.LIGHTER
+
+quotes:
+  lighter:
+    - BTC-PERP.LIGHTER
+
+trades:
+  lighter:
+    - BTC-PERP.LIGHTER
