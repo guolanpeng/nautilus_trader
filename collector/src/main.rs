@@ -1,6 +1,38 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
+use log::LevelFilter;
+use nautilus_binance::{
+    common::{
+        consts::BINANCE_CLIENT_ID,
+        enums::{BinanceEnvironment, BinanceProductType},
+    },
+    config::{BinanceDataClientConfig, BinanceSpotMarketDataMode},
+    factories::BinanceDataClientFactory,
+};
+use nautilus_common::{enums::Environment, logging::logger::LoggerConfig};
+use nautilus_core::datetime::NANOSECONDS_IN_MINUTE;
+use nautilus_hyperliquid::{
+    HyperliquidDataClientConfig, HyperliquidDataClientFactory,
+    common::{consts::HYPERLIQUID_CLIENT_ID, enums::HyperliquidEnvironment},
+};
+use nautilus_lighter::{
+    common::enums::LighterEnvironment, config::LighterDataClientConfig,
+    factories::LighterDataClientFactory,
+};
+use nautilus_live::node::{LiveNode, LiveNodeBuilder};
+use nautilus_model::identifiers::{ClientId, InstrumentId, TraderId};
+use nautilus_system::config::{RotationConfig, StreamingConfig};
+use nautilus_testkit::testers::{DataTester, DataTesterConfig};
 use serde::Deserialize;
+
+const DEFAULT_CONFIG_PATH: &str = "collector.yaml";
+const DEFAULT_CATALOG_PATH: &str = "./catalog/collector";
+const DEFAULT_FLUSH_INTERVAL_MS: u64 = 500;
+const NODE_NAME: &str = "DATA-COLLECTOR-001";
+const TRADER_ID: &str = "COLLECTOR-001";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Exchange {
@@ -91,8 +123,133 @@ fn add_subscriptions<F>(
     }
 }
 
-fn main() {
-    println!("collector implementation pending");
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+
+    let config_path = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+    let config = CollectorConfig::from_yaml_str(&std::fs::read_to_string(&config_path)?)?;
+    let plans = config.exchange_plans()?;
+
+    let catalog_path = std::env::var("COLLECTOR_CATALOG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_CATALOG_PATH));
+    std::fs::create_dir_all(&catalog_path)?;
+
+    let streaming_config = StreamingConfig::builder()
+        .catalog_path(catalog_path.to_string_lossy().into_owned())
+        .fs_protocol("file".to_string())
+        .flush_interval_ms(DEFAULT_FLUSH_INTERVAL_MS)
+        .replace_existing(false)
+        .rotation_config(RotationConfig::Interval {
+            interval_ns: NANOSECONDS_IN_MINUTE,
+        })
+        .build()?;
+
+    let log_config = LoggerConfig {
+        stdout_level: LevelFilter::Info,
+        ..Default::default()
+    };
+
+    let mut builder = LiveNode::builder(TraderId::from(TRADER_ID), Environment::Live)?
+        .with_name(NODE_NAME.to_string())
+        .with_logging(log_config)
+        .with_streaming_config(streaming_config)
+        .with_delay_post_stop_secs(2);
+
+    for exchange in plans.keys() {
+        builder = add_data_client(builder, *exchange)?;
+    }
+
+    let mut node = builder.build()?;
+    for (exchange, plan) in plans {
+        node.add_actor(DataTester::new(data_tester_config(exchange, plan)?))?;
+    }
+
+    log::info!(
+        "Collecting market data from configured exchanges into streaming catalog: {}",
+        catalog_path.display()
+    );
+    log::info!("Press Ctrl+C to stop collection and flush files");
+
+    let handle = node.handle();
+    tokio::spawn(async move {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            log::error!("Failed to listen for Ctrl+C: {e}");
+            return;
+        }
+        log::info!("Ctrl+C received, stopping collector");
+        handle.stop();
+    });
+
+    node.run().await?;
+
+    Ok(())
+}
+
+fn add_data_client(
+    builder: LiveNodeBuilder,
+    exchange: Exchange,
+) -> anyhow::Result<LiveNodeBuilder> {
+    match exchange {
+        Exchange::Binance => builder.add_data_client(
+            None,
+            Box::new(BinanceDataClientFactory::new()),
+            Box::new(BinanceDataClientConfig {
+                product_type: BinanceProductType::UsdM,
+                environment: BinanceEnvironment::Live,
+                spot_market_data_mode: BinanceSpotMarketDataMode::Json,
+                api_key: None,
+                api_secret: None,
+                ..Default::default()
+            }),
+        ),
+        Exchange::Hyperliquid => builder.add_data_client(
+            None,
+            Box::new(HyperliquidDataClientFactory::new()),
+            Box::new(HyperliquidDataClientConfig {
+                environment: HyperliquidEnvironment::Mainnet,
+                ..Default::default()
+            }),
+        ),
+        Exchange::Lighter => builder.add_data_client(
+            None,
+            Box::new(LighterDataClientFactory::new()),
+            Box::new(
+                LighterDataClientConfig::builder()
+                    .environment(LighterEnvironment::Mainnet)
+                    .build(),
+            ),
+        ),
+    }
+}
+
+fn data_tester_config(exchange: Exchange, plan: ExchangePlan) -> anyhow::Result<DataTesterConfig> {
+    let client_id = match exchange {
+        Exchange::Binance => *BINANCE_CLIENT_ID,
+        Exchange::Hyperliquid => *HYPERLIQUID_CLIENT_ID,
+        Exchange::Lighter => ClientId::new("LIGHTER"),
+    };
+    let instrument_ids = plan
+        .instruments
+        .into_iter()
+        .map(InstrumentId::from)
+        .collect::<Vec<_>>();
+
+    Ok(DataTesterConfig::builder()
+        .client_id(client_id)
+        .instrument_ids(instrument_ids)
+        .request_instruments(true)
+        .subscribe_book_deltas(plan.subscribe_book_deltas)
+        .subscribe_quotes(plan.subscribe_quotes)
+        .subscribe_trades(plan.subscribe_trades)
+        .manage_book(true)
+        .book_levels_to_print(5)
+        .stats_interval_secs(30)
+        .build()?)
 }
 
 #[cfg(test)]
