@@ -27,7 +27,7 @@ nautilus-model = { workspace = true }
 nautilus-system = { workspace = true }
 nautilus-testkit = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_yaml = "0.9"
+serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 
 [lints]

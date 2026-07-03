@@ -262,6 +262,7 @@ serde_json = { version = "1.0.150", default-features = false, features = [
   "std",
 ] }
 serde_urlencoded = "0.7.1"
+serde_yaml = "0.9"
 smallvec = { version = "1.15.2", features = ["serde"] }
 sockudo-ws = { version = "1.7.4", default-features = false, features = [
   "simd",
