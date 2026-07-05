@@ -17,6 +17,7 @@ homepage.workspace = true
 anyhow = { workspace = true }
 dotenvy = { workspace = true }
 log = { workspace = true }
+mimalloc.workspace = true
 nautilus-binance = { workspace = true }
 nautilus-common = { workspace = true, features = ["live"] }
 nautilus-core = { workspace = true }

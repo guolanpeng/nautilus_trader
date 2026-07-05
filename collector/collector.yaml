@@ -1,15 +1,27 @@
 book_deltas:
-  binance:
-    - BTCUSDT-PERP.BINANCE
-  hyperliquid:
-    - BTC-USD-PERP.HYPERLIQUID
-  lighter:
+  binance: #http请求1000档位，后续走ws增量
+      - BTCUSDT-PERP.BINANCE
+      - ETHUSDT-PERP.BINANCE
+      - XRPUSDT-PERP.BINANCE
+  hyperliquid: #每次都是快照更新，档位不固定(可查看官网) 转多少收多少
+      - BTC-USD-PERP.HYPERLIQUID
+      - ETH-USD-PERP.HYPERLIQUID
+      - XRP-USD-PERP.HYPERLIQUID
+  lighter: #开始订阅全量,后面走增量
     - BTC-PERP.LIGHTER
-
-quotes:
-  lighter:
-    - BTC-PERP.LIGHTER
+    - ETH-PERP.LIGHTER
+    - XRP-PERP.LIGHTER
 
 trades:
+  binance:
+    - BTCUSDT-PERP.BINANCE
+    - ETHUSDT-PERP.BINANCE
+    - XRPUSDT-PERP.BINANCE
+  hyperliquid:
+    - BTC-USD-PERP.HYPERLIQUID
+    - ETH-USD-PERP.HYPERLIQUID
+    - XRP-USD-PERP.HYPERLIQUID
   lighter:
     - BTC-PERP.LIGHTER
+    - ETH-PERP.LIGHTER
+    - XRP-PERP.LIGHTER

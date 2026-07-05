@@ -5,7 +5,10 @@ use adapters::add_data_client;
 use anyhow::Context;
 use config::CollectorConfig;
 use log::LevelFilter;
-use nautilus_common::{enums::Environment, logging::logger::LoggerConfig};
+use nautilus_common::{
+    enums::Environment,
+    logging::{logger::LoggerConfig, writer::FileWriterConfig},
+};
 use nautilus_core::{UnixNanos, datetime::NANOSECONDS_IN_DAY};
 use nautilus_live::node::LiveNode;
 use nautilus_model::identifiers::TraderId;
@@ -16,9 +19,13 @@ mod adapters;
 mod config;
 
 const DEFAULT_CONFIG_PATH: &str = "collector.yaml";
-const DEFAULT_CATALOG_PATH: &str = "./catalog/collector";
+const DEFAULT_CATALOG_PATH: &str = "./catalog";
 const DEFAULT_FLUSH_INTERVAL_MS: u64 = 1000;
 const TRADER_ID: &str = "COLLECTOR-001";
+
+//mimalloc is a general purpose allocator that is optimized for performance and memory usage. It is designed to be a drop-in replacement for the default allocator in Rust, and it can be used in any Rust program without any changes to the code. It is also designed to be thread-safe, so it can be used in multi-threaded programs without any issues.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -64,7 +71,14 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
 
     let log_config = LoggerConfig {
-        stdout_level: LevelFilter::Info,
+        stdout_level: LevelFilter::Warn,
+        fileout_level: LevelFilter::Info,
+        file_config: Some(FileWriterConfig::new(
+            Some("./logs".to_string()),
+            Some("collector".to_string()),
+            None,
+            None,
+        )),
         ..Default::default()
     };
 
