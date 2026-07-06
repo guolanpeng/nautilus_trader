@@ -409,15 +409,16 @@ impl FeatherWriter {
             return Ok(());
         }
 
+        let metadata = T::metadata(&data);
         let mut path = self.get_writer_path(&data)?;
-        let batch = T::encode_batch(&T::metadata(&data), &[data])?;
+        let batch = T::encode_batch(&metadata, &[data])?;
         let (first_ts_init, last_ts_init) = Self::batch_ts_init_range(&batch)?;
         self.rotate_if_pending_and_ts_advanced(&mut path, first_ts_init)
             .await?;
 
         if self.local_root_path.is_some() {
             if !self.local_writers.contains_key(&path) {
-                self.create_writer::<T>(path.clone(), &data)?;
+                self.create_writer_with_metadata::<T>(path.clone(), metadata.clone())?;
             }
 
             if let Some(writer) = self.local_writers.get_mut(&path) {
@@ -433,7 +434,7 @@ impl FeatherWriter {
         }
 
         if !self.writers.contains_key(&path) {
-            self.create_writer::<T>(path.clone(), &data)?;
+            self.create_writer_with_metadata::<T>(path.clone(), metadata)?;
         }
 
         // Write the RecordBatch to the appropriate FileWriter.
@@ -688,7 +689,10 @@ impl FeatherWriter {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "ts_init column is not UInt64")
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ts_init column is not UInt64",
+                )
             })?;
 
         if ts_init.is_empty() {
@@ -730,18 +734,6 @@ impl FeatherWriter {
         let writer = LocalFeatherWriter::new(&file_path, &writer.schema, &self.rotation_config)?;
         self.local_writers.insert(new_path.clone(), writer);
         Ok(new_path)
-    }
-
-    /// Creates (and inserts) a new `FileWriter` for type T.
-    fn create_writer<T>(
-        &mut self,
-        path: FileWriterPath,
-        data: &T,
-    ) -> Result<(), Box<dyn std::error::Error>>
-    where
-        T: EncodeToRecordBatch + CatalogPathPrefix + 'static,
-    {
-        self.create_writer_with_metadata::<T>(path, T::metadata(data))
     }
 
     /// Creates (and inserts) a new `FileWriter` for type T with pre-computed metadata.

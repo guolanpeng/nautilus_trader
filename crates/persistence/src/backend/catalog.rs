@@ -3918,6 +3918,39 @@ impl ParquetDataCatalog {
         Ok(())
     }
 
+    /// Converts a single stream feather file to catalog parquet data.
+    ///
+    /// This is useful for callers that have already selected closed stream files
+    /// and need per-file success semantics before deleting or archiving the source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data class is unsupported, feather reading fails,
+    /// stream transforms fail, or parquet writing fails.
+    pub fn convert_stream_file_to_data(
+        &mut self,
+        data_cls: &str,
+        feather_path: &str,
+        use_ts_event_for_ts_init: bool,
+    ) -> anyhow::Result<()> {
+        if Self::is_excluded_stream_data_type(data_cls) {
+            return Ok(());
+        }
+
+        let data_name = to_snake_case(data_cls);
+        if !Self::is_supported_stream_data_type(&data_name) {
+            anyhow::bail!("Unknown data class: {data_cls}");
+        }
+
+        let batches = self.read_feather_file(feather_path)?;
+        self.convert_feather_batches_to_parquet(
+            &data_name,
+            feather_path,
+            batches,
+            use_ts_event_for_ts_init,
+        )
+    }
+
     fn convert_feather_batches_to_parquet(
         &self,
         data_name: &str,

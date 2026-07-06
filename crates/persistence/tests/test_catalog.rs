@@ -4731,6 +4731,66 @@ fn test_convert_stream_to_data_writes_arrow_batches_without_deserializing() {
 }
 
 #[rstest]
+fn test_convert_stream_file_to_data_writes_single_feather_file() {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{StringArray, UInt64Array},
+        datatypes::{DataType, Field, Schema},
+        ipc::writer::StreamWriter,
+        record_batch::RecordBatch,
+    };
+
+    let (temp_dir, mut catalog) = create_temp_catalog();
+    let feather_dir = temp_dir
+        .path()
+        .join("live")
+        .join("test_instance")
+        .join("quotes")
+        .join("AUDUSD.SIM");
+    fs::create_dir_all(&feather_dir).unwrap();
+
+    let mut metadata = HashMap::new();
+    metadata.insert("instrument_id".to_string(), "AUD/USD.SIM".to_string());
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("ts_init", DataType::UInt64, false),
+            Field::new("ts_event", DataType::UInt64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ],
+        metadata,
+    ));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![100, 200])),
+            Arc::new(UInt64Array::from(vec![10, 20])),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+        ],
+    )
+    .unwrap();
+
+    let feather_path = feather_dir.join("AUDUSD.SIM_0.feather");
+    let mut feather_file = fs::File::create(&feather_path).unwrap();
+    let mut writer = StreamWriter::try_new(&mut feather_file, &schema).unwrap();
+    writer.write(&batch).unwrap();
+    writer.finish().unwrap();
+
+    catalog
+        .convert_stream_file_to_data(
+            "quotes",
+            "live/test_instance/quotes/AUDUSD.SIM/AUDUSD.SIM_0.feather",
+            false,
+        )
+        .unwrap();
+
+    let files = catalog
+        .query_files("quotes", Some(vec!["AUD/USD.SIM".to_string()]), None, None)
+        .unwrap();
+    assert_eq!(files.len(), 1);
+}
+
+#[rstest]
 fn test_convert_stream_to_data_converts_bar_type_metadata_to_external() {
     use std::sync::Arc;
 

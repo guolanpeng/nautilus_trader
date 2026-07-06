@@ -25,10 +25,11 @@ nautilus-hyperliquid = { workspace = true }
 nautilus-lighter = { workspace = true }
 nautilus-live = { workspace = true, features = ["node", "streaming"] }
 nautilus-model = { workspace = true }
+nautilus-persistence = { workspace = true }
 nautilus-system = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_yaml = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
 
 [lints]
 workspace = true

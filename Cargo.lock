@@ -2238,6 +2238,7 @@ dependencies = [
  "nautilus-lighter",
  "nautilus-live",
  "nautilus-model",
+ "nautilus-persistence",
  "nautilus-system",
  "serde",
  "serde_yaml",
