@@ -27,7 +27,11 @@ use std::{
 use ahash::AHashMap;
 use chrono_tz::Tz;
 use datafusion::arrow::{
-    datatypes::Schema, error::ArrowError, ipc::writer::StreamWriter, record_batch::RecordBatch,
+    array::{Array, UInt64Array},
+    datatypes::Schema,
+    error::ArrowError,
+    ipc::writer::StreamWriter,
+    record_batch::RecordBatch,
 };
 use nautilus_common::{
     cache::fifo::FifoCache,
@@ -277,6 +281,10 @@ pub struct FeatherWriter {
     local_root_path: Option<PathBuf>,
     /// Map of next rotation times keyed by their path.
     next_rotation_times: HashMap<FileWriterPath, UnixNanos>,
+    /// Writers that should rotate once the next batch advances beyond the current ts_init.
+    pending_rotations: HashSet<FileWriterPath>,
+    /// Last ts_init written for each active writer.
+    last_ts_init_by_path: HashMap<FileWriterPath, UnixNanos>,
     /// Runtime handle for async operations.
     runtime: tokio::runtime::Handle,
     /// Flush interval in milliseconds (0 = no automatic flushing).
@@ -375,6 +383,8 @@ impl FeatherWriter {
             local_writers: HashMap::new(),
             local_root_path,
             next_rotation_times: HashMap::new(),
+            pending_rotations: HashSet::new(),
+            last_ts_init_by_path: HashMap::new(),
             runtime,
             flush_interval_ms,
             last_flush_ns,
@@ -399,18 +409,22 @@ impl FeatherWriter {
             return Ok(());
         }
 
-        let path = self.get_writer_path(&data)?;
+        let mut path = self.get_writer_path(&data)?;
+        let batch = T::encode_batch(&T::metadata(&data), &[data])?;
+        let (first_ts_init, last_ts_init) = Self::batch_ts_init_range(&batch)?;
+        self.rotate_if_pending_and_ts_advanced(&mut path, first_ts_init)
+            .await?;
 
         if self.local_root_path.is_some() {
             if !self.local_writers.contains_key(&path) {
                 self.create_writer::<T>(path.clone(), &data)?;
             }
 
-            let batch = T::encode_batch(&T::metadata(&data), &[data])?;
             if let Some(writer) = self.local_writers.get_mut(&path) {
                 let should_rotate = writer.write_record_batch(&batch)?;
+                self.last_ts_init_by_path.insert(path.clone(), last_ts_init);
                 if should_rotate || self.check_scheduled_rotation(&path) {
-                    self.rotate_local_writer(&path).await?;
+                    self.pending_rotations.insert(path.clone());
                 }
             }
 
@@ -422,14 +436,12 @@ impl FeatherWriter {
             self.create_writer::<T>(path.clone(), &data)?;
         }
 
-        // Encode the data into a RecordBatch using T's encoding logic.
-        let batch = T::encode_batch(&T::metadata(&data), &[data])?;
-
         // Write the RecordBatch to the appropriate FileWriter.
         if let Some(writer) = self.writers.get_mut(&path) {
             let should_rotate = writer.write_record_batch(&batch)?;
+            self.last_ts_init_by_path.insert(path.clone(), last_ts_init);
             if should_rotate || self.check_scheduled_rotation(&path) {
-                self.rotate_writer(&path).await?;
+                self.pending_rotations.insert(path.clone());
             }
         }
 
@@ -480,19 +492,23 @@ impl FeatherWriter {
         }
 
         for group in groups.into_values() {
-            let path = self.get_writer_path(&group[0])?;
+            let mut path = self.get_writer_path(&group[0])?;
             let metadata = T::chunk_metadata(&group);
+            let batch = T::encode_batch(&metadata, &group)?;
+            let (first_ts_init, last_ts_init) = Self::batch_ts_init_range(&batch)?;
+            self.rotate_if_pending_and_ts_advanced(&mut path, first_ts_init)
+                .await?;
 
             if self.local_root_path.is_some() {
                 if !self.local_writers.contains_key(&path) {
                     self.create_writer_with_metadata::<T>(path.clone(), metadata.clone())?;
                 }
 
-                let batch = T::encode_batch(&metadata, &group)?;
                 if let Some(writer) = self.local_writers.get_mut(&path) {
                     let should_rotate = writer.write_record_batch(&batch)?;
+                    self.last_ts_init_by_path.insert(path.clone(), last_ts_init);
                     if should_rotate || self.check_scheduled_rotation(&path) {
-                        self.rotate_local_writer(&path).await?;
+                        self.pending_rotations.insert(path.clone());
                     }
                 }
 
@@ -503,12 +519,11 @@ impl FeatherWriter {
                 self.create_writer_with_metadata::<T>(path.clone(), metadata.clone())?;
             }
 
-            let batch = T::encode_batch(&metadata, &group)?;
-
             if let Some(writer) = self.writers.get_mut(&path) {
                 let should_rotate = writer.write_record_batch(&batch)?;
+                self.last_ts_init_by_path.insert(path.clone(), last_ts_init);
                 if should_rotate || self.check_scheduled_rotation(&path) {
-                    self.rotate_writer(&path).await?;
+                    self.pending_rotations.insert(path.clone());
                 }
             }
         }
@@ -631,31 +646,90 @@ impl FeatherWriter {
         UnixNanos::from(u64::try_from(timestamp_ns.max(0)).unwrap_or(0))
     }
 
+    async fn rotate_if_pending_and_ts_advanced(
+        &mut self,
+        path: &mut FileWriterPath,
+        incoming_ts_init: UnixNanos,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.pending_rotations.contains(path) {
+            return Ok(());
+        }
+
+        let Some(last_ts_init) = self.last_ts_init_by_path.get(path).copied() else {
+            self.pending_rotations.remove(path);
+            return Ok(());
+        };
+
+        if incoming_ts_init <= last_ts_init {
+            return Ok(());
+        }
+
+        let old_path = path.clone();
+        let new_path = if self.local_root_path.is_some() {
+            self.rotate_local_writer(&old_path).await?
+        } else {
+            self.rotate_writer(&old_path).await?
+        };
+
+        self.pending_rotations.remove(&old_path);
+        self.last_ts_init_by_path.remove(&old_path);
+        self.next_rotation_times.remove(&old_path);
+        *path = new_path;
+
+        Ok(())
+    }
+
+    fn batch_ts_init_range(
+        batch: &RecordBatch,
+    ) -> Result<(UnixNanos, UnixNanos), Box<dyn std::error::Error>> {
+        let ts_init_idx = batch.schema().index_of("ts_init")?;
+        let ts_init = batch
+            .column(ts_init_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "ts_init column is not UInt64")
+            })?;
+
+        if ts_init.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Cannot write empty RecordBatch",
+            )
+            .into());
+        }
+
+        Ok((
+            UnixNanos::from(ts_init.value(0)),
+            UnixNanos::from(ts_init.value(ts_init.len() - 1)),
+        ))
+    }
+
     /// Flushes and rotates `FileWriter` associated with `key`.
     /// TODO: Fix error type to handle arrow error and object store error
     async fn rotate_writer(
         &mut self,
         path: &FileWriterPath,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<FileWriterPath, Box<dyn std::error::Error>> {
         let mut writer = self.writers.remove(path).unwrap();
         let bytes = writer.take_buffer()?;
         self.store.put(&path.path, bytes.into()).await?;
         let new_path = self.regen_writer_path(path);
-        self.writers.insert(new_path, writer);
-        Ok(())
+        self.writers.insert(new_path.clone(), writer);
+        Ok(new_path)
     }
 
     async fn rotate_local_writer(
         &mut self,
         path: &FileWriterPath,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<FileWriterPath, Box<dyn std::error::Error>> {
         let mut writer = self.local_writers.remove(path).unwrap();
         writer.finish()?;
         let new_path = self.regen_writer_path(path);
         let file_path = self.local_file_path(&new_path)?;
         let writer = LocalFeatherWriter::new(&file_path, &writer.schema, &self.rotation_config)?;
-        self.local_writers.insert(new_path, writer);
-        Ok(())
+        self.local_writers.insert(new_path.clone(), writer);
+        Ok(new_path)
     }
 
     /// Creates (and inserts) a new `FileWriter` for type T.
@@ -786,6 +860,9 @@ impl FeatherWriter {
                     // Write to the object store
                     self.store.put(&path.path, bytes.into()).await?;
                 }
+                self.pending_rotations.remove(&path);
+                self.last_ts_init_by_path.remove(&path);
+                self.next_rotation_times.remove(&path);
 
                 // Recreate writer with same schema for continued writing
                 // We need the schema and type info - for now, we'll recreate on next write
@@ -810,11 +887,17 @@ impl FeatherWriter {
                 writer.finish()?;
             }
             self.local_writers.clear();
+            self.pending_rotations.clear();
+            self.last_ts_init_by_path.clear();
+            self.next_rotation_times.clear();
             return Ok(());
         }
 
         self.flush().await?;
         self.writers.clear();
+        self.pending_rotations.clear();
+        self.last_ts_init_by_path.clear();
+        self.next_rotation_times.clear();
         Ok(())
     }
 
@@ -1072,22 +1155,27 @@ impl FeatherWriter {
             return Ok(());
         }
 
-        let path = self.get_writer_path_custom(type_name, identifier.as_deref());
+        let mut path = self.get_writer_path_custom(type_name, identifier.as_deref());
+        let batch = Self::encode_custom_to_batch(custom)?;
+        let (first_ts_init, last_ts_init) = Self::batch_ts_init_range(&batch)?;
+        self.rotate_if_pending_and_ts_advanced(&mut path, first_ts_init)
+            .await?;
+
         if !self.writers.contains_key(&path) && !self.local_writers.contains_key(&path) {
             self.create_custom_writer(path.clone(), type_name)?;
         }
 
-        let batch = Self::encode_custom_to_batch(custom)?;
-
         if let Some(writer) = self.local_writers.get_mut(&path) {
             let should_rotate = writer.write_record_batch(&batch)?;
+            self.last_ts_init_by_path.insert(path.clone(), last_ts_init);
             if should_rotate || self.check_scheduled_rotation(&path) {
-                self.rotate_local_writer(&path).await?;
+                self.pending_rotations.insert(path.clone());
             }
         } else if let Some(writer) = self.writers.get_mut(&path) {
             let should_rotate = writer.write_record_batch(&batch)?;
+            self.last_ts_init_by_path.insert(path.clone(), last_ts_init);
             if should_rotate || self.check_scheduled_rotation(&path) {
-                self.rotate_writer(&path).await?;
+                self.pending_rotations.insert(path.clone());
             }
         }
 
@@ -1875,6 +1963,88 @@ mod tests {
         assert_eq!(recovered.len(), 2);
         assert_eq!(recovered[0], Data::from(quote1));
         assert_eq!(recovered[1], Data::from(quote2));
+    }
+
+    #[tokio::test]
+    async fn test_local_rotation_waits_for_ts_init_to_advance() {
+        let temp_dir = TempDir::new().unwrap();
+        let local_fs = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(local_fs);
+        let test_clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
+
+        let mut per_instrument = HashSet::new();
+        per_instrument.insert(QuoteTick::path_prefix().to_string());
+
+        let mut writer = FeatherWriter::new_local(
+            String::new(),
+            store,
+            clock,
+            RotationConfig::Size { max_size: 1 },
+            None,
+            Some(per_instrument),
+            Some(1_000),
+            temp_dir.path().to_path_buf(),
+        );
+
+        let instrument_id = InstrumentId::from("AUD/USD.SIM");
+        let quote1 = QuoteTick::new(
+            instrument_id,
+            Price::from("1.0"),
+            Price::from("1.1"),
+            Quantity::from("1000"),
+            Quantity::from("1000"),
+            UnixNanos::from(1000),
+            UnixNanos::from(1000),
+        );
+        let quote2 = QuoteTick::new(
+            instrument_id,
+            Price::from("1.2"),
+            Price::from("1.3"),
+            Quantity::from("2000"),
+            Quantity::from("2000"),
+            UnixNanos::from(1000),
+            UnixNanos::from(1000),
+        );
+        let quote3 = QuoteTick::new(
+            instrument_id,
+            Price::from("1.4"),
+            Price::from("1.5"),
+            Quantity::from("3000"),
+            Quantity::from("3000"),
+            UnixNanos::from(2000),
+            UnixNanos::from(2000),
+        );
+
+        writer.write(quote1).await.unwrap();
+        writer.write(quote2).await.unwrap();
+        test_clock
+            .borrow_mut()
+            .advance_time(UnixNanos::from(1), true);
+        writer.write(quote3).await.unwrap();
+        writer.close().await.unwrap();
+
+        let quote_dir = temp_dir.path().join("quotes").join("AUDUSD.SIM");
+        let mut files = std::fs::read_dir(quote_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        files.sort();
+
+        assert_eq!(files.len(), 2);
+
+        let mut rows_per_file = Vec::new();
+        for file_path in files {
+            let file = std::fs::File::open(file_path).unwrap();
+            let reader = StreamReader::try_new(file, None).unwrap();
+            let mut rows = 0;
+            for batch in reader {
+                rows += batch.unwrap().num_rows();
+            }
+            rows_per_file.push(rows);
+        }
+
+        assert_eq!(rows_per_file, vec![2, 1]);
     }
 
     #[tokio::test]
