@@ -51,22 +51,6 @@ impl CollectorConfig {
         serde_yaml::from_str(input)
     }
 
-    pub(crate) fn stream_data_types(&self) -> BTreeSet<&'static str> {
-        let mut data_types = BTreeSet::new();
-
-        if !self.book_deltas.is_empty() {
-            data_types.insert("order_book_deltas");
-        }
-        if !self.quotes.is_empty() {
-            data_types.insert("quotes");
-        }
-        if !self.trades.is_empty() {
-            data_types.insert("trades");
-        }
-
-        data_types
-    }
-
     pub(crate) fn exchange_plans(&self) -> anyhow::Result<BTreeMap<Exchange, ExchangePlan>> {
         let mut plans = BTreeMap::new();
         add_subscriptions(&mut plans, &self.book_deltas, |plan| {
@@ -192,29 +176,6 @@ trades:
                 "BTC-PERP.LIGHTER".to_string(),
                 "ETH-PERP.LIGHTER".to_string()
             ])
-        );
-    }
-
-    #[test]
-    fn returns_enabled_stream_data_types_once() {
-        let config = CollectorConfig::from_yaml_str(
-            r#"
-book_deltas:
-  binance:
-    - BTCUSDT-PERP.BINANCE
-quotes:
-  hyperliquid:
-    - BTC-USD-PERP.HYPERLIQUID
-trades:
-  lighter:
-    - BTC-PERP.LIGHTER
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            config.stream_data_types(),
-            BTreeSet::from(["order_book_deltas", "quotes", "trades"])
         );
     }
 }

@@ -4,7 +4,6 @@ use actor::CollectorActor;
 use adapters::add_data_client;
 use anyhow::Context;
 use config::CollectorConfig;
-use conversion::spawn_stream_conversion_task;
 use log::LevelFilter;
 use nautilus_common::{
     enums::Environment,
@@ -18,7 +17,6 @@ use nautilus_system::config::{RotationConfig, StreamingConfig};
 mod actor;
 mod adapters;
 mod config;
-mod conversion;
 
 const DEFAULT_CONFIG_PATH: &str = "collector.yaml";
 const DEFAULT_CATALOG_PATH: &str = "./catalog";
@@ -49,7 +47,6 @@ async fn main() -> anyhow::Result<()> {
             config_path.display()
         )
     })?;
-    let stream_data_types = config.stream_data_types();
     let plans = config.exchange_plans()?;
 
     let catalog_path = std::env::var("COLLECTOR_CATALOG_PATH")
@@ -94,7 +91,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut node = builder.build()?;
-    let instance_id = node.instance_id().to_string();
     node.add_actor(CollectorActor::from_exchange_plans(plans)?)?;
 
     log::info!(
@@ -102,11 +98,7 @@ async fn main() -> anyhow::Result<()> {
         catalog_path.display()
     );
 
-    let conversion_task =
-        spawn_stream_conversion_task(catalog_path.clone(), instance_id, stream_data_types);
-    let run_result = node.run().await;
-    conversion_task.abort();
-    run_result?;
+    node.run().await?;
 
     Ok(())
 }

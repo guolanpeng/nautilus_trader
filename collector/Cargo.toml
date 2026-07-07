@@ -25,7 +25,6 @@ nautilus-hyperliquid = { workspace = true }
 nautilus-lighter = { workspace = true }
 nautilus-live = { workspace = true, features = ["node", "streaming"] }
 nautilus-model = { workspace = true }
-nautilus-persistence = { workspace = true }
 nautilus-system = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_yaml = { workspace = true }
